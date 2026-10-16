@@ -1,0 +1,83 @@
+//! 測定の口 (Refs ippoan/alc-app#436、ippoan/rust-alc-api#697)。rust-alc-api の `crates/alc-misc` の測定の口を移す先で、
+//! path・method・JSON の形・status は rust と同じ (運行者端末・管理画面がそのまま使う)。
+//!
+//! - [`measurements`] — `/api/measurements` の 5 口 (開始・更新・作成・一覧・取得)。rust の `alc-misc` の
+//!   measurements.rs と repo/measurements.rs の写し
+//! - [`models`] — 入出力の形 (rust の `alc_core::models` の Measurement 系の写し。serde の rename / alias も同じ)
+//! - [`tenko`] — 通常点呼の記録 (完了した測定から点呼セッションと点呼記録を作る副作用)。rust の `alc-tenko` の
+//!   normal_tenko.rs と、tenko_sessions.rs・repo/tenko_sessions.rs の共有部分の写し
+//! - [`carins`] — 電子車検証の番号の検査と、車検期限の照合 (rust の `alc-core` の car_inspections の写し)
+//!
+//! 顔写真・動画の口 (`/api/measurements/{id}/face-photo`・`/video`) はまだ rust に在る (別の PR で R2 と一緒に移す)。
+//!
+//! 全部の口が `X-Tenant-ID` を要る (auth-worker が付ける。無い・UUID でない → 401。`alc_core_wasm::require_tenant_header`)。
+//! rust と同じく role は見ない。dev端末の印 `X-Device-Dev` は rust と同じく接続の設定 `app.device_dev` に通す
+//! (`require_tenant_header` が認証の後に書く `DeviceDevSlot` を口が読み、[`set_device_dev`] で立てる)。
+//! DB は `PgClient::tenant_tx` + `query_typed` 系だけ (名前付き prepared statement は使わない)。
+//! ログ・エラー応答は固定の語だけ (エラーの文・識別子・入力値を載せない。DB のエラーは `kind` = SQLSTATE か固定の label)。
+
+pub mod carins;
+pub mod measurements;
+pub mod models;
+pub mod tenko;
+
+use std::sync::Arc;
+
+use alc_core_wasm::{require_tenant_header, DeviceDevSlot};
+use alc_worker_db::{kind, PgClient, TenantTx};
+use axum::extract::{DefaultBodyLimit, Request};
+use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::Response;
+use axum::{middleware, Router};
+use futures_util::lock::Mutex;
+
+pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub pg: Arc<Mutex<PgClient>>,
+    pub log: LogSink,
+}
+
+impl AppState {
+    /// DB の失敗を固定の語でログに出し、500 にする
+    fn db_fail(&self, stage: &str, e: &tokio_postgres::Error) -> StatusCode {
+        (self.log)(&format!("measurements: {stage} failed: db ({})", kind(e)));
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+/// dev端末の要求で、transaction の中だけ `app.device_dev` を `'1'` にする文 (固定。値を埋め込まない)。
+/// rust の `alc_core::tenant::set_current_tenant` と同じ働き (rust は接続ごと、ここは transaction-local)。
+/// 列 `is_dev` の既定値と RLS がこれを見て、dev の行と本番の行を分ける (alc-migrations 153)
+pub const SET_DEVICE_DEV: &str = "SELECT set_config('app.device_dev', '1', true)";
+
+/// `dev` なら [`SET_DEVICE_DEV`] を流す (tenant_tx の最初の文。dev でなければ何もしない = 設定は空のまま)
+pub async fn set_device_dev(tx: &TenantTx<'_>, dev: bool) -> Result<(), tokio_postgres::Error> {
+    if dev {
+        tx.execute_typed(SET_DEVICE_DEV, &[]).await?;
+    }
+    Ok(())
+}
+
+/// 要求ごとに空の `DeviceDevSlot` を置く (kit の `require_tenant_header` は、在る slot にだけ認証の後で dev の印を書く。
+/// rust の `require_tenant_header` が要求ごとに slot を作るのと同じ。共有の 1 つを使い回さない)
+pub async fn with_device_dev_slot(mut req: Request, next: Next) -> Response {
+    req.extensions_mut().insert(DeviceDevSlot::default());
+    next.run(req).await
+}
+
+/// 本文の上限 (rust の main.rs の `DefaultBodyLimit` と同じ 20MB)
+pub const BODY_LIMIT: usize = 20 * 1024 * 1024;
+
+/// 全部の口。rust と同じく `/api` の下 (auth-worker は `/api/measurements...` のまま Service Binding に渡す)
+pub fn router() -> Router<AppState> {
+    // 後に足した route_layer が外側: slot を置く → tenant と dev の印を読む → 口
+    let api = measurements::router()
+        .route_layer(middleware::from_fn(require_tenant_header))
+        .route_layer(middleware::from_fn(with_device_dev_slot));
+    Router::new()
+        .nest("/api", api)
+        .layer(DefaultBodyLimit::max(BODY_LIMIT))
+}
