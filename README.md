@@ -17,7 +17,10 @@ rust-alc-api と同じ。
 | `/api/measurements` | GET | 絞り込み (`employee_id`・`result_type`/`result`・`date_from`/`from`・`date_to`/`to`・`status`) と `measured_at` の新しい順のページ (`per_page` 既定 50・上限 100、`page` 既定 1・下限 1)。応答は `{measurements, total, page, per_page}` |
 | `/api/measurements/{id}` | GET | 1 件 (無ければ 404) |
 
-顔写真・動画の口 (`/api/measurements/{id}/face-photo`・`/video`) はまだ rust に在る (R2 と一緒に別の PR で移す)。
+| `/api/measurements/{id}/face-photo` | GET | R2 の顔写真 (`image/jpeg`、`Cache-Control: private, max-age=3600`)。測定が無い・URL が NULL は 404、キーを取り出せない・R2 の失敗は 500、R2 の binding が無ければ 503 |
+| `/api/measurements/{id}/video` | GET | R2 の動画 (`video/webm`)。上と同じ |
+
+キーは保存した URL から要求の `tenant_id` で切り出す (`{tenant}/{uuid}.jpg`・`{tenant}/blow-video/{uuid}.webm`)。rust と違い、別 tenant の URL は読めない (500)。
 
 **通常点呼の記録**: 保存の本文に `record_as_tenko: true` があり、保存の後の状態が `completed` なら、同じ transaction で
 点呼セッションと点呼記録を 1 組作る (rust と同じ)。結果 `fail` / `over` は中止 (中止理由「アルコール検知」)、`pass` / `normal` は完了、

@@ -81,7 +81,7 @@ async fn test_measurement_tenant_isolation() {
 
 #[tokio::test]
 async fn test_all_routes_need_tenant_header() {
-    // X-Tenant-ID が無い・UUID でない → 401 (rust の test_measurements_no_auth。顔写真・動画の口はここに無い)
+    // X-Tenant-ID が無い・UUID でない → 401 (rust の test_measurements_no_auth。顔写真・動画の口も同じ)
     let app = app().await;
     let id = Uuid::new_v4();
     let routes = [
@@ -97,6 +97,8 @@ async fn test_all_routes_need_tenant_header() {
             Some(json!({"employee_id": id})),
         ),
         ("GET", format!("/api/measurements/{id}"), None),
+        ("GET", format!("/api/measurements/{id}/face-photo"), None),
+        ("GET", format!("/api/measurements/{id}/video"), None),
         (
             "PUT",
             format!("/api/measurements/{id}"),
@@ -122,19 +124,6 @@ async fn test_all_routes_need_tenant_header() {
         )
         .await;
         assert_eq!(res.status, 401, "{method} {uri} (UUID でない)");
-    }
-    // 顔写真・動画の口はこの Worker に無い (rust に残る)
-    let tenant = tenant().await;
-    for sub in ["face-photo", "video"] {
-        let res = call(
-            &app,
-            "GET",
-            &format!("/api/measurements/{id}/{sub}"),
-            Some(tenant),
-            None,
-        )
-        .await;
-        assert_eq!(res.status, 404, "{sub}");
     }
 }
 

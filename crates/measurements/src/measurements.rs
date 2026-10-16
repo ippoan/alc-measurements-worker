@@ -9,7 +9,7 @@
 //!   (`per_page` 既定 50・上限 100、`page` 既定 1・下限 1)
 //! - `GET /measurements/{id}` — 1 件 (無ければ 404)
 //!
-//! 顔写真・動画の口 (`/measurements/{id}/face-photo`・`/video`) はここに無い (rust に残る。別の PR で移す)。
+//! 顔写真・動画の口 (`/measurements/{id}/face-photo`・`/video`) は [`crate::files`]。
 
 use alc_core_wasm::{DeviceDevSlot, TenantId};
 use alc_worker_db::PgClient;

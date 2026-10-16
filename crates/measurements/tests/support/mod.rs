@@ -16,7 +16,9 @@ use alc_worker_db::PgClient;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request};
 use axum::Router;
+use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
+use measurements::files::{FileStore, SharedStore, StoreError};
 use measurements::{router, AppState};
 use serde_json::Value;
 use tokio::sync::OnceCell;
@@ -306,13 +308,57 @@ impl App {
     }
 }
 
-/// worker の src/lib.rs と同じ組み立て
+/// R2 のモック。`objects` に在るキーだけ返し、無いキーは失敗 (本物の R2 の「オブジェクト無し」と同じ)。
+/// 読まれたキーを `gets` に残す
+#[derive(Default)]
+pub struct MockStore {
+    pub objects: StdMutex<std::collections::HashMap<String, Vec<u8>>>,
+    pub gets: StdMutex<Vec<String>>,
+}
+
+impl MockStore {
+    pub fn with(key: &str, bytes: &[u8]) -> Arc<Self> {
+        let store = Self::default();
+        store
+            .objects
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), bytes.to_vec());
+        Arc::new(store)
+    }
+
+    pub fn gets(&self) -> Vec<String> {
+        self.gets.lock().unwrap().clone()
+    }
+}
+
+impl FileStore for MockStore {
+    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Vec<u8>, StoreError>> {
+        Box::pin(async move {
+            self.gets.lock().unwrap().push(key.to_owned());
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or(StoreError("missing"))
+        })
+    }
+}
+
+/// worker の src/lib.rs と同じ組み立て (R2 は無し)
 pub fn build(pg: PgClient) -> App {
+    build_with(pg, None)
+}
+
+/// worker の src/lib.rs と同じ組み立て。`files` は R2 の置き場 (無ければ顔写真・動画の口は 503)
+pub fn build_with(pg: PgClient, files: Option<SharedStore>) -> App {
     let logs = Arc::new(StdMutex::new(Vec::new()));
     let sink = logs.clone();
     let state = AppState {
         pg: Arc::new(Mutex::new(pg)),
         log: Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned())),
+        files,
     };
     App {
         router: router().with_state(state),

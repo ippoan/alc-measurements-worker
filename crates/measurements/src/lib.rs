@@ -8,7 +8,8 @@
 //!   normal_tenko.rs と、tenko_sessions.rs・repo/tenko_sessions.rs の共有部分の写し
 //! - [`carins`] — 電子車検証の番号の検査と、車検期限の照合 (rust の `alc-core` の car_inspections の写し)
 //!
-//! 顔写真・動画の口 (`/api/measurements/{id}/face-photo`・`/video`) はまだ rust に在る (別の PR で R2 と一緒に移す)。
+//! - [`files`] — 顔写真・動画の口 (`/api/measurements/{id}/face-photo`・`/video`。R2 から読んで返す。置き場は
+//!   [`files::FileStore`] で差し替える)
 //!
 //! 全部の口が `X-Tenant-ID` を要る (auth-worker が付ける。無い・UUID でない → 401。`alc_core_wasm::require_tenant_header`)。
 //! rust と同じく role は見ない。dev端末の印 `X-Device-Dev` は rust と同じく接続の設定 `app.device_dev` に通す
@@ -17,6 +18,7 @@
 //! ログ・エラー応答は固定の語だけ (エラーの文・識別子・入力値を載せない。DB のエラーは `kind` = SQLSTATE か固定の label)。
 
 pub mod carins;
+pub mod files;
 pub mod measurements;
 pub mod models;
 pub mod tenko;
@@ -38,11 +40,13 @@ pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 pub struct AppState {
     pub pg: Arc<Mutex<PgClient>>,
     pub log: LogSink,
+    /// 顔写真・動画の置き場 (R2)。無ければ (binding が無い) その 2 口だけ 503
+    pub files: Option<files::SharedStore>,
 }
 
 impl AppState {
     /// DB の失敗を固定の語でログに出し、500 にする
-    fn db_fail(&self, stage: &str, e: &tokio_postgres::Error) -> StatusCode {
+    pub(crate) fn db_fail(&self, stage: &str, e: &tokio_postgres::Error) -> StatusCode {
         (self.log)(&format!("measurements: {stage} failed: db ({})", kind(e)));
         StatusCode::INTERNAL_SERVER_ERROR
     }
@@ -75,6 +79,7 @@ pub const BODY_LIMIT: usize = 20 * 1024 * 1024;
 pub fn router() -> Router<AppState> {
     // 後に足した route_layer が外側: slot を置く → tenant と dev の印を読む → 口
     let api = measurements::router()
+        .merge(files::router())
         .route_layer(middleware::from_fn(require_tenant_header))
         .route_layer(middleware::from_fn(with_device_dev_slot));
     Router::new()
