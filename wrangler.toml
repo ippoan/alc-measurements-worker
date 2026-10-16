@@ -39,6 +39,12 @@ enabled = true
 binding = "MEASUREMENTS_HYPERDRIVE"
 id = "6bdf446634034f989d4e094d5510b162"
 
+# 顔写真・動画の R2 (rust-alc-api の本番の bucket と同じで、既存の写真・動画をそのまま読む。読むだけ。src/r2.rs)。
+# binding は env に継承されないので、staging は下で別の bucket を指す
+[[r2_buckets]]
+binding = "MEASUREMENTS_R2"
+bucket_name = "alc-face-photos"
+
 # staging: DB は ippoan/alc-vein-worker の staging と同じもの (Workers VPC の binding MEASUREMENTS_DB_VPC から
 # 既存の Tunnel 経由で PgBouncer へ繋ぐ。src/db.rs)。Hyperdrive は通さない。
 [env.staging]
@@ -63,6 +69,11 @@ binding = "MEASUREMENTS_DB_VPC"
 # service_id は VPC Service の参照 (宛先の Tunnel・host:port は Service 側に閉じる)
 service_id = "01a0efa3-57ee-7631-912e-7f261d828127"
 remote = true
+
+# staging の R2 は staging 用の bucket (本番の bucket を指すと本番の写真・動画を読む。scripts/check-exposure.sh が検査)
+[[env.staging.r2_buckets]]
+binding = "MEASUREMENTS_R2"
+bucket_name = "alc-face-photos-staging"
 
 # ローカル (`wrangler dev --env local`) 専用。deploy しない。
 # binding を持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL の段で繋ぐ

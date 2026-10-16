@@ -10,16 +10,22 @@
 #![cfg(target_arch = "wasm32")]
 
 mod db;
+mod r2;
 mod tcp;
 
 use std::sync::Arc;
 
+use crate::r2::R2Store;
 use axum::body::Body;
 use axum::http::{HeaderValue, Response, StatusCode};
 use futures_util::lock::Mutex;
 use measurements::{router, AppState, LogSink};
 use tower_service::Service;
 use worker::{console_error, event, Context, Env, HttpRequest, Result, WorkerVersionMetadata};
+
+/// 顔写真・動画の R2 の binding (wrangler.toml の `[[r2_buckets]]`。本番と staging で別の bucket)。
+/// 無ければ顔写真・動画の口だけが 503 (ほかの口は動く)
+const MEASUREMENTS_R2_BINDING: &str = "MEASUREMENTS_R2";
 
 fn log_sink() -> LogSink {
     Arc::new(|message| console_error!("{message}"))
@@ -54,6 +60,10 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
     let state = AppState {
         pg: Arc::new(Mutex::new(pg)),
         log: log_sink(),
+        files: env
+            .bucket(MEASUREMENTS_R2_BINDING)
+            .ok()
+            .map(|b| Arc::new(R2Store::new(b)) as measurements::files::SharedStore),
     };
     let mut resp = match router().with_state(state).call(req).await {
         Ok(r) => r,

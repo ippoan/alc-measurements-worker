@@ -4,7 +4,7 @@
 #   MEASUREMENTS_TEST_ADMIN_DATABASE_URL=... cargo llvm-cov --locked -p measurements --text > cov-measurements.txt
 #   bash scripts/check_coverage_100.sh --use-cache cov-measurements.txt
 #
-# 計測するのは `cargo test -p measurements` の全部 = 各 module の単体テスト (純粋関数) と tests/api_db.rs・normal_tenko_db.rs
+# 計測するのは `cargo test -p measurements` の全部 = 各 module の単体テスト (純粋関数) と tests/api_db.rs・files_db.rs・normal_tenko_db.rs
 # (口から実 DB まで。接続先が無ければ失敗する)。
 # worker 本体 (直下の src/、wasm 専用) は native で計測できないので対象外。
 
@@ -15,6 +15,10 @@ path = "crates/measurements/src/lib.rs"
 # 5 口 (検証の 400・404・一覧の動的 WHERE とページ・DB の失敗)
 [[files]]
 path = "crates/measurements/src/measurements.rs"
+
+# 顔写真・動画の 2 口 (404・キーの取り出し・R2 の失敗・DB の失敗・binding 無しの 503)
+[[files]]
+path = "crates/measurements/src/files.rs"
 
 # 行の読み取り (Measurement の 19 列)
 [[files]]
