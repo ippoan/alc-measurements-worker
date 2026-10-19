@@ -52,9 +52,9 @@ bucket_name = "alc-face-photos"
 [[send_email]]
 name = "ALERT_EMAIL"
 
-# 差出人 (送信ドメインは Cloudflare の Email Sending で確認済みのもの)。env に継承されないので staging は下で別に書く
+# 差出人 (送信ドメイン ippoan.org は Cloudflare の Email Routing が有効なもの)。env に継承されないので staging は下で別に書く
 [vars]
-NOTIFY_EMAIL_FROM = "alc-alert@mtamaramu.com"
+NOTIFY_EMAIL_FROM = "alc-alert@ippoan.org"
 
 # staging: DB は ippoan/alc-vein-worker の staging と同じもの (Workers VPC の binding MEASUREMENTS_DB_VPC から
 # 既存の Tunnel 経由で PgBouncer へ繋ぐ。src/db.rs)。Hyperdrive は通さない。
@@ -91,7 +91,7 @@ bucket_name = "alc-face-photos-staging"
 name = "ALERT_EMAIL"
 
 [env.staging.vars]
-NOTIFY_EMAIL_FROM = "alc-alert@mtamaramu.com"
+NOTIFY_EMAIL_FROM = "alc-alert@ippoan.org"
 
 # ローカル (`wrangler dev --env local`) 専用。deploy しない。
 # binding を持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL の段で繋ぐ
