@@ -26,6 +26,15 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
   `{tenant}/{uuid}.jpg`・`{tenant}/blow-video/{uuid}.webm` の形に一致しなければ 500。rust は `{R2_PUBLIC_URL_BASE}/` を剥ぐが、
   その既定値に account ID が入り public repo に書けないため。**別 tenant の写真を指す URL は読めない (rust より厳しい)。**
 
+## アルコール検知メール (`alert.rs`・`src/mail.rs`)
+DB の列 `alcohol_level` が **旧が NULL か 0 以下 → 新が 0 より上** になった保存だけ、テナントの notify グループ「アルコール検知」
+(`notify_groups`・`notify_recipient_groups`・`notify_recipients` の既存の表。専用の表は作らない) の使える宛先 (`enabled`・email あり) へ
+**1 人 1 通**。PUT は tx の中で旧値を `FOR UPDATE` で読み、判定は UPDATE 後の値で見る (値を送らない PUT は COALESCE で旧値が残る)。
+宛先は commit 後の短い tenant_tx で引き (失敗しても保存は残る)、送るのは pg の lock を放してから (`alert::prepare` → `drop(pg)` → `alert::deliver`)。
+送信の失敗はログ 1 行だけで応答は変えない・リトライしない。ログにメールアドレス・tenant_id・氏名を出さない (グループ無しだけ別の語)。
+送り手は `send_email` の binding `ALERT_EMAIL` (**トップと staging の両方**・`destination_address` は書かない) と変数 `NOTIFY_EMAIL_FROM`。
+どちらかが無ければ送らない。
+
 ## 規範
 - 公開範囲を弱めない: 本番・staging とも Service Binding だけ (どの env も `workers_dev`/`preview_urls` = false、route 無し)。
   Hyperdrive (`MEASUREMENTS_HYPERDRIVE`) は本番だけ。R2 `MEASUREMENTS_R2` は本番 `alc-face-photos`・staging `alc-face-photos-staging`
@@ -42,6 +51,6 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
   **`tenko.rs` の `status_for_result`・`record_payload`・`insert_record`・`TenkoSession` は rust (alc-tenko) と 2 か所に在る**
   (rust の自動点呼が同じものを使う)。片方を変えたらもう片方も変える (列・規則・record_hash の作り方)。
   serde_json に `preserve_order` を付けない (record_data の key の順 = hash が rust と変わる)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 13・api_db 9・files_db 14・normal_tenko_db 26) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 15・api_db 9・files_db 14・normal_tenko_db 26・alert_db 15) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・Hyperdrive の設定の ID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-trouble-worker と同じ rev)。

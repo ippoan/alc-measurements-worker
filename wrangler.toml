@@ -45,6 +45,17 @@ id = "6bdf446634034f989d4e094d5510b162"
 binding = "MEASUREMENTS_R2"
 bucket_name = "alc-face-photos"
 
+# アルコール検知メール (Refs ippoan/alc-app#436): 測定のアルコール値が 0 より上になったら、テナントの notify のグループ
+# 「アルコール検知」のメンバーへ 1 人 1 通送る (crates/measurements/src/alert.rs、binding の包みは src/mail.rs)。
+# 送れるのは Cloudflare アカウントで確認済みの送り先だけ。**destination_address は書かない** (書くと 1 人にしか送れない)。
+# binding は env に継承されないので、staging は下で別に書く
+[[send_email]]
+name = "ALERT_EMAIL"
+
+# 差出人 (送信ドメインは Cloudflare の Email Sending で確認済みのもの)。env に継承されないので staging は下で別に書く
+[vars]
+NOTIFY_EMAIL_FROM = "alc-alert@mtamaramu.com"
+
 # staging: DB は ippoan/alc-vein-worker の staging と同じもの (Workers VPC の binding MEASUREMENTS_DB_VPC から
 # 既存の Tunnel 経由で PgBouncer へ繋ぐ。src/db.rs)。Hyperdrive は通さない。
 [env.staging]
@@ -74,6 +85,13 @@ remote = true
 [[env.staging.r2_buckets]]
 binding = "MEASUREMENTS_R2"
 bucket_name = "alc-face-photos-staging"
+
+# アルコール検知メール。トップレベルと同じ binding と差出人 (destination_address は書かない)
+[[env.staging.send_email]]
+name = "ALERT_EMAIL"
+
+[env.staging.vars]
+NOTIFY_EMAIL_FROM = "alc-alert@mtamaramu.com"
 
 # ローカル (`wrangler dev --env local`) 専用。deploy しない。
 # binding を持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL の段で繋ぐ

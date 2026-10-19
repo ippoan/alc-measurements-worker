@@ -18,6 +18,7 @@ use axum::http::{HeaderMap, Request};
 use axum::Router;
 use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
+use measurements::alert::{AlertMail, AlertMailer, MailError, SharedMailer};
 use measurements::files::{FileStore, SharedStore, StoreError};
 use measurements::{router, AppState};
 use serde_json::Value;
@@ -353,16 +354,73 @@ pub fn build(pg: PgClient) -> App {
 
 /// worker の src/lib.rs と同じ組み立て。`files` は R2 の置き場 (無ければ顔写真・動画の口は 503)
 pub fn build_with(pg: PgClient, files: Option<SharedStore>) -> App {
+    build_full(pg, files, None)
+}
+
+/// worker の src/lib.rs と同じ組み立て。`mailer` はアルコール検知メールの送り手 (無ければ送らない)
+pub fn build_mailer(pg: PgClient, mailer: Option<SharedMailer>) -> App {
+    build_full(pg, None, mailer)
+}
+
+fn build_full(pg: PgClient, files: Option<SharedStore>, mailer: Option<SharedMailer>) -> App {
     let logs = Arc::new(StdMutex::new(Vec::new()));
     let sink = logs.clone();
     let state = AppState {
         pg: Arc::new(Mutex::new(pg)),
         log: Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned())),
         files,
+        mailer,
     };
     App {
         router: router().with_state(state),
         logs,
+    }
+}
+
+/// アルコール検知メールの送り手の偽物。送った 1 通ずつを `sent` に残し、`fail_to` の宛先への送信は失敗させる
+/// (Cloudflare で確認済みでない送り先と同じ)。失敗した宛先も `attempted` には残る
+#[derive(Default)]
+pub struct MockMailer {
+    pub sent: StdMutex<Vec<AlertMail>>,
+    pub attempted: StdMutex<Vec<String>>,
+    pub fail_to: StdMutex<Vec<String>>,
+}
+
+impl MockMailer {
+    pub fn failing(to: &[&str]) -> Arc<Self> {
+        let mailer = Self::default();
+        *mailer.fail_to.lock().unwrap() = to.iter().map(|s| s.to_string()).collect();
+        Arc::new(mailer)
+    }
+
+    pub fn sent(&self) -> Vec<AlertMail> {
+        self.sent.lock().unwrap().clone()
+    }
+
+    /// 送れた宛先 (昇順)
+    pub fn sent_to(&self) -> Vec<String> {
+        let mut to: Vec<String> = self.sent().into_iter().map(|m| m.to).collect();
+        to.sort();
+        to
+    }
+
+    pub fn attempted(&self) -> Vec<String> {
+        let mut to = self.attempted.lock().unwrap().clone();
+        to.sort();
+        to
+    }
+}
+
+impl AlertMailer for MockMailer {
+    fn send<'a>(&'a self, mail: &'a AlertMail) -> BoxFuture<'a, Result<(), MailError>> {
+        Box::pin(async move {
+            self.attempted.lock().unwrap().push(mail.to.clone());
+            if self.fail_to.lock().unwrap().contains(&mail.to) {
+                return Err(MailError("send"));
+            }
+            self.sent.lock().unwrap().push(mail.clone());
+            Ok(())
+        })
     }
 }
 

@@ -1,0 +1,255 @@
+//! アルコール検知メール (Refs ippoan/alc-app#436)。測定のアルコール値が 0 より上になった保存で、テナントの notify の
+//! グループ「アルコール検知」のメンバーへ 1 人 1 通のメールを送る。宛先は notify の既存の表 (`notify_groups`・
+//! `notify_recipient_groups`・`notify_recipients`) から引き、専用の表は作らない。
+//!
+//! # 送る条件
+//!
+//! アルコール値 (`alcohol_level`。機器の判定 `over` ではない) が **旧が NULL か 0 以下 → 新が 0 より上** になった保存だけ
+//! ([`should_alert`])。POST は旧値が無いので新が 0 より上なら送る。同じ測定を >0 のまま保存し直しても、>0 → 0 → >0 と
+//! 戻しても、1 回目の >0 の 1 通だけ (戻したあとの >0 は新しい通知)。旧値は PUT の transaction の中で `FOR UPDATE` で読む
+//! (同じ測定への PUT が並んでも、条件を満たす保存は 1 つだけ)。
+//!
+//! # 流れ (lock を握ったまま送らない)
+//!
+//! 1. 保存の transaction (旧値の読みと判定) が commit される
+//! 2. [`prepare`] — pg の lock を持ったまま、短い tenant_tx 1 回で宛先と乗務員名を引く (RLS が効く)。保存とは別の
+//!    transaction なので、ここの失敗で保存は巻き戻らない (ログ 1 行で送らない)
+//! 3. lock を放してから [`deliver`] — 宛先ごとに 1 通ずつ送る (1 人が未確認の送り先でも他の人へ届くように)。
+//!    失敗はログ 1 行だけで、保存の応答は変えない。リトライしない
+//!
+//! 送るのは [`AlertMailer`] (Worker では Cloudflare の `send_email` binding、テストでは偽物)。無ければ (`None`) 送らない。
+//! **ログは固定の語だけ** (メールアドレス・tenant_id・氏名を出さない)。
+
+use std::sync::Arc;
+
+use alc_worker_db::PgClient;
+use chrono::FixedOffset;
+use futures_util::future::BoxFuture;
+use tokio_postgres::types::Type;
+use uuid::Uuid;
+
+use crate::models::Measurement;
+use crate::tenko::sql::EMPLOYEE_NAME;
+use crate::{set_device_dev, AppState, LogSink};
+
+/// 宛先のグループの名前 (テナントごとに notify の画面で作る。`notify_groups` は (tenant_id, name) が UNIQUE)
+pub const ALERT_GROUP: &str = "アルコール検知";
+
+/// 乗務員の名前が引けないときの表示
+pub const UNKNOWN_EMPLOYEE: &str = "不明";
+
+/// 送信の段の失敗。持つのは段の名前だけ (宛先・本文・ランタイムのエラー文を持たない)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailError(pub &'static str);
+
+/// 1 人宛の 1 通 (差出人は送り手 [`AlertMailer`] が持つ)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertMail {
+    pub to: String,
+    pub subject: String,
+    pub body: String,
+}
+
+/// メールの送り手 (Worker では `send_email` の binding `ALERT_EMAIL`、テストでは偽物)。
+/// axum の state と handler が要るので `Send + Sync` で `Send` な future を返す
+pub trait AlertMailer: Send + Sync {
+    fn send<'a>(&'a self, mail: &'a AlertMail) -> BoxFuture<'a, Result<(), MailError>>;
+}
+
+pub type SharedMailer = Arc<dyn AlertMailer>;
+
+/// 宛先と乗務員名を引く SQL。グループ → (LEFT JOIN) メンバー → 宛先。グループが在ってメンバーが 0 でも
+/// グループの行は 1 行返る (email は NULL)。グループが無ければ 0 行 — 設定漏れと「メンバー 0」を見分けるため。
+/// 使えない宛先 (`enabled` でない・email が NULL) は JOIN の条件で落とす (NULL の行になる)。WHERE に tenant_id も明示する
+pub const RECIPIENTS: &str = "SELECT r.email \
+     FROM notify_groups g \
+     LEFT JOIN notify_recipient_groups m ON m.group_id = g.id \
+     LEFT JOIN notify_recipients r ON r.id = m.recipient_id \
+         AND r.tenant_id = $2 AND r.enabled AND r.email IS NOT NULL \
+     WHERE g.name = $1 AND g.tenant_id = $2";
+
+/// 旧が NULL か 0 以下で、新が 0 より上のときだけ true
+pub fn should_alert(old: Option<f64>, new: Option<f64>) -> bool {
+    new.is_some_and(|v| v > 0.0) && !old.is_some_and(|v| v > 0.0)
+}
+
+/// 件名と本文 (日本語。測定日時は日本時間)。乗務員名の改行は空白にする (件名に改行を入れさせない)
+pub fn compose(employee_name: &str, m: &Measurement) -> (String, String) {
+    let name = employee_name.replace(['\r', '\n'], " ");
+    let jst = FixedOffset::east_opt(9 * 3600).expect("+09:00");
+    let measured_at = m
+        .measured_at
+        .with_timezone(&jst)
+        .format("%Y-%m-%d %H:%M:%S");
+    let level = m.alcohol_level.unwrap_or_default();
+    let subject = format!("アルコール検知: {name}");
+    let body = format!(
+        "アルコールが検知されました。\n\n\
+         乗務員: {name}\n\
+         アルコール値: {level}\n\
+         測定日時: {measured_at} (日本時間)\n\
+         測定 ID: {}\n",
+        m.id
+    );
+    (subject, body)
+}
+
+/// 宛先の email と乗務員名を、短い tenant_tx 1 回で引く。(グループが在るか, 使える宛先の email, 乗務員名)
+async fn lookup(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    dev: bool,
+    employee_id: Uuid,
+) -> Result<(bool, Vec<String>, String), tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            set_device_dev(tx, dev).await?;
+            let rows = tx
+                .query_typed(
+                    RECIPIENTS,
+                    &[(&ALERT_GROUP, Type::TEXT), (&tenant_id, Type::UUID)],
+                )
+                .await?;
+            let mut emails: Vec<String> = rows
+                .iter()
+                .filter_map(|r| r.get::<_, Option<String>>(0))
+                .filter(|e| !e.trim().is_empty())
+                .collect();
+            // 同じ email の宛先が 2 つ在っても 1 通
+            emails.sort();
+            emails.dedup();
+            let name = tx
+                .query_typed_opt(
+                    EMPLOYEE_NAME,
+                    &[(&employee_id, Type::UUID), (&tenant_id, Type::UUID)],
+                )
+                .await?
+                .map(|r| r.get::<_, String>(0));
+            Ok((
+                !rows.is_empty(),
+                emails,
+                name.unwrap_or_else(|| UNKNOWN_EMPLOYEE.to_owned()),
+            ))
+        })
+    })
+    .await
+}
+
+/// 送る用意ができた通数 (送り手と、宛先ごとの 1 通)
+pub struct Outbox {
+    mailer: SharedMailer,
+    mails: Vec<AlertMail>,
+}
+
+/// 保存が条件を満たした (`alert`) ときだけ、宛先を引いて送る用意をする。送らない理由はログ 1 行 (固定の語。
+/// グループが無いときだけ別の語 = 設定漏れの見分け)。**pg の lock を持ったまま呼び、返したあとに lock を放してから
+/// [`deliver`] する**
+pub async fn prepare(
+    state: &AppState,
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    dev: bool,
+    alert: bool,
+    m: &Measurement,
+) -> Option<Outbox> {
+    if !alert {
+        return None;
+    }
+    let Some(mailer) = state.mailer.clone() else {
+        (state.log)("measurements: alert skipped: no mailer");
+        return None;
+    };
+    let (group_exists, emails, name) = match lookup(pg, tenant_id, dev, m.employee_id).await {
+        Ok(found) => found,
+        Err(e) => {
+            // 保存はもう commit 済み。ログだけ残して送らない
+            state.db_fail("alert lookup", &e);
+            return None;
+        }
+    };
+    if !group_exists {
+        (state.log)("measurements: alert skipped: no group");
+        return None;
+    }
+    if emails.is_empty() {
+        (state.log)("measurements: alert skipped: no recipients");
+        return None;
+    }
+    let (subject, body) = compose(&name, m);
+    let mails = emails
+        .into_iter()
+        .map(|to| AlertMail {
+            to,
+            subject: subject.clone(),
+            body: body.clone(),
+        })
+        .collect();
+    Some(Outbox { mailer, mails })
+}
+
+/// 宛先ごとに 1 通ずつ送る。失敗はログ 1 行 (段の名前だけ) で、ほかの宛先へは続ける。リトライしない
+pub async fn deliver(outbox: Option<Outbox>, log: &LogSink) {
+    if let Some(outbox) = outbox {
+        for mail in &outbox.mails {
+            if let Err(e) = outbox.mailer.send(mail).await {
+                log(&format!("measurements: alert send failed: {}", e.0));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{DateTime, Utc};
+
+    #[test]
+    fn alert_only_when_the_value_rises_above_zero() {
+        // 旧が NULL か 0 以下 → 新が > 0 だけ true
+        assert!(should_alert(None, Some(0.01)));
+        assert!(should_alert(Some(0.0), Some(0.01)));
+        assert!(should_alert(Some(-1.0), Some(0.01)));
+        // 新が NULL・0・負 → false
+        assert!(!should_alert(None, None));
+        assert!(!should_alert(None, Some(0.0)));
+        assert!(!should_alert(Some(0.0), Some(-0.5)));
+        assert!(!should_alert(Some(0.2), None));
+        // 旧がすでに > 0 → false (>0 → >0・>0 → 0)
+        assert!(!should_alert(Some(0.01), Some(0.2)));
+        assert!(!should_alert(Some(0.2), Some(0.0)));
+        // NaN は > 0 ではない
+        assert!(!should_alert(None, Some(f64::NAN)));
+    }
+
+    #[test]
+    fn compose_is_japanese_with_jst_time_and_a_single_line_subject() {
+        let at: DateTime<Utc> = "2026-09-12T15:30:00Z".parse().unwrap();
+        let m = Measurement {
+            id: Uuid::nil(),
+            tenant_id: Uuid::nil(),
+            employee_id: Uuid::nil(),
+            alcohol_level: Some(0.15),
+            result: None,
+            device_use_count: 0,
+            face_photo_url: None,
+            video_url: None,
+            measured_at: at,
+            created_at: at,
+            updated_at: at,
+            status: "completed".into(),
+            temperature: None,
+            systolic: None,
+            diastolic: None,
+            pulse: None,
+            medical_measured_at: None,
+            face_verified: None,
+            medical_manual_input: None,
+        };
+        let (subject, body) = compose("山田\r\n太郎", &m);
+        assert_eq!(subject, "アルコール検知: 山田  太郎");
+        assert!(body.contains("乗務員: 山田  太郎\n"));
+        assert!(body.contains("アルコール値: 0.15\n"));
+        assert!(body.contains("測定日時: 2026-09-13 00:30:00 (日本時間)\n"));
+        assert!(body.contains("測定 ID: 00000000-0000-0000-0000-000000000000\n"));
+    }
+}

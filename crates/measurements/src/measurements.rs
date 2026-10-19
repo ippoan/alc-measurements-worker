@@ -21,6 +21,7 @@ use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::Error;
 use uuid::Uuid;
 
+use crate::alert::{self, should_alert};
 use crate::carins::normalize_carins_numbers;
 use crate::models::{
     CreateMeasurement, Measurement, MeasurementFilter, MeasurementsResponse, StartMeasurement,
@@ -99,6 +100,11 @@ pub mod sql {
              RETURNING {MEASUREMENT_COLUMNS}"
         )
     }
+
+    /// 保存の前の値 (`FOR UPDATE`。同じ測定への PUT が並んでも、アルコール検知メールの条件を満たす保存は 1 つだけ)。
+    /// DB の列名は `alcohol_level` (API の欄 `alcohol_value` ではない)
+    pub const OLD_ALCOHOL_LEVEL: &str =
+        "SELECT alcohol_level FROM measurements WHERE id = $1 AND tenant_id = $2 FOR UPDATE";
 
     pub fn get() -> String {
         format!("SELECT {MEASUREMENT_COLUMNS} FROM measurements WHERE id = $1 AND tenant_id = $2")
@@ -180,7 +186,7 @@ pub async fn create(
     dev: bool,
     input: CreateMeasurement,
     log: LogSink,
-) -> Result<Measurement, Error> {
+) -> Result<(Measurement, bool), Error> {
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
             set_device_dev(tx, dev).await?;
@@ -207,6 +213,8 @@ pub async fn create(
                 )
                 .await?;
             let m = Measurement::from_row(&row);
+            // INSERT なので旧値は無い (新が 0 より上なら検知メールを送る)
+            let alert = should_alert(None, m.alcohol_level);
             // POST は点呼方法・本人確認の方法を受けない (従来どおり通常点呼・記録なし)。点呼セッションの id も返さない
             let tenko = NormalTenkoInput {
                 tenko_type: input.tenko_type,
@@ -216,7 +224,7 @@ pub async fn create(
                 carins_vehicle_id: input.carins_vehicle_id,
             };
             record_as_tenko_if_marked(tx, &m, input.record_as_tenko, &tenko, &log).await;
-            Ok(m)
+            Ok((m, alert))
         })
     })
     .await
@@ -229,11 +237,19 @@ pub async fn update(
     id: Uuid,
     input: UpdateMeasurement,
     log: LogSink,
-) -> Result<Option<UpdatedMeasurement>, Error> {
+) -> Result<Option<(UpdatedMeasurement, bool)>, Error> {
     let found = pg
         .tenant_tx(tenant_id, move |tx| {
             Box::pin(async move {
                 set_device_dev(tx, dev).await?;
+                // 旧値は UPDATE の前に読む (点呼の記録の区切りより前)。行が無ければ UPDATE も何も返さず Ok(None)
+                let old_level: Option<f64> = tx
+                    .query_typed_opt(
+                        sql::OLD_ALCOHOL_LEVEL,
+                        &[(&id, Type::UUID), (&tenant_id, Type::UUID)],
+                    )
+                    .await?
+                    .and_then(|r| r.get::<_, Option<f64>>(0));
                 let row = tx
                     .query_typed_opt(
                         &sql::update(),
@@ -260,6 +276,8 @@ pub async fn update(
                 let Some(m) = row.as_ref().map(Measurement::from_row) else {
                     return Ok(None);
                 };
+                // 入力に値が無くても COALESCE で旧値が残るので、input ではなく UPDATE 後の m で見る
+                let alert = should_alert(old_level, m.alcohol_level);
                 let tenko = NormalTenkoInput {
                     tenko_type: input.tenko_type,
                     tenko_method: input.tenko_method,
@@ -269,16 +287,19 @@ pub async fn update(
                 };
                 let session_id =
                     record_as_tenko_if_marked(tx, &m, input.record_as_tenko, &tenko, &log).await;
-                Ok(Some((m, session_id)))
+                Ok(Some((m, session_id, alert)))
             })
         })
         .await?;
-    Ok(
-        found.map(|(measurement, tenko_session_id)| UpdatedMeasurement {
-            measurement,
-            tenko_session_id,
-        }),
-    )
+    Ok(found.map(|(measurement, tenko_session_id, alert)| {
+        (
+            UpdatedMeasurement {
+                measurement,
+                tenko_session_id,
+            },
+            alert,
+        )
+    }))
 }
 
 pub async fn get_one(
@@ -379,11 +400,15 @@ async fn update_measurement(
 
     let dev = dev.get();
     let mut pg = state.pg.lock().await;
-    update(&mut pg, tenant_id, dev, id, body, state.log.clone())
+    let found = update(&mut pg, tenant_id, dev, id, body, state.log.clone())
         .await
-        .map_err(|e| state.db_fail("measurement update", &e))?
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .map_err(|e| state.db_fail("measurement update", &e))?;
+    let (updated, alert) = found.ok_or(StatusCode::NOT_FOUND)?;
+    // 保存は commit 済み。宛先は lock を持ったまま引き、送るのは lock を放してから
+    let outbox = alert::prepare(&state, &mut pg, tenant_id, dev, alert, &updated.measurement).await;
+    drop(pg);
+    alert::deliver(outbox, &state.log).await;
+    Ok(Json(updated))
 }
 
 /// 測定作成 (完了済み) — オフラインキュー互換
@@ -400,9 +425,12 @@ async fn create_measurement(
 
     let dev = dev.get();
     let mut pg = state.pg.lock().await;
-    let m = create(&mut pg, tenant_id, dev, body, state.log.clone())
+    let (m, alert) = create(&mut pg, tenant_id, dev, body, state.log.clone())
         .await
         .map_err(|e| state.db_fail("measurement create", &e))?;
+    let outbox = alert::prepare(&state, &mut pg, tenant_id, dev, alert, &m).await;
+    drop(pg);
+    alert::deliver(outbox, &state.log).await;
     Ok((StatusCode::CREATED, Json(m)))
 }
 
