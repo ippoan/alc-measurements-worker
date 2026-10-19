@@ -22,6 +22,8 @@ worker-build --release && npx wrangler@4.144.0 deploy --dry-run
 DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip しない)。接続ロールは `alc_api_rt`。
 
 ## rust と違う振る舞い
+- rust に無い口 `POST /api/measurements/alert-test` (アルコール検知メールのテスト送信。`alert::alert_test`)。**この口だけ role を見る**
+  (`X-User-Role` から復元した `AuthUser` が admin でなければ 403)。宛先の引きと送信のループは検知と同じ関数 (`alert::recipients`・`alert::deliver`)。
 - 顔写真・動画のキーは、保存した URL の中で `/{要求の tenant_id}/` が**最後に**現れる位置から後ろを取り (`files::extract_key`)、
   `{tenant}/{uuid}.jpg`・`{tenant}/blow-video/{uuid}.webm` の形に一致しなければ 500。rust は `{R2_PUBLIC_URL_BASE}/` を剥ぐが、
   その既定値に account ID が入り public repo に書けないため。**別 tenant の写真を指す URL は読めない (rust より厳しい)。**
@@ -41,7 +43,7 @@ DB の列 `alcohol_level` が **旧が NULL か 0 以下 → 新が 0 より上*
   (staging が本番 bucket を指さない。R2 の await は tenant_tx の中に入れない)。`wrangler.toml` の表の順を変えない (新しい表は `[build]` より後)。
 - **ログ・エラー応答は固定の語だけ。** エラーの文 (`{e}`)・tenant_id などの識別子・入力値 (車検証の番号など) を出さない。
   DB の失敗は `measurements: <段> failed: db (<kind>)` (kind は SQLSTATE か固定の label)。応答の本文は rust と同じく空。
-- role は見ない (rust も `X-Tenant-ID` だけ)。dev端末の印 `X-Device-Dev: 1` は rust と同じく `app.device_dev` に通す
+- role は見ない (rust も `X-Tenant-ID` だけ。例外はテスト送信の口 1 本)。dev端末の印 `X-Device-Dev: 1` は rust と同じく `app.device_dev` に通す
   (`set_device_dev`。tenant_tx の最初の文。列 `is_dev` の既定値と RLS が dev の行を分ける。alc-migrations 153)。
   印は kit の `require_tenant_header` が書く `DeviceDevSlot` から読む (ヘッダを口で読み直さない)。
   **dev 端末の印を tenant_tx の中で立てている。kit に口ができたら置き換える。**
@@ -51,6 +53,6 @@ DB の列 `alcohol_level` が **旧が NULL か 0 以下 → 新が 0 より上*
   **`tenko.rs` の `status_for_result`・`record_payload`・`insert_record`・`TenkoSession` は rust (alc-tenko) と 2 か所に在る**
   (rust の自動点呼が同じものを使う)。片方を変えたらもう片方も変える (列・規則・record_hash の作り方)。
   serde_json に `preserve_order` を付けない (record_data の key の順 = hash が rust と変わる)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 15・api_db 9・files_db 14・normal_tenko_db 26・alert_db 15) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 16・api_db 9・files_db 14・normal_tenko_db 26・alert_db 21) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・Hyperdrive の設定の ID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-trouble-worker と同じ rev)。

@@ -10,6 +10,7 @@
 //! - `GET /measurements/{id}` — 1 件 (無ければ 404)
 //!
 //! 顔写真・動画の口 (`/measurements/{id}/face-photo`・`/video`) は [`crate::files`]。
+//! アルコール検知メールのテスト送信 (`POST /measurements/alert-test`。admin だけ) は [`crate::alert::alert_test`]。
 
 use alc_core_wasm::{DeviceDevSlot, TenantId};
 use alc_worker_db::PgClient;
@@ -352,6 +353,7 @@ pub fn router() -> Router<AppState> {
             post(create_measurement).get(list_measurements),
         )
         .route("/measurements/start", post(start_measurement))
+        .route("/measurements/alert-test", post(alert::alert_test))
         .route(
             "/measurements/{id}",
             get(get_measurement).put(update_measurement),
@@ -407,7 +409,7 @@ async fn update_measurement(
     // 保存は commit 済み。宛先は lock を持ったまま引き、送るのは lock を放してから
     let outbox = alert::prepare(&state, &mut pg, tenant_id, dev, alert, &updated.measurement).await;
     drop(pg);
-    alert::deliver(outbox, &state.log).await;
+    let _ = alert::deliver(outbox, &state.log).await;
     Ok(Json(updated))
 }
 
@@ -430,7 +432,7 @@ async fn create_measurement(
         .map_err(|e| state.db_fail("measurement create", &e))?;
     let outbox = alert::prepare(&state, &mut pg, tenant_id, dev, alert, &m).await;
     drop(pg);
-    alert::deliver(outbox, &state.log).await;
+    let _ = alert::deliver(outbox, &state.log).await;
     Ok((StatusCode::CREATED, Json(m)))
 }
 

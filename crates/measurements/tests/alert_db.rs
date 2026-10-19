@@ -366,3 +366,148 @@ async fn test_lookup_failure_keeps_the_save_and_logs_a_fixed_word() {
     assert!(!logs[0].contains(&tenant.to_string()));
     assert_eq!(measurement_status(&id_of(&m)).await, "completed");
 }
+
+// ---- テスト送信 (`POST /api/measurements/alert-test`。admin だけ。測定は起こさない) ----
+
+const ALERT_TEST: &str = "/api/measurements/alert-test";
+
+/// テスト送信を叩く。`role` があれば X-User-ID・X-User-Email・X-User-Role を揃えて付ける (揃わないと AuthUser が無い)
+async fn alert_test(app: &App, tenant: Uuid, role: Option<&str>) -> Got {
+    let user = Uuid::new_v4().to_string();
+    let headers: Vec<(&str, &str)> = match role {
+        Some(r) => vec![
+            ("X-User-ID", user.as_str()),
+            ("X-User-Email", "admin@example.test"),
+            ("X-User-Role", r),
+        ],
+        None => vec![],
+    };
+    call_raw(app, "POST", ALERT_TEST, Some(tenant), &headers, Vec::new()).await
+}
+
+#[tokio::test]
+async fn test_alert_test_is_admin_only() {
+    let (tenant, _) = setup(&["a@example.test"]).await;
+    let mailer = Arc::new(MockMailer::default());
+    let app = app_with(rt_client().await, &mailer);
+
+    // admin でない role・ヘッダ無し・role だけ (X-User-ID が無く AuthUser が復元されない) は 403
+    for res in [
+        alert_test(&app, tenant, Some("viewer")).await,
+        alert_test(&app, tenant, None).await,
+        call_raw(
+            &app,
+            "POST",
+            ALERT_TEST,
+            Some(tenant),
+            &[("X-User-Role", "admin")],
+            Vec::new(),
+        )
+        .await,
+    ] {
+        assert_eq!(res.status, 403);
+        assert_eq!(res.json(), json!({ "error": "forbidden" }));
+    }
+    assert!(mailer.attempted().is_empty());
+    assert!(app.logs().is_empty());
+}
+
+#[tokio::test]
+async fn test_alert_test_without_mailer_is_503() {
+    let (tenant, _) = setup(&["a@example.test"]).await;
+    let app = build_mailer(rt_client().await, None);
+
+    let res = alert_test(&app, tenant, Some("admin")).await;
+
+    assert_eq!(res.status, 503);
+    assert_eq!(res.json(), json!({ "error": "mail_unavailable" }));
+}
+
+#[tokio::test]
+async fn test_alert_test_without_recipients_is_409() {
+    let tenant = tenant().await;
+    let mailer = Arc::new(MockMailer::default());
+    let app = app_with(rt_client().await, &mailer);
+
+    // グループが無い
+    let res = alert_test(&app, tenant, Some("admin")).await;
+    assert_eq!(res.status, 409);
+    assert_eq!(res.json(), json!({ "error": "no_recipients" }));
+
+    // グループは在るが、使える宛先 (enabled・email あり) が居ない
+    let g = group(tenant, ALERT_GROUP).await;
+    member(tenant, g, None, true).await;
+    member(tenant, g, Some("off@example.test"), false).await;
+    let res = alert_test(&app, tenant, Some("admin")).await;
+    assert_eq!(res.status, 409);
+    assert_eq!(res.json(), json!({ "error": "no_recipients" }));
+    assert!(mailer.attempted().is_empty());
+}
+
+#[tokio::test]
+async fn test_alert_test_sends_one_test_mail_per_usable_recipient() {
+    let (tenant, _) = setup(&["b@example.test", "a@example.test"]).await;
+    let g: Uuid = admin()
+        .await
+        .query_one(
+            "SELECT id FROM alc_api.notify_groups WHERE tenant_id = $1 AND name = $2",
+            &[&tenant, &ALERT_GROUP],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    member(tenant, g, Some("off@example.test"), false).await;
+    member(tenant, g, None, true).await;
+    let mailer = Arc::new(MockMailer::default());
+    let app = app_with(rt_client().await, &mailer);
+
+    let res = alert_test(&app, tenant, Some("admin")).await;
+
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json(), json!({ "sent": 2, "failed": 0 }));
+    assert_eq!(mailer.attempted(), ["a@example.test", "b@example.test"]);
+    for mail in mailer.sent() {
+        assert!(mail.subject.starts_with("【テスト】"), "{}", mail.subject);
+        assert_eq!(mail.subject, "【テスト】アルコール検知: テスト送信");
+        assert!(mail.body.contains("テスト送信"), "{}", mail.body);
+        assert!(!mail.body.contains("乗務員") && !mail.body.contains("アルコール値"));
+    }
+    // 測定は起こさない
+    assert_eq!(measurement_count(tenant).await, 0);
+    assert!(app.logs().is_empty(), "{:?}", app.logs());
+}
+
+#[tokio::test]
+async fn test_alert_test_counts_a_failed_send() {
+    let (tenant, _) = setup(&["bad@example.test", "good@example.test"]).await;
+    let mailer = MockMailer::failing(&["bad@example.test"]);
+    let app = app_with(rt_client().await, &mailer);
+
+    let res = alert_test(&app, tenant, Some("admin")).await;
+
+    // 宛先ごとの成否・アドレスは返さない
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json(), json!({ "sent": 1, "failed": 1 }));
+    assert_eq!(mailer.sent_to(), ["good@example.test"]);
+    assert_eq!(app.logs(), [SEND_FAILED]);
+}
+
+#[tokio::test]
+async fn test_alert_test_lookup_failure_is_500_with_a_fixed_word() {
+    let (tenant, _) = setup(&["a@example.test"]).await;
+    let mailer = Arc::new(MockMailer::default());
+    let app = app_with(broken_client().await, &mailer);
+
+    let res = alert_test(&app, tenant, Some("admin")).await;
+
+    assert_eq!(res.status, 500);
+    assert!(res.body.is_empty());
+    assert!(mailer.attempted().is_empty());
+    let logs = app.logs();
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    assert!(
+        logs[0].starts_with("measurements: alert test lookup failed: db ("),
+        "{logs:?}"
+    );
+    assert!(!logs[0].contains(&tenant.to_string()));
+}
