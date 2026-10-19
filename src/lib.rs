@@ -10,11 +10,13 @@
 #![cfg(target_arch = "wasm32")]
 
 mod db;
+mod mail;
 mod r2;
 mod tcp;
 
 use std::sync::Arc;
 
+use crate::mail::EmailSender;
 use crate::r2::R2Store;
 use axum::body::Body;
 use axum::http::{HeaderValue, Response, StatusCode};
@@ -26,6 +28,21 @@ use worker::{console_error, event, Context, Env, HttpRequest, Result, WorkerVers
 /// 顔写真・動画の R2 の binding (wrangler.toml の `[[r2_buckets]]`。本番と staging で別の bucket)。
 /// 無ければ顔写真・動画の口だけが 503 (ほかの口は動く)
 const MEASUREMENTS_R2_BINDING: &str = "MEASUREMENTS_R2";
+
+/// アルコール検知メールの `send_email` の binding (wrangler.toml の `[[send_email]]`。トップと staging の両方に在る) と、
+/// 差出人の変数。どちらかが無ければメールは送らない (ほかの口は動く)
+const ALERT_EMAIL_BINDING: &str = "ALERT_EMAIL";
+const NOTIFY_EMAIL_FROM_VAR: &str = "NOTIFY_EMAIL_FROM";
+
+/// 送り手を作る。binding が無い・差出人が未設定なら `None`
+fn alert_mailer(env: &Env) -> Option<measurements::alert::SharedMailer> {
+    let binding = env.send_email(ALERT_EMAIL_BINDING).ok()?;
+    let from = env.var(NOTIFY_EMAIL_FROM_VAR).ok()?.to_string();
+    if from.is_empty() {
+        return None;
+    }
+    Some(Arc::new(EmailSender::new(binding, from)))
+}
 
 fn log_sink() -> LogSink {
     Arc::new(|message| console_error!("{message}"))
@@ -64,6 +81,7 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
             .bucket(MEASUREMENTS_R2_BINDING)
             .ok()
             .map(|b| Arc::new(R2Store::new(b)) as measurements::files::SharedStore),
+        mailer: alert_mailer(&env),
     };
     let mut resp = match router().with_state(state).call(req).await {
         Ok(r) => r,

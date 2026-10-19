@@ -10,6 +10,8 @@
 //!
 //! - [`files`] — 顔写真・動画の口 (`/api/measurements/{id}/face-photo`・`/video`。R2 から読んで返す。置き場は
 //!   [`files::FileStore`] で差し替える)
+//! - [`alert`] — アルコール検知メール (測定のアルコール値が 0 より上になった保存で、notify のグループ「アルコール検知」の
+//!   メンバーへ 1 人 1 通。送り手は [`alert::AlertMailer`] で差し替える)
 //!
 //! 全部の口が `X-Tenant-ID` を要る (auth-worker が付ける。無い・UUID でない → 401。`alc_core_wasm::require_tenant_header`)。
 //! rust と同じく role は見ない。dev端末の印 `X-Device-Dev` は rust と同じく接続の設定 `app.device_dev` に通す
@@ -17,6 +19,7 @@
 //! DB は `PgClient::tenant_tx` + `query_typed` 系だけ (名前付き prepared statement は使わない)。
 //! ログ・エラー応答は固定の語だけ (エラーの文・識別子・入力値を載せない。DB のエラーは `kind` = SQLSTATE か固定の label)。
 
+pub mod alert;
 pub mod carins;
 pub mod files;
 pub mod measurements;
@@ -42,6 +45,8 @@ pub struct AppState {
     pub log: LogSink,
     /// 顔写真・動画の置き場 (R2)。無ければ (binding が無い) その 2 口だけ 503
     pub files: Option<files::SharedStore>,
+    /// アルコール検知メールの送り手 (`send_email` の binding)。無ければ (binding か差出人が無い) メールは送らない
+    pub mailer: Option<alert::SharedMailer>,
 }
 
 impl AppState {
