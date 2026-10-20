@@ -362,7 +362,7 @@ pub fn build_mailer(pg: PgClient, mailer: Option<SharedMailer>) -> App {
     build_full(pg, None, mailer)
 }
 
-fn build_full(pg: PgClient, files: Option<SharedStore>, mailer: Option<SharedMailer>) -> App {
+pub fn build_full(pg: PgClient, files: Option<SharedStore>, mailer: Option<SharedMailer>) -> App {
     let logs = Arc::new(StdMutex::new(Vec::new()));
     let sink = logs.clone();
     let state = AppState {

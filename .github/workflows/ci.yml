@@ -83,7 +83,7 @@ jobs:
           awk '/Running tests\/normal_tenko_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/measurements-test.txt" \
             | grep -Eq '^test result: ok\. 26 passed; 0 failed; 0 ignored'
           awk '/Running tests\/alert_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/measurements-test.txt" \
-            | grep -Eq '^test result: ok\. 21 passed; 0 failed; 0 ignored'
+            | grep -Eq '^test result: ok\. 28 passed; 0 failed; 0 ignored'
           # -p を付けないと直下の package (worker) だけが対象になり、報告が空になる
           cargo llvm-cov report --locked -p measurements --text > "$RUNNER_TEMP/measurements-cov.txt"
           bash scripts/check_coverage_100.sh --use-cache "$RUNNER_TEMP/measurements-cov.txt"

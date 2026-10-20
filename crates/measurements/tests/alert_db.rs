@@ -8,7 +8,7 @@ mod support;
 
 use std::sync::Arc;
 
-use measurements::alert::ALERT_GROUP;
+use measurements::alert::{ALERT_GROUP, PHOTO_NOTE};
 use serde_json::{json, Value};
 use support::*;
 use uuid::Uuid;
@@ -97,6 +97,171 @@ async fn put(app: &App, tenant: Uuid, id: &str, level: Option<f64>) -> Value {
 
 fn id_of(measurement: &Value) -> String {
     measurement["id"].as_str().unwrap().to_owned()
+}
+
+const PHOTO: &[u8] = b"\xff\xd8\xffphoto-bytes";
+
+/// 保存時と同じ形のキー (`{tenant}/{uuid}.jpg`) と、その公開 URL (接頭辞はこの Worker が見ない)
+fn photo_key(tenant: Uuid) -> String {
+    format!("{tenant}/{}.jpg", Uuid::new_v4())
+}
+
+fn photo_url(key: &str) -> String {
+    format!("https://files.example.test/{key}")
+}
+
+fn app_with_files(
+    store: &Arc<MockStore>,
+    mailer: &Arc<MockMailer>,
+    pg: alc_worker_db::PgClient,
+) -> App {
+    let files: measurements::files::SharedStore = store.clone();
+    build_full(pg, Some(files), Some(mailer.clone()))
+}
+
+/// `face_photo_url` 付きで POST (201) して応答の JSON を返す
+async fn post_with_photo(app: &App, tenant: Uuid, emp: Uuid, level: f64, url: &str) -> Value {
+    let mut body = measurement_body(emp, "pass", AT, false, None);
+    body["alcohol_value"] = json!(level);
+    body["face_photo_url"] = json!(url);
+    let res = call(app, "POST", "/api/measurements", Some(tenant), Some(body)).await;
+    assert_eq!(res.status, 201);
+    res.json()
+}
+
+#[tokio::test]
+async fn test_post_attaches_the_photo_shared_between_recipients() {
+    let (tenant, emp) = setup(&["b@example.test", "a@example.test"]).await;
+    let key = photo_key(tenant);
+    let store = MockStore::with(&key, PHOTO);
+    let mailer = Arc::new(MockMailer::default());
+    let app = app_with_files(&store, &mailer, rt_client().await);
+
+    post_with_photo(&app, tenant, emp, 0.25, &photo_url(&key)).await;
+
+    let sent = mailer.sent();
+    assert_eq!(sent.len(), 2);
+    for mail in &sent {
+        let a = mail.attachment.as_ref().expect("写真が付く");
+        assert_eq!((a.filename, a.content_type), ("photo.jpg", "image/jpeg"));
+        assert_eq!(&a.bytes[..], PHOTO);
+        assert!(mail.body.ends_with(PHOTO_NOTE), "{}", mail.body);
+    }
+    // 宛先ごとに複製せず共有する。R2 の読みは 1 回
+    let (x, y) = (sent[0].attachment.as_ref(), sent[1].attachment.as_ref());
+    assert!(Arc::ptr_eq(&x.unwrap().bytes, &y.unwrap().bytes));
+    assert_eq!(store.gets(), [key]);
+    assert!(app.logs().is_empty(), "{:?}", app.logs());
+}
+
+#[tokio::test]
+async fn test_put_attaches_the_photo_saved_by_the_same_put() {
+    let (tenant, emp) = setup(&["a@example.test"]).await;
+    let key = photo_key(tenant);
+    let store = MockStore::with(&key, PHOTO);
+    let mailer = Arc::new(MockMailer::default());
+    let app = app_with_files(&store, &mailer, rt_client().await);
+    let id = start_measurement(&app, tenant, emp).await;
+
+    let mut body = completed_body("pass", AT, false, None, None);
+    body["alcohol_value"] = json!(0.1);
+    body["face_photo_url"] = json!(photo_url(&key));
+    put_measurement_ok(&app, tenant, &id, &body).await;
+
+    let sent = mailer.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(&sent[0].attachment.as_ref().unwrap().bytes[..], PHOTO);
+    assert!(app.logs().is_empty(), "{:?}", app.logs());
+}
+
+#[tokio::test]
+async fn test_without_a_photo_url_the_mail_has_no_attachment() {
+    let (tenant, emp) = setup(&["a@example.test"]).await;
+    let store = Arc::new(MockStore::default());
+    let mailer = Arc::new(MockMailer::default());
+    let app = app_with_files(&store, &mailer, rt_client().await);
+
+    post(&app, tenant, emp, 0.25).await;
+
+    let mail = &mailer.sent()[0];
+    assert_eq!(mail.attachment, None);
+    assert!(!mail.body.contains(PHOTO_NOTE));
+    assert!(store.gets().is_empty());
+    assert!(app.logs().is_empty(), "{:?}", app.logs());
+}
+
+#[tokio::test]
+async fn test_unreadable_photo_sends_the_body_only_and_logs_a_fixed_word() {
+    let (tenant, emp) = setup(&["a@example.test"]).await;
+    // 形は正しいが R2 に無いキー
+    let key = photo_key(tenant);
+    let store = Arc::new(MockStore::default());
+    let mailer = Arc::new(MockMailer::default());
+    let app = app_with_files(&store, &mailer, rt_client().await);
+
+    post_with_photo(&app, tenant, emp, 0.25, &photo_url(&key)).await;
+
+    assert_eq!(mailer.sent_to(), ["a@example.test"]);
+    assert_eq!(mailer.sent()[0].attachment, None);
+    assert!(!mailer.sent()[0].body.contains(PHOTO_NOTE));
+    assert_eq!(
+        app.logs(),
+        ["measurements: alert photo failed: storage (missing)"]
+    );
+}
+
+#[tokio::test]
+async fn test_bad_or_other_tenant_photo_url_is_not_read() {
+    let (tenant, emp) = setup(&["a@example.test"]).await;
+    let other = Uuid::new_v4();
+    // 別 tenant の写真は R2 に在っても読まない
+    let other_key = photo_key(other);
+    let store = MockStore::with(&other_key, PHOTO);
+    let mailer = Arc::new(MockMailer::default());
+    let app = app_with_files(&store, &mailer, rt_client().await);
+
+    post_with_photo(&app, tenant, emp, 0.25, &photo_url(&other_key)).await;
+    post_with_photo(
+        &app,
+        tenant,
+        emp,
+        0.25,
+        "https://files.example.test/not-a-key",
+    )
+    .await;
+
+    assert_eq!(mailer.sent().len(), 2);
+    assert!(mailer.sent().iter().all(|m| m.attachment.is_none()));
+    assert!(store.gets().is_empty(), "R2 は読まない");
+    assert_eq!(app.logs(), ["measurements: alert photo failed: key"; 2]);
+}
+
+#[tokio::test]
+async fn test_no_file_store_sends_the_body_only_without_a_log() {
+    let (tenant, emp) = setup(&["a@example.test"]).await;
+    let mailer = Arc::new(MockMailer::default());
+    let app = app_with(rt_client().await, &mailer);
+    let url = photo_url(&photo_key(tenant));
+
+    post_with_photo(&app, tenant, emp, 0.25, &url).await;
+
+    assert_eq!(mailer.sent()[0].attachment, None);
+    assert!(app.logs().is_empty(), "{:?}", app.logs());
+}
+
+#[tokio::test]
+async fn test_photo_is_not_read_when_no_mail_is_sent() {
+    let (tenant, emp) = setup(&["a@example.test"]).await;
+    let key = photo_key(tenant);
+    let store = MockStore::with(&key, PHOTO);
+    let mailer = Arc::new(MockMailer::default());
+    let app = app_with_files(&store, &mailer, rt_client().await);
+
+    // 値 0 は検知ではない。送らないので写真も読まない
+    post_with_photo(&app, tenant, emp, 0.0, &photo_url(&key)).await;
+
+    assert!(mailer.sent().is_empty());
+    assert!(store.gets().is_empty());
 }
 
 #[tokio::test]
@@ -471,6 +636,9 @@ async fn test_alert_test_sends_one_test_mail_per_usable_recipient() {
         assert_eq!(mail.subject, "【テスト】アルコール検知: テスト送信");
         assert!(mail.body.contains("テスト送信"), "{}", mail.body);
         assert!(!mail.body.contains("乗務員") && !mail.body.contains("アルコール値"));
+        // テスト送信に写真は付けない
+        assert_eq!(mail.attachment, None);
+        assert!(!mail.body.contains(PHOTO_NOTE));
     }
     // 測定は起こさない
     assert_eq!(measurement_count(tenant).await, 0);

@@ -409,6 +409,8 @@ async fn update_measurement(
     // 保存は commit 済み。宛先は lock を持ったまま引き、送るのは lock を放してから
     let outbox = alert::prepare(&state, &mut pg, tenant_id, dev, alert, &updated.measurement).await;
     drop(pg);
+    let photo = updated.measurement.face_photo_url.as_deref();
+    let outbox = alert::attach_photo(&state, tenant_id, outbox, photo).await;
     let _ = alert::deliver(outbox, &state.log).await;
     Ok(Json(updated))
 }
@@ -432,6 +434,7 @@ async fn create_measurement(
         .map_err(|e| state.db_fail("measurement create", &e))?;
     let outbox = alert::prepare(&state, &mut pg, tenant_id, dev, alert, &m).await;
     drop(pg);
+    let outbox = alert::attach_photo(&state, tenant_id, outbox, m.face_photo_url.as_deref()).await;
     let _ = alert::deliver(outbox, &state.log).await;
     Ok((StatusCode::CREATED, Json(m)))
 }
