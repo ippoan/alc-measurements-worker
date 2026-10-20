@@ -2,7 +2,8 @@
 //!
 //! - `POST /measurements/start` — `employee_id` だけで status = `started` の行を作る (201)
 //! - `PUT /measurements/{id}` — 来た欄だけ COALESCE で変える (検証の 400・無ければ 404)。印 `record_as_tenko` 付きで
-//!   完了すれば通常点呼の記録も作り ([`crate::tenko`])、応答に `tenko_session_id` を足す
+//!   完了すれば通常点呼の記録も作り ([`crate::tenko`])、応答に `tenko_session_id` を足す。`defer_tenko` も付けば記録は作らず
+//!   確定待ち (`tenko_pending`) にする (rust に無い。[`crate::deferred`])
 //! - `POST /measurements` — 完了済みの測定を 1 件作る (201。オフラインの送り直しと同じ形)。点呼の記録も PUT と同じ
 //!   (ただし点呼方法・本人確認の方法は受けない = 通常点呼・記録なし)
 //! - `GET /measurements` — 絞り込み (乗務員・結果・期間・status) と `measured_at` の新しい順のページ
@@ -11,6 +12,7 @@
 //!
 //! 顔写真・動画の口 (`/measurements/{id}/face-photo`・`/video`) は [`crate::files`]。
 //! アルコール検知メールのテスト送信 (`POST /measurements/alert-test`。admin だけ) は [`crate::alert::alert_test`]。
+//! 点呼の確定 (`POST /measurements/{id}/tenko`。rust に無い) は [`crate::deferred::confirm_tenko`]。
 
 use alc_core_wasm::{DeviceDevSlot, TenantId};
 use alc_worker_db::PgClient;
@@ -26,7 +28,7 @@ use crate::alert::{self, should_alert};
 use crate::carins::normalize_carins_numbers;
 use crate::models::{
     CreateMeasurement, Measurement, MeasurementFilter, MeasurementsResponse, StartMeasurement,
-    UpdateMeasurement, UpdatedMeasurement, MEASUREMENT_COLUMNS,
+    UpdateMeasurement, UpdatedMeasurement, MEASUREMENT_COLUMNS, MEASUREMENT_COLUMN_COUNT,
 };
 use crate::tenko::{record_as_tenko_if_marked, NormalTenkoInput};
 use crate::{set_device_dev, AppState, LogSink};
@@ -79,6 +81,9 @@ pub mod sql {
         )
     }
 
+    /// 来た欄だけ変える。`$17` (確定を後回しにする点呼の入力) は、この保存で status が completed になる回
+    /// (SET の右辺の `status` は保存の前の値) にだけ `tenko_pending` へ入れる — 後の保存 (録画の URL 等) では上書きしない。
+    /// 最後の列 (測定の列の後ろ) は保存の後に確定待ちかどうか
     pub fn update() -> String {
         format!(
             "UPDATE measurements SET \
@@ -96,9 +101,12 @@ pub mod sql {
                  face_verified = COALESCE($12, face_verified), \
                  medical_manual_input = COALESCE($13, medical_manual_input), \
                  video_url = COALESCE($14, video_url), \
+                 tenko_pending = CASE WHEN $17::jsonb IS NOT NULL AND status <> 'completed' \
+                                       AND COALESCE($1, status) = 'completed' \
+                                      THEN $17 ELSE tenko_pending END, \
                  updated_at = NOW() \
              WHERE id = $15 AND tenant_id = $16 \
-             RETURNING {MEASUREMENT_COLUMNS}"
+             RETURNING {MEASUREMENT_COLUMNS}, tenko_pending IS NOT NULL"
         )
     }
 
@@ -243,6 +251,18 @@ pub async fn update(
         .tenant_tx(tenant_id, move |tx| {
             Box::pin(async move {
                 set_device_dev(tx, dev).await?;
+                let tenko = NormalTenkoInput {
+                    tenko_type: input.tenko_type,
+                    tenko_method: input.tenko_method,
+                    identity_method: input.identity_method,
+                    carins_cert_no: input.carins_cert_no,
+                    carins_vehicle_id: input.carins_vehicle_id,
+                };
+                // 確定を後回しにするなら、記録の入力 (点呼方法を除く) を列に入れる (入れるかどうかの判定は UPDATE の中)
+                let pending =
+                    (input.record_as_tenko && input.defer_tenko == Some(true)).then(|| {
+                        serde_json::to_value(&tenko).expect("NormalTenkoInput は JSON にできる")
+                    });
                 // 旧値は UPDATE の前に読む (点呼の記録の区切りより前)。行が無ければ UPDATE も何も返さず Ok(None)
                 let old_level: Option<f64> = tx
                     .query_typed_opt(
@@ -271,36 +291,37 @@ pub async fn update(
                             (&input.video_url, Type::TEXT),
                             (&id, Type::UUID),
                             (&tenant_id, Type::UUID),
+                            (&pending, Type::JSONB),
                         ],
                     )
                     .await?;
-                let Some(m) = row.as_ref().map(Measurement::from_row) else {
+                let Some(row) = row else {
                     return Ok(None);
                 };
+                let m = Measurement::from_row(&row);
+                let tenko_pending: bool = row.get(MEASUREMENT_COLUMN_COUNT);
                 // 入力に値が無くても COALESCE で旧値が残るので、input ではなく UPDATE 後の m で見る
                 let alert = should_alert(old_level, m.alcohol_level);
-                let tenko = NormalTenkoInput {
-                    tenko_type: input.tenko_type,
-                    tenko_method: input.tenko_method,
-                    identity_method: input.identity_method,
-                    carins_cert_no: input.carins_cert_no,
-                    carins_vehicle_id: input.carins_vehicle_id,
-                };
-                let session_id =
-                    record_as_tenko_if_marked(tx, &m, input.record_as_tenko, &tenko, &log).await;
-                Ok(Some((m, session_id, alert)))
+                // 確定待ちの測定 (この保存で入れた、または前の保存で入れてまだ確定していない) は記録を作らない
+                // (確定の口か見回りが作る)
+                let marked = input.record_as_tenko && !tenko_pending;
+                let session_id = record_as_tenko_if_marked(tx, &m, marked, &tenko, &log).await;
+                Ok(Some((m, (session_id, tenko_pending), alert)))
             })
         })
         .await?;
-    Ok(found.map(|(measurement, tenko_session_id, alert)| {
-        (
-            UpdatedMeasurement {
-                measurement,
-                tenko_session_id,
-            },
-            alert,
-        )
-    }))
+    Ok(
+        found.map(|(measurement, (tenko_session_id, tenko_pending), alert)| {
+            (
+                UpdatedMeasurement {
+                    measurement,
+                    tenko_session_id,
+                    tenko_pending,
+                },
+                alert,
+            )
+        }),
+    )
 }
 
 pub async fn get_one(
@@ -357,6 +378,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/measurements/{id}",
             get(get_measurement).put(update_measurement),
+        )
+        .route(
+            "/measurements/{id}/tenko",
+            post(crate::deferred::confirm_tenko),
         )
 }
 
@@ -542,6 +567,15 @@ mod tests {
         assert!(rows.ends_with(
             "WHERE m.tenant_id = $1 AND m.status = $2 ORDER BY m.measured_at DESC LIMIT $3 OFFSET $4"
         ));
+    }
+
+    #[test]
+    fn measurement_column_count_matches_the_columns() {
+        // UPDATE の RETURNING は測定の列の後ろに確定待ちの印を足し、その位置で読む
+        assert_eq!(
+            MEASUREMENT_COLUMNS.split(", ").count(),
+            MEASUREMENT_COLUMN_COUNT
+        );
     }
 
     #[test]

@@ -10,6 +10,8 @@
 //!
 //! - [`files`] — 顔写真・動画の口 (`/api/measurements/{id}/face-photo`・`/video`。R2 から読んで返す。置き場は
 //!   [`files::FileStore`] で差し替える)
+//! - [`deferred`] — 点呼の記録の確定を後回しにした測定の確定 (`POST /api/measurements/{id}/tenko` と、worker の定時実行の
+//!   見回り [`deferred::sweep`])。rust に無い
 //! - [`alert`] — アルコール検知メール (測定のアルコール値が 0 より上になった保存で、notify のグループ「アルコール検知」の
 //!   メンバーへ 1 人 1 通。送り手は [`alert::AlertMailer`] で差し替える)
 //!
@@ -21,6 +23,7 @@
 
 pub mod alert;
 pub mod carins;
+pub mod deferred;
 pub mod files;
 pub mod measurements;
 pub mod models;

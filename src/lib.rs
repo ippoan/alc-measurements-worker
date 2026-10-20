@@ -4,6 +4,9 @@
 //!
 //! **この Worker は呼び手を認証しない。** 本番・staging とも workers.dev を開けず (`workers_dev` / `preview_urls` = false、
 //! `routes` を持たない)、入口は auth-worker からの Service Binding だけ (wrangler.toml と scripts/check-exposure.sh が保証する)。
+//!
+//! 定時実行 (`scheduled`、wrangler.toml の `[triggers]`。1 分ごと) は、点呼の確定を後回しにしたまま 2 分を過ぎた測定を
+//! `通常点呼` で確定する見回り ([`measurements::deferred::sweep`]。Refs ippoan/alc-app#436)。ログは件数だけ。
 
 // worker 本体は wasm32 専用。native の `cargo build` / `clippy` / `test` (workspace の root で打つもの) では空の crate にして、
 // crates/measurements だけを検査させる
@@ -23,7 +26,10 @@ use axum::http::{HeaderValue, Response, StatusCode};
 use futures_util::lock::Mutex;
 use measurements::{router, AppState, LogSink};
 use tower_service::Service;
-use worker::{console_error, event, Context, Env, HttpRequest, Result, WorkerVersionMetadata};
+use worker::{
+    console_error, console_log, event, Context, Env, HttpRequest, Result, ScheduleContext,
+    ScheduledEvent, WorkerVersionMetadata,
+};
 
 /// 顔写真・動画の R2 の binding (wrangler.toml の `[[r2_buckets]]`。本番と staging で別の bucket)。
 /// 無ければ顔写真・動画の口だけが 503 (ほかの口は動く)
@@ -100,4 +106,19 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         }
     }
     Ok(resp)
+}
+
+/// 見回り (確定待ちのまま 2 分を過ぎた測定を `通常点呼` で確定する)。DB の経路は fetch と同じ [`db::connect`]
+#[event(scheduled)]
+async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    let mut pg = match db::connect(&env).await {
+        Ok(c) => c,
+        Err(e) => {
+            console_error!("measurements: tenko sweep {e}");
+            return;
+        }
+    };
+    if let Some(summary) = measurements::deferred::sweep(&mut pg, &log_sink()).await {
+        console_log!("{}", summary.line());
+    }
 }

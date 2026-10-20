@@ -137,7 +137,11 @@ async fn migrate(su: &Client) {
         .filter(|p| p.extension().is_some_and(|x| x == "sql"))
         .collect();
     files.sort();
-    for needed in ["_runtime_role.sql", "_tenko_sessions_identity_method.sql"] {
+    for needed in [
+        "_runtime_role.sql",
+        "_tenko_sessions_identity_method.sql",
+        "_measurements_tenko_pending.sql",
+    ] {
         assert!(
             files
                 .iter()
