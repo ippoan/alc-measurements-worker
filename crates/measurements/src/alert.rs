@@ -280,7 +280,7 @@ impl PendingAlert {
                 outbox = outbox.with_photo(bytes);
             }
         }
-        deliver(Some(outbox), &log).await
+        deliver(outbox, &log).await
     }
 }
 
@@ -324,16 +324,14 @@ pub async fn prepare(
 
 /// 宛先ごとに 1 通ずつ送る。失敗はログ 1 行 (段の名前だけ) で、ほかの宛先へは続ける。リトライしない。
 /// 返すのは (送れた数, 失敗した数)
-pub async fn deliver(outbox: Option<Outbox>, log: &LogSink) -> (usize, usize) {
+pub async fn deliver(outbox: Outbox, log: &LogSink) -> (usize, usize) {
     let (mut sent, mut failed) = (0, 0);
-    if let Some(outbox) = outbox {
-        for mail in &outbox.mails {
-            match outbox.mailer.send(mail).await {
-                Ok(()) => sent += 1,
-                Err(e) => {
-                    failed += 1;
-                    log(&format!("measurements: alert send failed: {}", e.0));
-                }
+    for mail in &outbox.mails {
+        match outbox.mailer.send(mail).await {
+            Ok(()) => sent += 1,
+            Err(e) => {
+                failed += 1;
+                log(&format!("measurements: alert send failed: {}", e.0));
             }
         }
     }
@@ -377,11 +375,7 @@ pub async fn alert_test(
         return error(StatusCode::CONFLICT, "no_recipients");
     }
     let (subject, body) = compose_test();
-    let (sent, failed) = deliver(
-        Some(Outbox::new(mailer, emails, &subject, &body)),
-        &state.log,
-    )
-    .await;
+    let (sent, failed) = deliver(Outbox::new(mailer, emails, &subject, &body), &state.log).await;
     Json(json!({ "sent": sent, "failed": failed })).into_response()
 }
 
