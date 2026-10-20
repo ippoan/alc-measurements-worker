@@ -123,6 +123,30 @@ async fn get_video(
     serve(state, tenant_id, dev, id, Media::Video).await
 }
 
+/// 保存した URL の写真・動画を R2 から読む (口 [`serve`] と検知メールの添付で同じ手順)。URL → [`extract_key`]
+/// (要求の tenant_id で照合。別 tenant の URL は読めない) → [`FileStore::get`]。キーが取れない・R2 の失敗は
+/// ログ 1 行 (`stage` と固定の語だけ。URL・キーを出さない) を残して `None`
+pub async fn read_media(
+    state: &AppState,
+    files: &SharedStore,
+    tenant_id: Uuid,
+    url: &str,
+    media: Media,
+    stage: &str,
+) -> Option<Vec<u8>> {
+    let Some(key) = extract_key(url, tenant_id, media) else {
+        (state.log)(&format!("measurements: {stage} failed: key"));
+        return None;
+    };
+    match files.get(&key).await {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            (state.log)(&format!("measurements: {stage} failed: storage ({})", e.0));
+            None
+        }
+    }
+}
+
 async fn serve(
     state: AppState,
     tenant_id: Uuid,
@@ -150,14 +174,9 @@ async fn serve(
             Media::Video => m.video_url,
         })
         .ok_or(StatusCode::NOT_FOUND)?;
-    let Some(key) = extract_key(&url, tenant_id, media) else {
-        (state.log)(&format!("measurements: {stage} failed: key"));
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    };
-    let bytes = files.get(&key).await.map_err(|e| {
-        (state.log)(&format!("measurements: {stage} failed: storage ({})", e.0));
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let bytes = read_media(&state, &files, tenant_id, &url, media, stage)
+        .await
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((
         [
             (header::CONTENT_TYPE, media.content_type()),

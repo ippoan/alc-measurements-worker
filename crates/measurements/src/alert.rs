@@ -40,6 +40,7 @@ use serde_json::json;
 use tokio_postgres::types::Type;
 use uuid::Uuid;
 
+use crate::files::{read_media, Media};
 use crate::models::Measurement;
 use crate::tenko::sql::EMPLOYEE_NAME;
 use crate::{set_device_dev, AppState, LogSink};
@@ -57,13 +58,25 @@ pub const SUBJECT_PREFIX: &str = "アルコール検知: ";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MailError(pub &'static str);
 
+/// 添付 (測定の顔写真・吹き終わりの静止画)。bytes は宛先間で共有する (宛先ごとに複製しない)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub filename: &'static str,
+    pub content_type: &'static str,
+    pub bytes: Arc<[u8]>,
+}
+
 /// 1 人宛の 1 通 (差出人は送り手 [`AlertMailer`] が持つ)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlertMail {
     pub to: String,
     pub subject: String,
     pub body: String,
+    pub attachment: Option<Attachment>,
 }
+
+/// 写真を添付したときだけ本文の末尾に足す 1 行
+pub const PHOTO_NOTE: &str = "写真を添付しています。\n";
 
 /// メールの送り手 (Worker では `send_email` の binding `ALERT_EMAIL`、テストでは偽物)。
 /// axum の state と handler が要るので `Send + Sync` で `Send` な future を返す
@@ -198,9 +211,52 @@ impl Outbox {
                 to,
                 subject: subject.to_owned(),
                 body: body.to_owned(),
+                attachment: None,
             })
             .collect();
         Outbox { mailer, mails }
+    }
+
+    /// 全員の 1 通に同じ写真 (bytes は共有) を載せ、本文に [`PHOTO_NOTE`] を足す
+    fn with_photo(mut self, bytes: Vec<u8>) -> Self {
+        let bytes: Arc<[u8]> = bytes.into();
+        for mail in &mut self.mails {
+            mail.body.push_str(PHOTO_NOTE);
+            mail.attachment = Some(Attachment {
+                filename: "photo.jpg",
+                content_type: "image/jpeg",
+                bytes: bytes.clone(),
+            });
+        }
+        self
+    }
+}
+
+/// 送ると決まった (`outbox` が `Some`) ときだけ、測定の顔写真を R2 から読んで添付する。**pg の lock を放してから呼ぶ**
+/// ([`prepare`] では読まない)。写真が無い・R2 が無い・key が不正・取れないときは何も足さず本文だけで送る
+/// (取れない理由はログ 1 行・固定の語)
+pub async fn attach_photo(
+    state: &AppState,
+    tenant_id: Uuid,
+    outbox: Option<Outbox>,
+    photo_url: Option<&str>,
+) -> Option<Outbox> {
+    let outbox = outbox?;
+    let (Some(url), Some(files)) = (photo_url, state.files.as_ref()) else {
+        return Some(outbox);
+    };
+    match read_media(
+        state,
+        files,
+        tenant_id,
+        url,
+        Media::FacePhoto,
+        "alert photo",
+    )
+    .await
+    {
+        Some(bytes) => Some(outbox.with_photo(bytes)),
+        None => Some(outbox),
     }
 }
 
