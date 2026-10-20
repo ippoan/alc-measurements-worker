@@ -24,7 +24,7 @@ use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::Error;
 use uuid::Uuid;
 
-use crate::alert::{self, should_alert};
+use crate::alert::{self, should_alert, PendingAlert};
 use crate::carins::normalize_carins_numbers;
 use crate::models::{
     CreateMeasurement, Measurement, MeasurementFilter, MeasurementsResponse, StartMeasurement,
@@ -416,7 +416,7 @@ async fn update_measurement(
     Extension(dev): Extension<DeviceDevSlot>,
     Path(id): Path<Uuid>,
     Json(mut body): Json<UpdateMeasurement>,
-) -> Result<Json<UpdatedMeasurement>, StatusCode> {
+) -> Result<(Option<Extension<PendingAlert>>, Json<UpdatedMeasurement>), StatusCode> {
     check_opt(&body.result_type, &VALID_RESULTS)?;
     check_opt(&body.status, &VALID_STATUSES)?;
     check_opt(&body.tenko_type, &VALID_TENKO_TYPES)?;
@@ -431,13 +431,11 @@ async fn update_measurement(
         .await
         .map_err(|e| state.db_fail("measurement update", &e))?;
     let (updated, alert) = found.ok_or(StatusCode::NOT_FOUND)?;
-    // 保存は commit 済み。宛先は lock を持ったまま引き、送るのは lock を放してから
+    // 保存は commit 済み。宛先は lock を持ったまま引き、写真の読みと送信は応答の後 (Worker の wait_until)
     let outbox = alert::prepare(&state, &mut pg, tenant_id, dev, alert, &updated.measurement).await;
-    drop(pg);
     let photo = updated.measurement.face_photo_url.as_deref();
-    let outbox = alert::attach_photo(&state, tenant_id, outbox, photo).await;
-    let _ = alert::deliver(outbox, &state.log).await;
-    Ok(Json(updated))
+    let pending = PendingAlert::new(&state, tenant_id, outbox, photo);
+    Ok((pending.map(Extension), Json(updated)))
 }
 
 /// 測定作成 (完了済み) — オフラインキュー互換
@@ -446,7 +444,14 @@ async fn create_measurement(
     Extension(TenantId(tenant_id)): Extension<TenantId>,
     Extension(dev): Extension<DeviceDevSlot>,
     Json(mut body): Json<CreateMeasurement>,
-) -> Result<(StatusCode, Json<Measurement>), StatusCode> {
+) -> Result<
+    (
+        StatusCode,
+        Option<Extension<PendingAlert>>,
+        Json<Measurement>,
+    ),
+    StatusCode,
+> {
     check(VALID_RESULTS.contains(&body.result_type.as_str()))?;
     check_opt(&body.tenko_type, &VALID_TENKO_TYPES)?;
     normalize_carins_numbers(&mut body.carins_cert_no, &mut body.carins_vehicle_id)
@@ -458,10 +463,8 @@ async fn create_measurement(
         .await
         .map_err(|e| state.db_fail("measurement create", &e))?;
     let outbox = alert::prepare(&state, &mut pg, tenant_id, dev, alert, &m).await;
-    drop(pg);
-    let outbox = alert::attach_photo(&state, tenant_id, outbox, m.face_photo_url.as_deref()).await;
-    let _ = alert::deliver(outbox, &state.log).await;
-    Ok((StatusCode::CREATED, Json(m)))
+    let pending = PendingAlert::new(&state, tenant_id, outbox, m.face_photo_url.as_deref());
+    Ok((StatusCode::CREATED, pending.map(Extension), Json(m)))
 }
 
 async fn list_measurements(

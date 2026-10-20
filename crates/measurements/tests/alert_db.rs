@@ -8,7 +8,7 @@ mod support;
 
 use std::sync::Arc;
 
-use measurements::alert::{ALERT_GROUP, PHOTO_NOTE};
+use measurements::alert::{PendingAlert, ALERT_GROUP, PHOTO_NOTE};
 use serde_json::{json, Value};
 use support::*;
 use uuid::Uuid;
@@ -152,6 +152,58 @@ async fn test_post_attaches_the_photo_shared_between_recipients() {
     assert!(Arc::ptr_eq(&x.unwrap().bytes, &y.unwrap().bytes));
     assert_eq!(store.gets(), [key]);
     assert!(app.logs().is_empty(), "{:?}", app.logs());
+}
+
+#[tokio::test]
+async fn test_response_returns_before_the_photo_is_read_and_the_mail_is_sent() {
+    let (tenant, emp) = setup(&["a@example.test"]).await;
+    let key = photo_key(tenant);
+    let store = MockStore::with(&key, PHOTO);
+    let mailer = Arc::new(MockMailer::default());
+    let app = app_with_files(&store, &mailer, rt_client().await);
+    let mut body = measurement_body(emp, "pass", AT, false, None);
+    body["alcohol_value"] = json!(0.25);
+    body["face_photo_url"] = json!(photo_url(&key));
+    let headers = [("content-type", "application/json")];
+    let bytes = serde_json::to_vec(&body).unwrap();
+
+    let mut resp = respond_raw(
+        &app,
+        "POST",
+        "/api/measurements",
+        Some(tenant),
+        &headers,
+        bytes,
+    )
+    .await;
+
+    // 応答の時点では写真を読まず送っていない。後で送るものは応答の extension に在る
+    assert_eq!(resp.status(), 201);
+    assert!(mailer.sent().is_empty());
+    assert!(store.gets().is_empty());
+    let pending = resp.extensions_mut().remove::<PendingAlert>();
+    let pending = pending.expect("検知の保存は後で送るものを応答に載せる");
+    assert_eq!(pending.send().await, (1, 0));
+    let sent = mailer.sent();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].attachment.is_some());
+    assert_eq!(store.gets(), [key]);
+
+    // 送らない保存 (値 0) は何も載せない
+    let mut zero = measurement_body(emp, "pass", AT, false, None);
+    zero["alcohol_value"] = json!(0.0);
+    let bytes = serde_json::to_vec(&zero).unwrap();
+    let resp = respond_raw(
+        &app,
+        "POST",
+        "/api/measurements",
+        Some(tenant),
+        &headers,
+        bytes,
+    )
+    .await;
+    assert_eq!(resp.status(), 201);
+    assert!(resp.extensions().get::<PendingAlert>().is_none());
 }
 
 #[tokio::test]
