@@ -14,8 +14,9 @@
 //! 1. 保存の transaction (旧値の読みと判定) が commit される
 //! 2. [`prepare`] — pg の lock を持ったまま、短い tenant_tx 1 回で宛先と乗務員名を引く (RLS が効く)。保存とは別の
 //!    transaction なので、ここの失敗で保存は巻き戻らない (ログ 1 行で送らない)
-//! 3. lock を放してから [`deliver`] — 宛先ごとに 1 通ずつ送る (1 人が未確認の送り先でも他の人へ届くように)。
-//!    失敗はログ 1 行だけで、保存の応答は変えない。リトライしない
+//! 3. 応答を返した後 — [`PendingAlert`] を応答の extension に入れ、Worker の fetch が取り出して `wait_until` に渡す。
+//!    そこで顔写真を R2 から読んで添付し、[`deliver`] で宛先ごとに 1 通ずつ送る (1 人が未確認の送り先でも他の人へ
+//!    届くように)。保存の応答は写真の読みと送信を待たない。失敗はログ 1 行だけで、リトライしない
 //!
 //! 送るのは [`AlertMailer`] (Worker では Cloudflare の `send_email` binding、テストでは偽物)。無ければ (`None`) 送らない。
 //! **ログは固定の語だけ** (メールアドレス・tenant_id・氏名を出さない)。
@@ -40,7 +41,7 @@ use serde_json::json;
 use tokio_postgres::types::Type;
 use uuid::Uuid;
 
-use crate::files::{read_media, Media};
+use crate::files::{read_media, Media, SharedStore};
 use crate::models::Measurement;
 use crate::tenko::sql::EMPLOYEE_NAME;
 use crate::{set_device_dev, AppState, LogSink};
@@ -197,6 +198,7 @@ async fn lookup(
 }
 
 /// 送る用意ができた通数 (送り手と、宛先ごとの 1 通)
+#[derive(Clone)]
 pub struct Outbox {
     mailer: SharedMailer,
     mails: Vec<AlertMail>,
@@ -232,37 +234,59 @@ impl Outbox {
     }
 }
 
-/// 送ると決まった (`outbox` が `Some`) ときだけ、測定の顔写真を R2 から読んで添付する。**pg の lock を放してから呼ぶ**
-/// ([`prepare`] では読まない)。写真が無い・R2 が無い・key が不正・取れないときは何も足さず本文だけで送る
-/// (取れない理由はログ 1 行・固定の語)
-pub async fn attach_photo(
-    state: &AppState,
+/// 応答を返した後に送るもの。ハンドラーが [`prepare`] で宛先を引いたあと応答の extension に入れ、Worker の fetch が
+/// 取り出して `wait_until` に渡す (保存の応答を写真の読みと送信で待たせない)。持つのは送り手と宛先ごとの 1 通・写真の
+/// URL と、それを読む部品 (R2・ログ) だけで、**DB には触らない** (pg の lock を持たない)
+#[derive(Clone)]
+pub struct PendingAlert {
+    outbox: Outbox,
     tenant_id: Uuid,
-    outbox: Option<Outbox>,
-    photo_url: Option<&str>,
-) -> Option<Outbox> {
-    let outbox = outbox?;
-    let (Some(url), Some(files)) = (photo_url, state.files.as_ref()) else {
-        return Some(outbox);
-    };
-    match read_media(
-        state,
-        files,
-        tenant_id,
-        url,
-        Media::FacePhoto,
-        "alert photo",
-    )
-    .await
-    {
-        Some(bytes) => Some(outbox.with_photo(bytes)),
-        None => Some(outbox),
+    photo_url: Option<String>,
+    files: Option<SharedStore>,
+    log: LogSink,
+}
+
+impl PendingAlert {
+    /// 送ると決まった (`outbox` が `Some`) ときだけ作る
+    pub fn new(
+        state: &AppState,
+        tenant_id: Uuid,
+        outbox: Option<Outbox>,
+        photo_url: Option<&str>,
+    ) -> Option<Self> {
+        Some(PendingAlert {
+            outbox: outbox?,
+            tenant_id,
+            photo_url: photo_url.map(str::to_owned),
+            files: state.files.clone(),
+            log: state.log.clone(),
+        })
+    }
+
+    /// 測定の顔写真を R2 から読んで添付し ([`read_media`]。要求の tenant_id で照合し、別 tenant の写真は読まない)、
+    /// 宛先ごとに送る ([`deliver`])。写真が無い・R2 が無い・key が不正・取れないときは本文だけで送る
+    /// (取れない理由はログ 1 行・固定の語)。返すのは (送れた数, 失敗した数)
+    pub async fn send(self) -> (usize, usize) {
+        let PendingAlert {
+            mut outbox,
+            tenant_id,
+            photo_url,
+            files,
+            log,
+        } = self;
+        if let (Some(url), Some(files)) = (photo_url.as_deref(), files.as_ref()) {
+            let photo = read_media(&log, files, tenant_id, url, Media::FacePhoto, "alert photo");
+            if let Some(bytes) = photo.await {
+                outbox = outbox.with_photo(bytes);
+            }
+        }
+        deliver(Some(outbox), &log).await
     }
 }
 
 /// 保存が条件を満たした (`alert`) ときだけ、宛先を引いて送る用意をする。送らない理由はログ 1 行 (固定の語。
-/// グループが無いときだけ別の語 = 設定漏れの見分け)。**pg の lock を持ったまま呼び、返したあとに lock を放してから
-/// [`deliver`] する**
+/// グループが無いときだけ別の語 = 設定漏れの見分け)。**pg の lock を持ったまま呼び**、返した `Outbox` は
+/// [`PendingAlert`] に包んで応答の後に送る
 pub async fn prepare(
     state: &AppState,
     pg: &mut PgClient,

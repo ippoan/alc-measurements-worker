@@ -29,7 +29,7 @@ use futures_util::future::BoxFuture;
 use uuid::Uuid;
 
 use crate::measurements::get_one;
-use crate::AppState;
+use crate::{AppState, LogSink};
 
 /// R2 の段の失敗。持つのは段の名前だけ (キーやランタイムのエラー文を持たない)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +127,7 @@ async fn get_video(
 /// (要求の tenant_id で照合。別 tenant の URL は読めない) → [`FileStore::get`]。キーが取れない・R2 の失敗は
 /// ログ 1 行 (`stage` と固定の語だけ。URL・キーを出さない) を残して `None`
 pub async fn read_media(
-    state: &AppState,
+    log: &LogSink,
     files: &SharedStore,
     tenant_id: Uuid,
     url: &str,
@@ -135,13 +135,13 @@ pub async fn read_media(
     stage: &str,
 ) -> Option<Vec<u8>> {
     let Some(key) = extract_key(url, tenant_id, media) else {
-        (state.log)(&format!("measurements: {stage} failed: key"));
+        log(&format!("measurements: {stage} failed: key"));
         return None;
     };
     match files.get(&key).await {
         Ok(bytes) => Some(bytes),
         Err(e) => {
-            (state.log)(&format!("measurements: {stage} failed: storage ({})", e.0));
+            log(&format!("measurements: {stage} failed: storage ({})", e.0));
             None
         }
     }
@@ -174,7 +174,7 @@ async fn serve(
             Media::Video => m.video_url,
         })
         .ok_or(StatusCode::NOT_FOUND)?;
-    let bytes = read_media(&state, &files, tenant_id, &url, media, stage)
+    let bytes = read_media(&state.log, &files, tenant_id, &url, media, stage)
         .await
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((

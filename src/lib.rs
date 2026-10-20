@@ -1,6 +1,7 @@
 //! 測定の Worker `alc-measurements` (Refs ippoan/alc-app#436、ippoan/rust-alc-api#697)。crates/measurements の口
 //! (`router`、axum) を workers-rs (`http` / `axum` feature) に載せる。型は ippoan/alc-trouble-worker と同じ。
 //! DB への経路 (staging = Workers VPC の先の PgBouncer、本番 = Hyperdrive) は [`db::connect`] の 1 か所で出し分ける。
+//! アルコール検知メールは、口が応答の extension に入れた [`PendingAlert`] を取り出し、応答の後 (`wait_until`) に送る。
 //!
 //! **この Worker は呼び手を認証しない。** 本番・staging とも workers.dev を開けず (`workers_dev` / `preview_urls` = false、
 //! `routes` を持たない)、入口は auth-worker からの Service Binding だけ (wrangler.toml と scripts/check-exposure.sh が保証する)。
@@ -24,6 +25,7 @@ use crate::r2::R2Store;
 use axum::body::Body;
 use axum::http::{HeaderValue, Response, StatusCode};
 use futures_util::lock::Mutex;
+use measurements::alert::PendingAlert;
 use measurements::{router, AppState, LogSink};
 use tower_service::Service;
 use worker::{
@@ -61,7 +63,7 @@ fn error_response(status: StatusCode, code: &str) -> Response<Body> {
 }
 
 #[event(fetch)]
-async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Body>> {
+async fn fetch(req: HttpRequest, env: Env, ctx: Context) -> Result<Response<Body>> {
     // 全リクエストで routing の前に繋ぐ (ippoan/alc-trouble-worker と同じ)
     let pg = match db::connect(&env).await {
         Ok(c) => c,
@@ -93,6 +95,12 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         Ok(r) => r,
         Err(e) => match e {},
     };
+    // アルコール検知メール (顔写真の読みと送信) は応答を返した後に回す。応答の本文・ヘッダーは変えない
+    if let Some(pending) = resp.extensions_mut().remove::<PendingAlert>() {
+        ctx.wait_until(async move {
+            let _ = pending.send().await;
+        });
+    }
     // どの版が応えたかを応答ヘッダーで分かるようにする。binding が取れなければ何も付けない
     if let Ok(meta) = env.get_binding::<WorkerVersionMetadata>("CF_VERSION_METADATA") {
         if let Ok(v) = HeaderValue::from_str(&meta.id()) {

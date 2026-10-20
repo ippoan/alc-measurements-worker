@@ -14,11 +14,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use alc_worker_db::PgClient;
 use axum::body::Body;
-use axum::http::{HeaderMap, Request};
+use axum::http::{HeaderMap, Request, Response};
 use axum::Router;
 use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
-use measurements::alert::{AlertMail, AlertMailer, MailError, SharedMailer};
+use measurements::alert::{AlertMail, AlertMailer, MailError, PendingAlert, SharedMailer};
 use measurements::files::{FileStore, SharedStore, StoreError};
 use measurements::{router, AppState};
 use serde_json::Value;
@@ -469,7 +469,32 @@ pub async fn call(
     }
 }
 
-/// 本文とヘッダーをそのまま送る
+/// 本文とヘッダーをそのまま送り、router の応答をそのまま返す (応答の後に回す検知メール [`PendingAlert`] は
+/// extension に入ったまま。送らない)
+pub async fn respond_raw(
+    app: &App,
+    method: &str,
+    uri: &str,
+    tenant: Option<Uuid>,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+) -> Response<Body> {
+    let mut b = Request::builder().method(method).uri(uri);
+    if let Some(t) = tenant {
+        b = b.header("X-Tenant-ID", t.to_string());
+    }
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    app.router
+        .clone()
+        .oneshot(b.body(Body::from(body)).unwrap())
+        .await
+        .unwrap()
+}
+
+/// 本文とヘッダーをそのまま送る。worker の src/lib.rs と同じく、応答の extension に [`PendingAlert`] が在れば取り出して
+/// 送る (Worker では応答の後の `wait_until`。ここでは応答を読む前に待つ)
 pub async fn call_raw(
     app: &App,
     method: &str,
@@ -478,19 +503,10 @@ pub async fn call_raw(
     headers: &[(&str, &str)],
     body: Vec<u8>,
 ) -> Got {
-    let mut b = Request::builder().method(method).uri(uri);
-    if let Some(t) = tenant {
-        b = b.header("X-Tenant-ID", t.to_string());
+    let mut resp = respond_raw(app, method, uri, tenant, headers, body).await;
+    if let Some(pending) = resp.extensions_mut().remove::<PendingAlert>() {
+        pending.send().await;
     }
-    for (k, v) in headers {
-        b = b.header(*k, *v);
-    }
-    let resp = app
-        .router
-        .clone()
-        .oneshot(b.body(Body::from(body)).unwrap())
-        .await
-        .unwrap();
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
