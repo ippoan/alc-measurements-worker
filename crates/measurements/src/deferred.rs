@@ -25,7 +25,7 @@ use tokio_postgres::Error;
 use uuid::Uuid;
 
 use crate::measurements::VALID_TENKO_METHODS;
-use crate::models::{Measurement, MEASUREMENT_COLUMN_COUNT};
+use crate::models::Measurement;
 use crate::tenko::{existing_session, record_or_existing_session_id, NormalTenkoInput};
 use crate::{set_device_dev, AppState, LogSink};
 
@@ -35,16 +35,17 @@ pub const SWEEP_METHOD: &str = crate::tenko::TENKO_METHOD_NORMAL;
 pub mod sql {
     use crate::models::MEASUREMENT_COLUMNS;
 
-    /// 測定の status (`FOR UPDATE`。確定の口と見回りが同じ測定を同時に確定しようとしても 1 つずつ通す)
-    pub const STATUS: &str =
-        "SELECT status FROM measurements WHERE id = $1 AND tenant_id = $2 FOR UPDATE";
+    /// 測定の status と確定待ちの入力 (`FOR UPDATE`。確定の口と見回りが同じ測定を同時に確定しようとしても 1 つずつ通す。
+    /// 入力はここで読む — 下の [`claim`] の RETURNING は UPDATE の後の値 (NULL) しか返さない)
+    pub const STATUS: &str = "SELECT status, tenko_pending FROM measurements \
+         WHERE id = $1 AND tenant_id = $2 FOR UPDATE";
 
-    /// 確定待ちの入力を 1 回だけ取る (NULL にして、取った値を返す)。測定の列の後ろに入力
+    /// 確定待ちの入力を 1 回だけ取る (NULL にする)。確定待ちだった (= 取れた) ときだけ測定の行を返す
     pub fn claim() -> String {
         format!(
             "UPDATE measurements SET tenko_pending = NULL \
              WHERE id = $1 AND tenant_id = $2 AND tenko_pending IS NOT NULL \
-             RETURNING {MEASUREMENT_COLUMNS}, tenko_pending"
+             RETURNING {MEASUREMENT_COLUMNS}"
         )
     }
 
@@ -88,6 +89,7 @@ pub async fn confirm(
             else {
                 return Ok(Confirmed::NotFound);
             };
+            let pending: Option<serde_json::Value> = status.get(1);
             if status.get::<_, String>(0) != "completed" {
                 return Ok(Confirmed::Conflict {
                     error: "measurement_not_completed",
@@ -102,9 +104,11 @@ pub async fn confirm(
                 .await?;
             if let Some(row) = claimed {
                 let m = Measurement::from_row(&row);
-                // 入力は PUT が書いた JSON。読めない (手で書き換えた) ときは既定 (種別 normal・照合なし) で記録する
-                let mut input: NormalTenkoInput =
-                    serde_json::from_value(row.get(MEASUREMENT_COLUMN_COUNT)).unwrap_or_default();
+                // 入力は PUT が書いた JSON (行は FOR UPDATE で押さえてあるので、取った値と同じ)。
+                // 読めない (手で書き換えた) ときは既定 (種別 normal・照合なし) で記録する
+                let mut input: NormalTenkoInput = pending
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default();
                 input.tenko_method = Some(tenko_method.clone());
                 record_or_existing_session_id(tx, &m, &input, &log).await?;
             }
