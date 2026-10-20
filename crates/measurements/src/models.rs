@@ -44,6 +44,9 @@ pub const MEASUREMENT_COLUMNS: &str = "id, tenant_id, employee_id, alcohol_level
      face_photo_url, video_url, measured_at, created_at, updated_at, status, \
      temperature, systolic, diastolic, pulse, medical_measured_at, face_verified, medical_manual_input";
 
+/// [`MEASUREMENT_COLUMNS`] の列の数 (= その後ろに足した列の位置)
+pub const MEASUREMENT_COLUMN_COUNT: usize = 19;
+
 impl Measurement {
     /// [`MEASUREMENT_COLUMNS`] の順で並んだ行から読む
     pub fn from_row(r: &Row) -> Self {
@@ -141,6 +144,11 @@ pub struct UpdateMeasurement {
     /// 詳細は [`CreateMeasurement::carins_vehicle_id`]。
     #[serde(default)]
     pub carins_vehicle_id: Option<String>,
+    /// `record_as_tenko` と一緒に `true` なら、この保存では点呼の記録を作らず、記録の入力 (点呼方法を除く) を
+    /// 測定の列 `tenko_pending` に入れて確定を待つ (status が completed になる保存の回だけ。後の保存では上書きしない)。
+    /// 確定は `POST /measurements/{id}/tenko` か、見回り (2 分後に `通常点呼`)。rust には無い (Refs ippoan/alc-app#436)
+    #[serde(default)]
+    pub defer_tenko: Option<bool>,
     #[serde(alias = "alcohol_level")]
     pub alcohol_value: Option<f64>,
     #[serde(alias = "result")]
@@ -165,8 +173,12 @@ pub struct UpdatedMeasurement {
     #[serde(flatten)]
     pub measurement: Measurement,
     /// この保存で作られた (または同じ測定に既にある) 通常の流れの点呼セッションの id。
-    /// `record_as_tenko` が無い・結果が点呼にならない・記録に失敗したときは `None`
+    /// `record_as_tenko` が無い・結果が点呼にならない・記録に失敗した・確定待ちのときは `None`
     pub tenko_session_id: Option<Uuid>,
+    /// 点呼の記録が確定待ち (`tenko_pending` が入っている) なら `true`。`false` のときは欄ごと出さない
+    /// (確定を後回しにしない保存の応答は今までと同じ形。Refs ippoan/alc-app#436)
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tenko_pending: bool,
 }
 
 /// `GET /api/measurements` の query (rust の `MeasurementFilter`)

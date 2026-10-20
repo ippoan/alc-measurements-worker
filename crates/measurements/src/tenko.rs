@@ -16,7 +16,7 @@ use std::future::Future;
 
 use alc_worker_db::{kind, TenantTx};
 use chrono::{DateTime, NaiveDate, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_postgres::types::Type;
 use tokio_postgres::{Error, Row};
@@ -34,12 +34,17 @@ pub const TENKO_TYPE_NORMAL: &str = "normal";
 pub const TENKO_METHOD_NORMAL: &str = "通常点呼";
 
 /// 測定の保存に付いてくる、通常点呼の記録だけに使う値 (値の検査は handler で済ませてある)。
-/// rust の `NormalTenkoInput` (tenant_tx の閉包に持ち込むので owned)
-#[derive(Debug, Default, Clone)]
+/// rust の `NormalTenkoInput` (tenant_tx の閉包に持ち込むので owned)。
+///
+/// 確定を後回しにする保存 (`defer_tenko`) は、点呼方法を除いたこの値を JSON で測定の列 `tenko_pending` に入れ、
+/// 確定のとき ([`crate::deferred`]) に読み戻して点呼方法を足す (Refs ippoan/alc-app#436)
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NormalTenkoInput {
     /// `None` → `normal`
     pub tenko_type: Option<String>,
-    /// `None` → `通常点呼`。session と record の両方に同じ値を書く
+    /// `None` → `通常点呼`。session と record の両方に同じ値を書く。`tenko_pending` には入れない (確定のときに決まる)
+    #[serde(skip)]
     pub tenko_method: Option<String>,
     /// 運転者の本人確認の方法 (migration 159)。`None` → NULL (記録なし)。
     /// session の列にだけ書く (record には `record_data` 経由で入る)
@@ -219,9 +224,9 @@ pub mod sql {
     /// 乗務員の名前 (同じ transaction の中で引く)
     pub const EMPLOYEE_NAME: &str = "SELECT name FROM employees WHERE id = $1 AND tenant_id = $2";
 
-    /// 同じ測定に既にある、通常の流れ (通常点呼 / IT点呼) のセッションの id。述語は冪等用の部分 unique と同じで、
+    /// 同じ測定に既にある、通常の流れ (通常点呼 / IT点呼) のセッションの id と点呼方法。述語は冪等用の部分 unique と同じで、
     /// 自動点呼・遠隔点呼が同じ測定を指している session は拾わない
-    pub const EXISTING_SESSION_ID: &str = "SELECT id FROM tenko_sessions \
+    pub const EXISTING_SESSION: &str = "SELECT id, tenko_method FROM tenko_sessions \
          WHERE measurement_id = $1 AND tenant_id = $2 \
            AND (tenko_type = 'normal' OR tenko_method IN ('通常点呼', 'IT点呼')) \
          LIMIT 1";
@@ -493,6 +498,22 @@ pub async fn record(
     Ok(Some(session))
 }
 
+/// 同じ測定に既にある、通常の流れ (通常点呼 / IT点呼) の点呼セッションの (id, 点呼方法) を引く。
+/// 確定の口 ([`crate::deferred`]) は、既にある方法と頼まれた方法を比べるのに使う
+pub async fn existing_session(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    measurement_id: Uuid,
+) -> Result<Option<(Uuid, String)>, Error> {
+    Ok(tx
+        .query_typed_opt(
+            sql::EXISTING_SESSION,
+            &[(&measurement_id, Type::UUID), (&tenant_id, Type::UUID)],
+        )
+        .await?
+        .map(|r| (r.get(0), r.get(1))))
+}
+
 /// 同じ測定に既にある、通常の流れ (通常点呼 / IT点呼) の点呼セッションの id を引く (rust の `existing_session_id`)。
 /// [`record`] が `Ok(None)` (記録済み) を返したときに、測定の保存の応答へ載せる id を引き直すために使う
 pub async fn existing_session_id(
@@ -500,18 +521,14 @@ pub async fn existing_session_id(
     tenant_id: Uuid,
     measurement_id: Uuid,
 ) -> Result<Option<Uuid>, Error> {
-    Ok(tx
-        .query_typed_opt(
-            sql::EXISTING_SESSION_ID,
-            &[(&measurement_id, Type::UUID), (&tenant_id, Type::UUID)],
-        )
+    Ok(existing_session(tx, tenant_id, measurement_id)
         .await?
-        .map(|r| r.get(0)))
+        .map(|(id, _)| id))
 }
 
 /// 点呼セッションを作ってその id を返す。作られなかったとき (記録済みの再送、または結果が点呼にならない測定) は、
 /// 同じ測定に既にある session の id を引き直す (rust の `record_or_existing_session_id`)
-async fn record_or_existing_session_id(
+pub(crate) async fn record_or_existing_session_id(
     tx: &TenantTx<'_>,
     m: &Measurement,
     input: &NormalTenkoInput,

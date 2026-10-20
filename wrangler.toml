@@ -56,6 +56,12 @@ name = "ALERT_EMAIL"
 [vars]
 NOTIFY_EMAIL_FROM = "alc-alert@ippoan.org"
 
+# 見回り (Refs ippoan/alc-app#436): 1 分ごとに、点呼の確定を後回しにしたまま 2 分を過ぎた測定を `通常点呼` で確定する
+# (src/lib.rs の scheduled → crates/measurements/src/deferred.rs)。triggers は env に継承される (staging も同じ間隔で、
+# DB の経路は staging の段 = VPC → PgBouncer)
+[triggers]
+crons = ["* * * * *"]
+
 # staging: DB は ippoan/alc-vein-worker の staging と同じもの (Workers VPC の binding MEASUREMENTS_DB_VPC から
 # 既存の Tunnel 経由で PgBouncer へ繋ぐ。src/db.rs)。Hyperdrive は通さない。
 [env.staging]
