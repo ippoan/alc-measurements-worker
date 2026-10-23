@@ -1,13 +1,15 @@
 //! 毎朝 7:00 (日本時間) の「血圧の日報」メール (Refs ippoan/alc-app#436)。前日 (日本時間 0:00〜24:00) に血圧を測った全員の
-//! 記録の一覧を、テナントの notify のグループ「血圧の日報」の使える宛先 (`enabled`・email あり) へ 1 人 1 通送る。
-//! 宛先の引きと送信はアルコール検知メールと同じ ([`crate::alert::recipient_emails`]・[`crate::alert::deliver`])。
+//! 記録の一覧を、テナントの**管理者**へ 1 人 1 通送る (既定で送り、外したい人だけ外すオプトアウト)。
+//! 宛先は `notify_recipients` のうち `enabled`・email あり・結び付いた社員 (`employee_id`。削除済みでない) の `role` に
+//! `manager` か `admin` を含み、notify のグループ「血圧の日報を受け取らない」のメンバーでない人 ([`sql::RECIPIENTS`])。
+//! 送信はアルコール検知メールと同じ ([`crate::alert::deliver`])。旧グループ「血圧の日報」は使わない (残っていても無視)。
 //!
 //! worker の定時実行 (wrangler.toml の `[triggers]`。本番だけ [`DAILY_CRON`]) が [`run`] を呼ぶ。
 //!
 //! # テナントごと
 //!
 //! テナントの一覧は `tenants` を nil の tenant_tx で読む。1 テナントずつ短い tenant_tx 1 回で (宛先, 前日の記録) を引き、
-//! 宛先が 0 (グループが無い・メンバーが使えない) のテナントは何もしない。記録が 0 件なら「記録はありません」と送る。
+//! 宛先が 0 (管理者がいない・全員が外した・メールが使えない) のテナントは何もしない。記録が 0 件なら「記録はありません」と送る。
 //! 1 テナントの失敗で残りを止めない (リトライしない)。dev 端末の記録は RLS が分けるので入らない。
 //!
 //! 記録の時刻は `medical_measured_at` (無ければ `measured_at`)。完了 (completed) で systolic が入っている行だけ。
@@ -22,8 +24,8 @@ use crate::alert::{self, Outbox, SharedMailer, UNKNOWN_EMPLOYEE};
 use crate::bp::{self, Baseline, BASELINE_COLUMNS};
 use crate::LogSink;
 
-/// 宛先のグループの名前 (テナントごとに notify の画面で作る)
-pub const REPORT_GROUP: &str = "血圧の日報";
+/// 日報を受け取らない人のグループの名前 (テナントごとに notify の画面で作る。メンバーは宛先から外れる)
+pub const OPT_OUT_GROUP: &str = "血圧の日報を受け取らない";
 
 /// 日報の定時実行 (UTC。毎日 22:00 = 日本時間の翌朝 7:00)。wrangler.toml の本番の `[triggers]` と同じ文字列
 pub const DAILY_CRON: &str = "0 22 * * *";
@@ -33,6 +35,19 @@ pub mod sql {
 
     /// テナントの一覧 (`tenants` は RLS が無く、実行用ロールが読める)
     pub const TENANTS: &str = "SELECT id FROM tenants ORDER BY id";
+
+    /// 日報の宛先の email。$1 = tenant_id、$2 = 受け取らないグループの名前。
+    /// 使える宛先 (`enabled`・email あり) のうち、結び付いた社員 (削除済みでない) が manager か admin で、
+    /// 受け取らないグループのメンバーでない人。WHERE に tenant_id も明示する
+    pub const RECIPIENTS: &str = "SELECT r.email \
+         FROM notify_recipients r \
+         JOIN employees e ON e.id = r.employee_id AND e.tenant_id = r.tenant_id \
+         WHERE r.tenant_id = $1 AND r.enabled AND r.email IS NOT NULL AND btrim(r.email) <> '' \
+           AND e.deleted_at IS NULL AND e.role && ARRAY['manager', 'admin']::text[] \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM notify_recipient_groups m \
+               JOIN notify_groups g ON g.id = m.group_id AND g.tenant_id = $1 \
+               WHERE m.recipient_id = r.id AND g.name = $2)";
 
     /// 前日の記録 (時刻順)。基準値は LEFT JOIN (無ければ全部 NULL = 既定)。WHERE に tenant_id も明示する
     pub fn records() -> String {
@@ -159,6 +174,24 @@ impl ReportSummary {
     }
 }
 
+/// 日報の宛先の email (昇順・重複なし)
+async fn recipient_emails(
+    tx: &alc_worker_db::TenantTx<'_>,
+    tenant_id: Uuid,
+) -> Result<Vec<String>, tokio_postgres::Error> {
+    let rows = tx
+        .query_typed(
+            sql::RECIPIENTS,
+            &[(&tenant_id, Type::UUID), (&OPT_OUT_GROUP, Type::TEXT)],
+        )
+        .await?;
+    let mut emails: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+    // 同じ email の宛先が 2 つ在っても 1 通
+    emails.sort();
+    emails.dedup();
+    Ok(emails)
+}
+
 /// 1 テナントの (宛先の email, 記録)
 async fn lookup(
     pg: &mut PgClient,
@@ -168,7 +201,7 @@ async fn lookup(
 ) -> Result<(Vec<String>, Vec<Record>), tokio_postgres::Error> {
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
-            let (_, emails) = alert::recipient_emails(tx, tenant_id, REPORT_GROUP).await?;
+            let emails = recipient_emails(tx, tenant_id).await?;
             if emails.is_empty() {
                 // 宛先が無ければ記録は引かない
                 return Ok((emails, Vec::new()));
