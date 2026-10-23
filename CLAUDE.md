@@ -51,7 +51,7 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
 - 本人への LINE WORKS: 完了の PUT で systolic が**初めて**入った保存 (旧 systolic が NULL。tx の中で `FOR UPDATE` の旧値と比べる) の後、
   `bp_notify_settings` の `employee_id` = 測定の乗務員・`notify_self`・`lineworks_user_id` あり (`bp::sql::RECIPIENTS`) へ。基準値は
   `employee_health_baselines` (無ければ 120/80 ±10)、外れたら「基準から外れています」を足す。`bp::PendingBp` を応答の extension に入れ、
-  `src/lib.rs` が `ctx.wait_until` で送る (アルコール検知メールと同じ形)。dev 端末の要求・宛先なし・送信の失敗でも保存は成功。
+  `src/lib.rs` が `ctx.wait_until` で送る (アルコール検知メールと同じ形)。dev 端末の要求からも送る (本人宛て)。宛先なし・送信の失敗でも保存は成功。
   送り先は alc-lineworks-worker の Service Binding `ALC_LINEWORKS` (本番 `alc-lineworks`・staging `alc-lineworks-staging`)。ログは固定の語と件数だけ。
 - 毎朝 7:00 (日本時間) の日報メール: 本番の cron `0 22 * * *` (`report::DAILY_CRON` と同じ文字列。staging の cron は見回りだけ)。
   テナントを `tenants` から引き、前日 (日本時間 0〜24 時) の一覧を、テナントの notify グループ「血圧の日報」(`report::REPORT_GROUP`。
