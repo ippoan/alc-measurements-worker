@@ -2,8 +2,8 @@
 //! Service Binding) は `MockService` (受けた要求を記録する)。
 //!
 //! 条件は `PUT /measurements/{id}` が **status = completed で systolic が入り、更新前の systolic が NULL** の保存だけ。
-//! 宛先は `notify_recipients` の `employee_id` が測定の乗務員で、`enabled` かつ `lineworks_user_id` ありの行
-//! (alc-migrations 184)。dev 端末の要求からは送らない。ログは固定の語と件数だけ (氏名・値・id・user_id を出さない)。
+//! 宛先は血圧の通知の設定の表 `bp_notify_settings` (alc-migrations 186) の、測定の乗務員の `notify_self` かつ
+//! `lineworks_user_id` ありの行 (既存の `notify_recipients` は使わない)。dev 端末の要求からは送らない。ログは固定の語と件数だけ (氏名・値・id・user_id を出さない)。
 
 mod support;
 
@@ -36,34 +36,19 @@ async fn setup() -> (Uuid, Uuid) {
     (tenant, emp)
 }
 
-/// 宛先を 1 つ作る (superuser で)。`lineworks_user_id` が無ければ LINE の user_id だけの宛先
+/// 血圧の通知の設定の行を 1 つ作る (superuser で。alc-migrations 186)。`lineworks_user_id` が無ければ LINE WORKS の宛先なし
 async fn recipient(
     tenant: Uuid,
-    employee: Option<Uuid>,
+    employee: Uuid,
     lineworks_user_id: Option<&str>,
-    enabled: bool,
+    notify_self: bool,
 ) {
-    let line_only = lineworks_user_id
-        .is_none()
-        .then(|| Uuid::new_v4().to_string());
     admin()
         .await
         .execute(
-            "INSERT INTO alc_api.notify_recipients \
-                 (tenant_id, name, provider, lineworks_user_id, line_user_id, enabled, employee_id) \
-             VALUES ($1, '受信者', $2, $3, $4, $5, $6)",
-            &[
-                &tenant,
-                &if line_only.is_some() {
-                    "line"
-                } else {
-                    "lineworks"
-                },
-                &lineworks_user_id,
-                &line_only,
-                &enabled,
-                &employee,
-            ],
+            "INSERT INTO alc_api.bp_notify_settings (tenant_id, employee_id, lineworks_user_id, notify_self) \
+             VALUES ($1, $2, $3, $4)",
+            &[&tenant, &employee, &lineworks_user_id, &notify_self],
         )
         .await
         .unwrap();
@@ -110,7 +95,7 @@ fn texts(service: &MockService) -> Vec<String> {
 #[tokio::test]
 async fn test_first_save_sends_the_result_to_the_person() {
     let (tenant, emp) = setup().await;
-    recipient(tenant, Some(emp), Some("lw-user-1"), true).await;
+    recipient(tenant, emp, Some("lw-user-1"), true).await;
     let service = MockService::ok();
     let app = app_with(&service).await;
     let id = start_measurement(&app, tenant, emp).await;
@@ -141,7 +126,7 @@ async fn test_first_save_sends_the_result_to_the_person() {
 #[tokio::test]
 async fn test_saving_again_does_not_send_twice() {
     let (tenant, emp) = setup().await;
-    recipient(tenant, Some(emp), Some("lw-user-1"), true).await;
+    recipient(tenant, emp, Some("lw-user-1"), true).await;
     let service = MockService::ok();
     let app = app_with(&service).await;
     let id = start_measurement(&app, tenant, emp).await;
@@ -164,7 +149,7 @@ async fn test_saving_again_does_not_send_twice() {
 #[tokio::test]
 async fn test_not_completed_or_without_systolic_does_not_send() {
     let (tenant, emp) = setup().await;
-    recipient(tenant, Some(emp), Some("lw-user-1"), true).await;
+    recipient(tenant, emp, Some("lw-user-1"), true).await;
     let service = MockService::ok();
     let app = app_with(&service).await;
     let id = start_measurement(&app, tenant, emp).await;
@@ -187,7 +172,7 @@ async fn test_not_completed_or_without_systolic_does_not_send() {
 #[tokio::test]
 async fn test_off_baseline_adds_a_line_with_the_default_baseline() {
     let (tenant, emp) = setup().await;
-    recipient(tenant, Some(emp), Some("lw-user-1"), true).await;
+    recipient(tenant, emp, Some("lw-user-1"), true).await;
     let service = MockService::ok();
     let app = app_with(&service).await;
 
@@ -209,7 +194,7 @@ async fn test_off_baseline_adds_a_line_with_the_default_baseline() {
 #[tokio::test]
 async fn test_off_baseline_uses_the_employees_own_baseline() {
     let (tenant, emp) = setup().await;
-    recipient(tenant, Some(emp), Some("lw-user-1"), true).await;
+    recipient(tenant, emp, Some("lw-user-1"), true).await;
     baseline(tenant, emp, 150, 95, 5).await;
     let service = MockService::ok();
     let app = app_with(&service).await;
@@ -232,36 +217,52 @@ async fn test_off_baseline_uses_the_employees_own_baseline() {
 #[tokio::test]
 async fn test_only_the_matching_enabled_recipient_receives() {
     let (tenant, emp) = setup().await;
-    let other_emp = employee(tenant, "鈴木", &Uuid::new_v4().simple().to_string()[..8]).await;
+    let code = || Uuid::new_v4().simple().to_string()[..8].to_owned();
+    let other_emp = employee(tenant, "鈴木", &code()).await;
+    let line_only_emp = employee(tenant, "佐藤", &code()).await;
+    let bare_emp = employee(tenant, "高橋", &code()).await;
     let (other_tenant, other_tenant_emp) = setup().await;
     let service = MockService::ok();
     let app = app_with(&service).await;
 
-    // 使えない宛先: 無効・LINE だけ。本人でない宛先: 別の社員・社員の結び付けなし・別テナント
-    let line_only_emp = employee(tenant, "佐藤", &Uuid::new_v4().simple().to_string()[..8]).await;
-    recipient(tenant, Some(emp), Some("lw-disabled"), false).await;
-    recipient(tenant, Some(line_only_emp), None, true).await;
-    recipient(tenant, Some(other_emp), Some("lw-other-employee"), true).await;
-    recipient(tenant, None, Some("lw-unlinked"), true).await;
+    // 送らない: 本人への通知を切った・user_id が無い・設定の行が無い。本人でない設定: 別の社員・別テナント。
+    // 既存の通知の宛先 (notify_recipients。結び付けも user_id もある) は使わない
+    recipient(tenant, emp, Some("lw-disabled"), false).await;
+    recipient(tenant, line_only_emp, None, true).await;
+    recipient(tenant, other_emp, Some("lw-other-employee"), true).await;
     recipient(
         other_tenant,
-        Some(other_tenant_emp),
+        other_tenant_emp,
         Some("lw-other-tenant"),
         true,
     )
     .await;
-    for who in [emp, line_only_emp] {
+    admin()
+        .await
+        .execute(
+            "INSERT INTO alc_api.notify_recipients \
+                 (tenant_id, name, provider, lineworks_user_id, enabled, employee_id) \
+             VALUES ($1, '受信者', 'lineworks', 'lw-old-recipient', true, $2), \
+                    ($1, '受信者', 'lineworks', 'lw-old-recipient-2', true, $3)",
+            &[&tenant, &emp, &bare_emp],
+        )
+        .await
+        .unwrap();
+    for who in [emp, line_only_emp, bare_emp] {
         let id = start_measurement(&app, tenant, who).await;
         put_measurement_ok(&app, tenant, &id, &bp_body(120, 80, None)).await;
     }
     assert!(service.requests().is_empty());
-    assert_eq!(app.logs(), [SKIP_NO_RECIPIENT, SKIP_NO_RECIPIENT]);
+    assert_eq!(
+        app.logs(),
+        [SKIP_NO_RECIPIENT, SKIP_NO_RECIPIENT, SKIP_NO_RECIPIENT]
+    );
 
-    // 無効だった宛先を有効にしたら、その 1 人だけ
+    // 本人への通知を入れ直したら、その 1 人だけ
     admin()
         .await
         .execute(
-            "UPDATE alc_api.notify_recipients SET enabled = true WHERE lineworks_user_id = 'lw-disabled'",
+            "UPDATE alc_api.bp_notify_settings SET notify_self = true WHERE lineworks_user_id = 'lw-disabled'",
             &[],
         )
         .await
@@ -280,7 +281,7 @@ async fn test_only_the_matching_enabled_recipient_receives() {
 #[tokio::test]
 async fn test_dev_device_does_not_send() {
     let (tenant, emp) = setup().await;
-    recipient(tenant, Some(emp), Some("lw-user-1"), true).await;
+    recipient(tenant, emp, Some("lw-user-1"), true).await;
     let service = MockService::ok();
     let app = app_with(&service).await;
     let dev = [("X-Device-Dev", "1"), ("content-type", "application/json")];
@@ -314,7 +315,7 @@ async fn test_dev_device_does_not_send() {
 #[tokio::test]
 async fn test_no_lineworks_binding_keeps_the_save() {
     let (tenant, emp) = setup().await;
-    recipient(tenant, Some(emp), Some("lw-user-1"), true).await;
+    recipient(tenant, emp, Some("lw-user-1"), true).await;
     let app = build_lineworks(rt_client().await, None);
     let id = start_measurement(&app, tenant, emp).await;
 
@@ -327,7 +328,7 @@ async fn test_no_lineworks_binding_keeps_the_save() {
 #[tokio::test]
 async fn test_send_failures_keep_the_save_and_log_only_a_label() {
     let (tenant, emp) = setup().await;
-    recipient(tenant, Some(emp), Some("lw-secret-user"), true).await;
+    recipient(tenant, emp, Some("lw-secret-user"), true).await;
     for (service, want) in [
         (
             MockService::with(404, false),
@@ -354,15 +355,15 @@ async fn test_send_failures_keep_the_save_and_log_only_a_label() {
 async fn test_lookup_failure_keeps_the_save_and_logs_a_fixed_word() {
     // 宛先の引きが失敗しても (この tenant の宛先の行を読むと必ず失敗する制限的な policy を張る)、保存は残り、送らない
     let (tenant, emp) = setup().await;
-    recipient(tenant, Some(emp), Some("lw-user-1"), true).await;
+    recipient(tenant, emp, Some("lw-user-1"), true).await;
     let service = MockService::ok();
     let app = app_with(&service).await;
     let id = start_measurement(&app, tenant, emp).await;
     let su = admin().await;
     let policy = format!("bp_fail_{}", tenant.simple());
     su.batch_execute(&format!(
-        "CREATE POLICY {policy} ON alc_api.notify_recipients AS RESTRICTIVE FOR SELECT \
-         USING (CASE WHEN tenant_id = '{tenant}'::uuid THEN 1 / (length(name) - length(name)) = 1 ELSE true END)"
+        "CREATE POLICY {policy} ON alc_api.bp_notify_settings AS RESTRICTIVE FOR SELECT \
+         USING (CASE WHEN tenant_id = '{tenant}'::uuid THEN 1 / (length(tenant_id::text) - length(tenant_id::text)) = 1 ELSE true END)"
     ))
     .await
     .unwrap();
@@ -370,7 +371,7 @@ async fn test_lookup_failure_keeps_the_save_and_logs_a_fixed_word() {
     let res = put_measurement_ok(&app, tenant, &id, &bp_body(124, 78, None)).await;
 
     su.batch_execute(&format!(
-        "DROP POLICY {policy} ON alc_api.notify_recipients"
+        "DROP POLICY {policy} ON alc_api.bp_notify_settings"
     ))
     .await
     .unwrap();

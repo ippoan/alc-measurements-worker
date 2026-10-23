@@ -345,13 +345,13 @@ pub async fn deliver(outbox: Outbox, log: &LogSink) -> (usize, usize) {
 }
 
 /// テスト送信を許す呼び手か (auth-worker が付ける `X-User-Role`。alc-notify-worker の recipients.rs と同じ形)
-fn is_admin(auth_user: &Option<Extension<AuthUser>>) -> bool {
+pub(crate) fn is_admin(auth_user: &Option<Extension<AuthUser>>) -> bool {
     auth_user
         .as_ref()
         .is_some_and(|Extension(u)| u.role == "admin")
 }
 
-fn error(status: StatusCode, word: &'static str) -> Response {
+pub(crate) fn error(status: StatusCode, word: &'static str) -> Response {
     (status, Json(json!({ "error": word }))).into_response()
 }
 

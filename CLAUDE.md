@@ -44,18 +44,27 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
 送り手は `send_email` の binding `ALERT_EMAIL` (**トップと staging の両方**・`destination_address` は書かない) と変数 `NOTIFY_EMAIL_FROM`。
 どちらかが無ければ送らない。
 
-## 血圧の通知 (`bp.rs`・`report.rs`・`service.rs`)
+## 血圧の通知 (`bp.rs`・`bp_settings.rs`・`report.rs`・`service.rs`)
+**宛先と受け取りの設定は専用の表 `bp_notify_settings`** (alc-migrations 186。1 社員 1 行: `lineworks_user_id`・`lineworks_name`・`email`・
+`notify_self`・`daily_report`。(tenant, lineworks_user_id) は部分 UNIQUE)。**既存の通知の宛先 `notify_recipients`・notify のグループは血圧の通知では一切使わない**
+(「血圧の日報」「血圧の日報を受け取らない」グループは残っていても無視)。
 - 本人への LINE WORKS: 完了の PUT で systolic が**初めて**入った保存 (旧 systolic が NULL。tx の中で `FOR UPDATE` の旧値と比べる) の後、
-  `notify_recipients` (`employee_id` = 測定の乗務員・`enabled`・`lineworks_user_id` あり。alc-migrations 184) へ。基準値は
+  `bp_notify_settings` の `employee_id` = 測定の乗務員・`notify_self`・`lineworks_user_id` あり (`bp::sql::RECIPIENTS`) へ。基準値は
   `employee_health_baselines` (無ければ 120/80 ±10)、外れたら「基準から外れています」を足す。`bp::PendingBp` を応答の extension に入れ、
   `src/lib.rs` が `ctx.wait_until` で送る (アルコール検知メールと同じ形)。dev 端末の要求・宛先なし・送信の失敗でも保存は成功。
   送り先は alc-lineworks-worker の Service Binding `ALC_LINEWORKS` (本番 `alc-lineworks`・staging `alc-lineworks-staging`)。ログは固定の語と件数だけ。
 - 毎朝 7:00 (日本時間) の日報メール: 本番の cron `0 22 * * *` (`report::DAILY_CRON` と同じ文字列。staging の cron は見回りだけ)。
   テナントを `tenants` から引き、**管理者**へ前日 (日本時間 0〜24 時) の一覧を 1 人 1 通 (既定で送り、外したい人だけ外すオプトアウト)。
-  宛先 (`report::sql::RECIPIENTS`) = `notify_recipients` のうち `enabled`・email あり・`employee_id` が結び付いた社員 (`deleted_at IS NULL`) の
-  `role` (TEXT[]) に `manager` か `admin` を含み、notify グループ「血圧の日報を受け取らない」(`report::OPT_OUT_GROUP`) のメンバーでない人。
-  旧グループ「血圧の日報」は使わない (残っていても無視)。アルコール検知メールの宛先 (`alert::recipient_emails`・グループ「アルコール検知」) とは別の引き。
-  テナントごとに失敗しても続ける。
+  宛先 (`report::sql::RECIPIENTS`) = 削除済みでない社員 (`deleted_at IS NULL`) の `role` (TEXT[]) に `manager` か `admin` を含み、
+  `bp_notify_settings` の `daily_report` が true で `email` がある人。**設定の行が無い管理者は email が無いので送らない。**
+  アルコール検知メールの宛先 (`alert::recipient_emails`・グループ「アルコール検知」) とは別の引き。テナントごとに失敗しても続ける。
+- 設定の口 (`bp_settings.rs`。管理画面 alc-app が呼ぶ。**4 口とも admin だけ**: `X-User-Role` が admin でなければ 403 `forbidden`。`alert::is_admin` と同じ):
+  `GET /api/bp-notify/settings` (削除済みでない全社員を社員コード順に、設定を LEFT JOIN)・`PUT /api/bp-notify/settings/{employee_id}`
+  (来ていない欄はそのまま・`null` は空・同じ lineworks_user_id が他の社員に在れば 409 `lineworks_user_taken`・社員が居なければ 404・email 不正は 400)・
+  `GET /api/bp-notify/lineworks-users` (Service Binding の `GET /api/internal/lineworks/users`。取れなければ 502、binding 無しは 503 `lineworks_unavailable`)・
+  `POST /api/bp-notify/link-by-name` (`{dry_run}` 省略で true。LINE WORKS のメンバー全体と、lineworks_user_id が無い社員を空白 (半角・全角) を除いた氏名で比べ、
+  一致がちょうど 1 人で他の社員に結び付いていなければ候補 (`bp_settings::plan`)。確定は 1 transaction、先を越されたら何も書かず 409)。
+  `Service` trait は `post` と `get` (応答は status と本文)。**メンバー一覧の await は tenant_tx の外**。ログに氏名・LINE WORKS の id・メールを出さない。
 
 ## 規範
 - 公開範囲を弱めない: 本番・staging とも Service Binding だけ (どの env も `workers_dev`/`preview_urls` = false、route 無し)。
@@ -63,7 +72,7 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
   (staging が本番 bucket を指さない。R2 の await は tenant_tx の中に入れない)。`wrangler.toml` の表の順を変えない (新しい表は `[build]` より後)。
 - **ログ・エラー応答は固定の語だけ。** エラーの文 (`{e}`)・tenant_id などの識別子・入力値 (車検証の番号など) を出さない。
   DB の失敗は `measurements: <段> failed: db (<kind>)` (kind は SQLSTATE か固定の label)。応答の本文は rust と同じく空。
-- role は見ない (rust も `X-Tenant-ID` だけ。例外はテスト送信の口 1 本)。dev端末の印 `X-Device-Dev: 1` は rust と同じく `app.device_dev` に通す
+- role は見ない (rust も `X-Tenant-ID` だけ。例外はテスト送信の口と血圧の通知の設定の 4 口)。dev端末の印 `X-Device-Dev: 1` は rust と同じく `app.device_dev` に通す
   (`set_device_dev`。tenant_tx の最初の文。列 `is_dev` の既定値と RLS が dev の行を分ける。alc-migrations 153)。
   印は kit の `require_tenant_header` が書く `DeviceDevSlot` から読む (ヘッダを口で読み直さない)。
   **dev 端末の印を tenant_tx の中で立てている。kit に口ができたら置き換える。**
@@ -73,6 +82,6 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
   **`tenko.rs` の `status_for_result`・`record_payload`・`insert_record`・`TenkoSession` は rust (alc-tenko) と 2 か所に在る**
   (rust の自動点呼が同じものを使う)。片方を変えたらもう片方も変える (列・規則・record_hash の作り方)。
   serde_json に `preserve_order` を付けない (record_data の key の順 = hash が rust と変わる)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 28・api_db 9・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 12) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 35・api_db 9・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 12・bp_settings_db 18) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・Hyperdrive の設定の ID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-trouble-worker と同じ rev)。
