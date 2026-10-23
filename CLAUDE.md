@@ -51,7 +51,10 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
   `src/lib.rs` が `ctx.wait_until` で送る (アルコール検知メールと同じ形)。dev 端末の要求・宛先なし・送信の失敗でも保存は成功。
   送り先は alc-lineworks-worker の Service Binding `ALC_LINEWORKS` (本番 `alc-lineworks`・staging `alc-lineworks-staging`)。ログは固定の語と件数だけ。
 - 毎朝 7:00 (日本時間) の日報メール: 本番の cron `0 22 * * *` (`report::DAILY_CRON` と同じ文字列。staging の cron は見回りだけ)。
-  テナントを `tenants` から引き、notify グループ「血圧の日報」の使える宛先へ前日 (日本時間 0〜24 時) の一覧を 1 人 1 通。
+  テナントを `tenants` から引き、**管理者**へ前日 (日本時間 0〜24 時) の一覧を 1 人 1 通 (既定で送り、外したい人だけ外すオプトアウト)。
+  宛先 (`report::sql::RECIPIENTS`) = `notify_recipients` のうち `enabled`・email あり・`employee_id` が結び付いた社員 (`deleted_at IS NULL`) の
+  `role` (TEXT[]) に `manager` か `admin` を含み、notify グループ「血圧の日報を受け取らない」(`report::OPT_OUT_GROUP`) のメンバーでない人。
+  旧グループ「血圧の日報」は使わない (残っていても無視)。アルコール検知メールの宛先 (`alert::recipient_emails`・グループ「アルコール検知」) とは別の引き。
   テナントごとに失敗しても続ける。
 
 ## 規範
@@ -70,6 +73,6 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
   **`tenko.rs` の `status_for_result`・`record_payload`・`insert_record`・`TenkoSession` は rust (alc-tenko) と 2 か所に在る**
   (rust の自動点呼が同じものを使う)。片方を変えたらもう片方も変える (列・規則・record_hash の作り方)。
   serde_json に `preserve_order` を付けない (record_data の key の順 = hash が rust と変わる)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 28・api_db 9・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 8) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 28・api_db 9・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 12) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・Hyperdrive の設定の ID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-trouble-worker と同じ rev)。
