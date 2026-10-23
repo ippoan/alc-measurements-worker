@@ -3,7 +3,7 @@
 //!
 //! 条件は `PUT /measurements/{id}` が **status = completed で systolic が入り、更新前の systolic が NULL** の保存だけ。
 //! 宛先は血圧の通知の設定の表 `bp_notify_settings` (alc-migrations 186) の、測定の乗務員の `notify_self` かつ
-//! `lineworks_user_id` ありの行 (既存の `notify_recipients` は使わない)。dev 端末の要求からは送らない。ログは固定の語と件数だけ (氏名・値・id・user_id を出さない)。
+//! `lineworks_user_id` ありの行 (既存の `notify_recipients` は使わない)。dev 端末の要求からも送る (本人宛て)。ログは固定の語と件数だけ (氏名・値・id・user_id を出さない)。
 
 mod support;
 
@@ -15,7 +15,6 @@ use uuid::Uuid;
 
 const SKIP_NO_RECIPIENT: &str = "measurements: bp notify skipped: no recipient";
 const SKIP_NO_LINEWORKS: &str = "measurements: bp notify skipped: no lineworks";
-const SKIP_DEV: &str = "measurements: bp notify skipped: dev";
 /// 2026-10-23 08:12 (日本時間)
 const AT: &str = "2026-10-22T23:12:00Z";
 
@@ -279,7 +278,7 @@ async fn test_only_the_matching_enabled_recipient_receives() {
 }
 
 #[tokio::test]
-async fn test_dev_device_does_not_send() {
+async fn test_dev_device_sends_to_the_person_too() {
     let (tenant, emp) = setup().await;
     recipient(tenant, emp, Some("lw-user-1"), true).await;
     let service = MockService::ok();
@@ -308,8 +307,11 @@ async fn test_dev_device_does_not_send() {
     .await;
 
     assert_eq!(res.status, 200);
-    assert!(service.requests().is_empty());
-    assert_eq!(app.logs(), [SKIP_DEV]);
+    let requests = service.requests();
+    assert_eq!(requests.len(), 1);
+    let sent: Value = serde_json::from_str(&requests[0].body).unwrap();
+    assert_eq!(sent["to"]["user_id"], "lw-user-1");
+    assert!(app.logs().is_empty(), "{:?}", app.logs());
 }
 
 #[tokio::test]

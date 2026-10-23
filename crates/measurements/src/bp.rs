@@ -6,7 +6,7 @@
 //!
 //! 保存が **status = completed で systolic が入り、更新前の systolic が NULL** のときだけ ([`should_notify`])。旧値は PUT の
 //! transaction の中で `FOR UPDATE` で読む (アルコール検知メールと同じ。同じ測定への PUT が並んでも、条件を満たす保存は 1 つだけ)。
-//! 血圧を保存し直しても、後から別の欄だけ保存しても二重には送らない。dev 端末の要求 (`X-Device-Dev: 1`) からは送らない。
+//! 血圧を保存し直しても、後から別の欄だけ保存しても二重には送らない。dev 端末の要求 (`X-Device-Dev: 1`) からも送る (本人宛てなので他人には届かない)。
 //!
 //! # 流れ (lock を握ったまま送らない)
 //!
@@ -212,7 +212,7 @@ impl PendingBp {
 }
 
 /// 保存が条件を満たした (`notify`) ときだけ、宛先を引いて送る用意をする。送らない理由はログ 1 行 (固定の語)。
-/// dev 端末の要求・送り先の Worker が無い・宛先が無いときは送らない。**pg の lock を持ったまま呼び**、返した
+/// 送り先の Worker が無い・宛先が無いときは送らない (dev 端末の要求でも送る。本人宛て)。**pg の lock を持ったまま呼び**、返した
 /// [`PendingBp`] は応答の extension に入れて応答の後に送る。引きの失敗は保存を巻き戻さない
 pub async fn prepare(
     state: &AppState,
@@ -223,10 +223,6 @@ pub async fn prepare(
     m: &Measurement,
 ) -> Option<PendingBp> {
     if !notify {
-        return None;
-    }
-    if dev {
-        (state.log)("measurements: bp notify skipped: dev");
         return None;
     }
     let Some(service) = state.lineworks.clone() else {

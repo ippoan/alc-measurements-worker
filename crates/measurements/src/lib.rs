@@ -18,7 +18,7 @@
 //!   メンバーへ 1 人 1 通。送り手は [`alert::AlertMailer`] で差し替える)
 //!
 //! 全部の口が `X-Tenant-ID` を要る (auth-worker が付ける。無い・UUID でない → 401。`alc_core_wasm::require_tenant_header`)。
-//! rust と同じく role は見ない (例外は [`alert::alert_test`] の 1 口だけで、`X-User-Role` が admin でなければ 403)。dev端末の印 `X-Device-Dev` は rust と同じく接続の設定 `app.device_dev` に通す
+//! rust と同じく role は見ない (例外は [`alert::alert_test`]・[`report::bp_report_test`] のテスト送信と血圧の通知の設定の口で、`X-User-Role` が admin でなければ 403)。dev端末の印 `X-Device-Dev` は rust と同じく接続の設定 `app.device_dev` に通す
 //! (`require_tenant_header` が認証の後に書く `DeviceDevSlot` を口が読み、[`set_device_dev`] で立てる)。
 //! DB は `PgClient::tenant_tx` + `query_typed` 系だけ (名前付き prepared statement は使わない)。
 //! ログ・エラー応答は固定の語だけ (エラーの文・識別子・入力値を載せない。DB のエラーは `kind` = SQLSTATE か固定の label)。
@@ -48,6 +48,9 @@ use futures_util::lock::Mutex;
 
 pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// 今の時刻 (UTC)。chrono を時計なしで使うので、Worker では `Date.now()`、テストでは固定の時刻を渡す
+pub type NowFn = Arc<dyn Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub pg: Arc<Mutex<PgClient>>,
@@ -58,6 +61,8 @@ pub struct AppState {
     pub mailer: Option<alert::SharedMailer>,
     /// LINE WORKS の送り先 (ippoan/alc-lineworks-worker の Service Binding `ALC_LINEWORKS`)。無ければ血圧の本人通知は送らない
     pub lineworks: Option<service::SharedService>,
+    /// 今の時刻 (血圧の日報のテスト送信が「前日」を決めるのに使う)
+    pub now: NowFn,
 }
 
 impl AppState {

@@ -12,6 +12,7 @@
 //!
 //! 顔写真・動画の口 (`/measurements/{id}/face-photo`・`/video`) は [`crate::files`]。
 //! アルコール検知メールのテスト送信 (`POST /measurements/alert-test`。admin だけ) は [`crate::alert::alert_test`]。
+//! 血圧の日報のテスト送信 (`POST /measurements/bp-report-test`。admin だけ) は [`crate::report::bp_report_test`]。
 //! 点呼の確定 (`POST /measurements/{id}/tenko`。rust に無い) は [`crate::deferred::confirm_tenko`]。
 
 use alc_core_wasm::{DeviceDevSlot, TenantId};
@@ -31,6 +32,7 @@ use crate::models::{
     CreateMeasurement, Measurement, MeasurementFilter, MeasurementsResponse, StartMeasurement,
     UpdateMeasurement, UpdatedMeasurement, MEASUREMENT_COLUMNS, MEASUREMENT_COLUMN_COUNT,
 };
+use crate::report;
 use crate::tenko::{record_as_tenko_if_marked, NormalTenkoInput};
 use crate::{set_device_dev, AppState, LogSink};
 
@@ -392,6 +394,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/measurements/start", post(start_measurement))
         .route("/measurements/alert-test", post(alert::alert_test))
+        .route("/measurements/bp-report-test", post(report::bp_report_test))
         .route(
             "/measurements/{id}",
             get(get_measurement).put(update_measurement),
