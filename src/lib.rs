@@ -100,6 +100,10 @@ async fn fetch(req: HttpRequest, env: Env, ctx: Context) -> Result<Response<Body
             .service(ALC_LINEWORKS_BINDING)
             .ok()
             .map(|f| Arc::new(ServiceBinding::new(f)) as measurements::service::SharedService),
+        now: Arc::new(|| {
+            measurements::report::from_millis(worker::Date::now().as_millis() as f64)
+                .unwrap_or_default()
+        }),
     };
     let mut resp = match router().with_state(state).call(req).await {
         Ok(r) => r,

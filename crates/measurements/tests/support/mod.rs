@@ -391,6 +391,7 @@ pub fn build_all(
         files,
         mailer,
         lineworks,
+        now: Arc::new(|| "2026-10-22T22:00:00Z".parse().unwrap()),
     };
     App {
         router: router().with_state(state),

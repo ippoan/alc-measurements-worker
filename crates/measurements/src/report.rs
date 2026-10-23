@@ -1,29 +1,46 @@
 //! 毎朝 7:00 (日本時間) の「血圧の日報」メール (Refs ippoan/alc-app#436)。前日 (日本時間 0:00〜24:00) に血圧を測った全員の
-//! 記録の一覧を、テナントの**管理者**へ 1 人 1 通送る (既定で送り、外したい人だけ外すオプトアウト)。
-//! 宛先は削除済みでない社員のうち `role` に `manager` か `admin` を含み、血圧の通知の設定の表 `bp_notify_settings`
-//! (alc-migrations 186。設定の口は [`crate::bp_settings`]) で `daily_report` が true・`email` がある人 ([`sql::RECIPIENTS`])。
-//! 設定の行が無い管理者は email が無いので送らない。既存の通知の宛先 (`notify_recipients`)・notify のグループは使わない。
+//! 記録の一覧を、テナントの notify のグループ [`REPORT_GROUP`] (「血圧の日報」) のメンバーへ 1 人 1 通送る。
+//! アルコール検知メールと同じ形で、宛先は notify の既存の表 (`notify_groups`・`notify_recipient_groups`・`notify_recipients`) の
+//! 使える宛先 (`enabled`・email あり) を [`alert::recipient_emails`] で引く。管理者には自動では送らない
+//! (宛先は nuxt-notify の画面で好きなメールアドレスを登録する)。血圧の通知の設定の表 `bp_notify_settings` の
+//! `daily_report`・`email` は日報では使わない (本人への LINE WORKS ([`crate::bp`]) の設定だけ)。
 //! 送信はアルコール検知メールと同じ ([`crate::alert::deliver`])。
+//!
+//! テスト送信 (`POST /api/measurements/bp-report-test`。admin だけ) は [`bp_report_test`]: 同じ宛先へ前日の実際の日報を
+//! 件名に「[テスト]」を付けて今すぐ送る。
 //!
 //! worker の定時実行 (wrangler.toml の `[triggers]`。本番だけ [`DAILY_CRON`]) が [`run`] を呼ぶ。
 //!
 //! # テナントごと
 //!
 //! テナントの一覧は `tenants` を nil の tenant_tx で読む。1 テナントずつ短い tenant_tx 1 回で (宛先, 前日の記録) を引き、
-//! 宛先が 0 (管理者がいない・全員が外した・メールが使えない) のテナントは何もしない。記録が 0 件なら「記録はありません」と送る。
+//! 宛先が 0 (グループが無い・メンバーがいない・メールが使えない) のテナントは何もしない。記録が 0 件なら「記録はありません」と送る。
 //! 1 テナントの失敗で残りを止めない (リトライしない)。dev 端末の記録は RLS が分けるので入らない。
 //!
 //! 記録の時刻は `medical_measured_at` (無ければ `measured_at`)。完了 (completed) で systolic が入っている行だけ。
 //! **ログは件数だけ** (氏名・値・id・メールアドレスを出さない)。
 
+use alc_core_wasm::{DeviceDevSlot, TenantId};
 use alc_worker_db::{kind, PgClient, TxOutput};
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::{Extension, Json};
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
+use serde_json::json;
 use tokio_postgres::types::Type;
 use uuid::Uuid;
 
-use crate::alert::{self, Outbox, SharedMailer, UNKNOWN_EMPLOYEE};
+use crate::alert::{self, error, is_admin, Outbox, SharedMailer, UNKNOWN_EMPLOYEE};
 use crate::bp::{self, Baseline, BASELINE_COLUMNS};
-use crate::LogSink;
+use crate::{set_device_dev, AppState, LogSink};
+
+/// 宛先のグループの名前 (テナントごとに notify の画面 (nuxt-notify) で作る。`notify_groups` は (tenant_id, name) が UNIQUE。
+/// nuxt-notify の同名の定数と文字列を合わせる)
+pub const REPORT_GROUP: &str = "血圧の日報";
+
+/// テスト送信の件名の接頭辞
+pub const TEST_SUBJECT_PREFIX: &str = "[テスト] ";
 
 /// 日報の定時実行 (UTC。毎日 22:00 = 日本時間の翌朝 7:00)。wrangler.toml の本番の `[triggers]` と同じ文字列
 pub const DAILY_CRON: &str = "0 22 * * *";
@@ -33,14 +50,6 @@ pub mod sql {
 
     /// テナントの一覧 (`tenants` は RLS が無く、実行用ロールが読める)
     pub const TENANTS: &str = "SELECT id FROM tenants ORDER BY id";
-
-    /// 日報の宛先の email。$1 = tenant_id。削除済みでない社員のうち manager か admin で、設定の表で
-    /// `daily_report` が true・email がある人。WHERE に tenant_id も明示する
-    pub const RECIPIENTS: &str = "SELECT s.email \
-         FROM employees e \
-         JOIN bp_notify_settings s ON s.employee_id = e.id AND s.tenant_id = e.tenant_id \
-         WHERE e.tenant_id = $1 AND e.deleted_at IS NULL AND e.role && ARRAY['manager', 'admin']::text[] \
-           AND s.daily_report AND s.email IS NOT NULL AND btrim(s.email) <> ''";
 
     /// 前日の記録 (時刻順)。基準値は LEFT JOIN (無ければ全部 NULL = 既定)。WHERE に tenant_id も明示する
     pub fn records() -> String {
@@ -167,31 +176,18 @@ impl ReportSummary {
     }
 }
 
-/// 日報の宛先の email (昇順・重複なし)
-async fn recipient_emails(
-    tx: &alc_worker_db::TenantTx<'_>,
-    tenant_id: Uuid,
-) -> Result<Vec<String>, tokio_postgres::Error> {
-    let rows = tx
-        .query_typed(sql::RECIPIENTS, &[(&tenant_id, Type::UUID)])
-        .await?;
-    let mut emails: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
-    // 同じ email の宛先が 2 つ在っても 1 通
-    emails.sort();
-    emails.dedup();
-    Ok(emails)
-}
-
 /// 1 テナントの (宛先の email, 記録)
 async fn lookup(
     pg: &mut PgClient,
     tenant_id: Uuid,
+    dev: bool,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Result<(Vec<String>, Vec<Record>), tokio_postgres::Error> {
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
-            let emails = recipient_emails(tx, tenant_id).await?;
+            set_device_dev(tx, dev).await?;
+            let (_, emails) = alert::recipient_emails(tx, tenant_id, REPORT_GROUP).await?;
             if emails.is_empty() {
                 // 宛先が無ければ記録は引かない
                 return Ok((emails, Vec::new()));
@@ -266,7 +262,7 @@ pub async fn run(
         ..Default::default()
     };
     for tenant_id in tenants {
-        let (emails, records) = match lookup(pg, tenant_id, from, to).await {
+        let (emails, records) = match lookup(pg, tenant_id, false, from, to).await {
             Ok(found) => found,
             Err(e) => {
                 log(&format!(
@@ -288,6 +284,40 @@ pub async fn run(
         summary.failed += failed;
     }
     Some(summary)
+}
+
+/// `POST /api/measurements/bp-report-test` — グループ [`REPORT_GROUP`] の使える宛先へ、前日の実際の日報を件名に
+/// 「[テスト]」を付けて今すぐ送る (記録が無ければ「記録はありません」の本文)。応答・エラーは alert-test と同じ形:
+/// admin 以外 403 `forbidden`・送り手が無い 503 `mail_unavailable`・宛先が 0 (グループが無いも含む) 409 `no_recipients`・
+/// 引きの失敗 500 (本文なし)・送った 200 `{"sent", "failed"}`
+pub async fn bp_report_test(
+    State(state): State<AppState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Extension(dev): Extension<DeviceDevSlot>,
+    auth_user: Option<Extension<alc_core_wasm::AuthUser>>,
+) -> Response {
+    if !is_admin(&auth_user) {
+        return error(StatusCode::FORBIDDEN, "forbidden");
+    }
+    let Some(mailer) = state.mailer.clone() else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "mail_unavailable");
+    };
+    let (from, to, day) = yesterday((state.now)());
+    let mut pg = state.pg.lock().await;
+    let found = lookup(&mut pg, tenant_id, dev.get(), from, to).await;
+    drop(pg);
+    let (emails, records) = match found {
+        Ok(found) => found,
+        Err(e) => return state.db_fail("bp report test lookup", &e).into_response(),
+    };
+    if emails.is_empty() {
+        return error(StatusCode::CONFLICT, "no_recipients");
+    }
+    let (subject, body) = compose(day, &records);
+    let subject = format!("{TEST_SUBJECT_PREFIX}{subject}");
+    let (sent, failed) =
+        alert::deliver(Outbox::new(mailer, emails, &subject, &body), &state.log).await;
+    Json(json!({ "sent": sent, "failed": failed })).into_response()
 }
 
 #[cfg(test)]
