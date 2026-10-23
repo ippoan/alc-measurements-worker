@@ -16,16 +16,19 @@
 mod db;
 mod mail;
 mod r2;
+mod service;
 mod tcp;
 
 use std::sync::Arc;
 
 use crate::mail::EmailSender;
 use crate::r2::R2Store;
+use crate::service::ServiceBinding;
 use axum::body::Body;
 use axum::http::{HeaderValue, Response, StatusCode};
 use futures_util::lock::Mutex;
 use measurements::alert::PendingAlert;
+use measurements::bp::PendingBp;
 use measurements::{router, AppState, LogSink};
 use tower_service::Service;
 use worker::{
@@ -41,6 +44,9 @@ const MEASUREMENTS_R2_BINDING: &str = "MEASUREMENTS_R2";
 /// 差出人の変数。どちらかが無ければメールは送らない (ほかの口は動く)
 const ALERT_EMAIL_BINDING: &str = "ALERT_EMAIL";
 const NOTIFY_EMAIL_FROM_VAR: &str = "NOTIFY_EMAIL_FROM";
+
+/// alc-lineworks-worker の Service Binding (wrangler.toml の `[[services]]`。血圧の本人への LINE WORKS)。無ければ送らない
+const ALC_LINEWORKS_BINDING: &str = "ALC_LINEWORKS";
 
 /// 送り手を作る。binding が無い・差出人が未設定なら `None`
 fn alert_mailer(env: &Env) -> Option<measurements::alert::SharedMailer> {
@@ -90,6 +96,10 @@ async fn fetch(req: HttpRequest, env: Env, ctx: Context) -> Result<Response<Body
             .ok()
             .map(|b| Arc::new(R2Store::new(b)) as measurements::files::SharedStore),
         mailer: alert_mailer(&env),
+        lineworks: env
+            .service(ALC_LINEWORKS_BINDING)
+            .ok()
+            .map(|f| Arc::new(ServiceBinding::new(f)) as measurements::service::SharedService),
     };
     let mut resp = match router().with_state(state).call(req).await {
         Ok(r) => r,
@@ -97,6 +107,12 @@ async fn fetch(req: HttpRequest, env: Env, ctx: Context) -> Result<Response<Body
     };
     // アルコール検知メール (顔写真の読みと送信) は応答を返した後に回す。応答の本文・ヘッダーは変えない
     if let Some(pending) = resp.extensions_mut().remove::<PendingAlert>() {
+        ctx.wait_until(async move {
+            let _ = pending.send().await;
+        });
+    }
+    // 血圧の本人への LINE WORKS も、応答を返した後に送る
+    if let Some(pending) = resp.extensions_mut().remove::<PendingBp>() {
         ctx.wait_until(async move {
             let _ = pending.send().await;
         });
@@ -116,16 +132,29 @@ async fn fetch(req: HttpRequest, env: Env, ctx: Context) -> Result<Response<Body
     Ok(resp)
 }
 
-/// 見回り (確定待ちのまま 2 分を過ぎた測定を `通常点呼` で確定する)。DB の経路は fetch と同じ [`db::connect`]
+/// 定時実行。本番の `0 22 * * *` (日本時間 7:00) は前日の血圧の日報メール、それ以外 (1 分ごと) は見回り
+/// (確定待ちのまま 2 分を過ぎた測定を `通常点呼` で確定する)。DB の経路は fetch と同じ [`db::connect`]
 #[event(scheduled)]
-async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let mut pg = match db::connect(&env).await {
         Ok(c) => c,
         Err(e) => {
-            console_error!("measurements: tenko sweep {e}");
+            console_error!("measurements: scheduled {e}");
             return;
         }
     };
+    if event.cron() == measurements::report::DAILY_CRON {
+        let Some(now) = measurements::report::from_millis(event.schedule()) else {
+            console_error!("measurements: bp report skipped: no time");
+            return;
+        };
+        if let Some(summary) =
+            measurements::report::run(&mut pg, alert_mailer(&env), &log_sink(), now).await
+        {
+            console_log!("{}", summary.line());
+        }
+        return;
+    }
     if let Some(summary) = measurements::deferred::sweep(&mut pg, &log_sink()).await {
         console_log!("{}", summary.line());
     }

@@ -22,11 +22,14 @@
 //! ログ・エラー応答は固定の語だけ (エラーの文・識別子・入力値を載せない。DB のエラーは `kind` = SQLSTATE か固定の label)。
 
 pub mod alert;
+pub mod bp;
 pub mod carins;
 pub mod deferred;
 pub mod files;
 pub mod measurements;
 pub mod models;
+pub mod report;
+pub mod service;
 pub mod tenko;
 
 use std::sync::Arc;
@@ -50,6 +53,8 @@ pub struct AppState {
     pub files: Option<files::SharedStore>,
     /// アルコール検知メールの送り手 (`send_email` の binding)。無ければ (binding か差出人が無い) メールは送らない
     pub mailer: Option<alert::SharedMailer>,
+    /// LINE WORKS の送り先 (ippoan/alc-lineworks-worker の Service Binding `ALC_LINEWORKS`)。無ければ血圧の本人通知は送らない
+    pub lineworks: Option<service::SharedService>,
 }
 
 impl AppState {

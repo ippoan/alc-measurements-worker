@@ -56,11 +56,21 @@ name = "ALERT_EMAIL"
 [vars]
 NOTIFY_EMAIL_FROM = "alc-alert@ippoan.org"
 
-# 見回り (Refs ippoan/alc-app#436): 1 分ごとに、点呼の確定を後回しにしたまま 2 分を過ぎた測定を `通常点呼` で確定する
-# (src/lib.rs の scheduled → crates/measurements/src/deferred.rs)。triggers は env に継承される (staging も同じ間隔で、
-# DB の経路は staging の段 = VPC → PgBouncer)
+# 血圧の本人への LINE WORKS (Refs ippoan/alc-app#436): 血圧が初めて保存された PUT の後に、測定した本人へ ippoan/alc-lineworks-worker
+# の POST /api/internal/lineworks/messages を Service Binding で呼んで送る (crates/measurements/src/bp.rs、src/service.rs。
+# Bot の秘密値はこの Worker に来ない)。binding は env に継承されないので、staging は下で staging の Worker を指す
+[[services]]
+binding = "ALC_LINEWORKS"
+service = "alc-lineworks"
+
+# 本番の定時実行 (Refs ippoan/alc-app#436、src/lib.rs の scheduled)。
+#   * 1 分ごと: 点呼の確定を後回しにしたまま 2 分を過ぎた測定を `通常点呼` で確定する見回り
+#     (crates/measurements/src/deferred.rs)
+#   * 毎日 22:00 UTC (= 日本時間の毎朝 7:00): 前日の血圧の日報メール (crates/measurements/src/report.rs)。
+#     この文字列は measurements::report::DAILY_CRON と同じにすること (scheduled はこの文字列で振り分ける)
+# triggers は env に継承される。staging は下で見回りだけに上書きする (日報は本番だけ)
 [triggers]
-crons = ["* * * * *"]
+crons = ["* * * * *", "0 22 * * *"]
 
 # staging: DB は ippoan/alc-vein-worker の staging と同じもの (Workers VPC の binding MEASUREMENTS_DB_VPC から
 # 既存の Tunnel 経由で PgBouncer へ繋ぐ。src/db.rs)。Hyperdrive は通さない。
@@ -92,12 +102,22 @@ remote = true
 binding = "MEASUREMENTS_R2"
 bucket_name = "alc-face-photos-staging"
 
+# staging の Service Binding は staging の Worker を指す (本番の Worker を指すと、staging から本番の LINE WORKS に届く。
+# scripts/check-exposure.sh が検査)
+[[env.staging.services]]
+binding = "ALC_LINEWORKS"
+service = "alc-lineworks-staging"
+
 # アルコール検知メール。トップレベルと同じ binding と差出人 (destination_address は書かない)
 [[env.staging.send_email]]
 name = "ALERT_EMAIL"
 
 [env.staging.vars]
 NOTIFY_EMAIL_FROM = "alc-alert@ippoan.org"
+
+# staging の定時実行は見回りだけ (血圧の日報は本番だけ。DB の経路は staging の段 = VPC → PgBouncer)
+[env.staging.triggers]
+crons = ["* * * * *"]
 
 # ローカル (`wrangler dev --env local`) 専用。deploy しない。
 # binding を持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL の段で繋ぐ
