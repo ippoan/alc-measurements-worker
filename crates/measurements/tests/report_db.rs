@@ -1,7 +1,8 @@
 //! 毎朝 7:00 (日本時間) の「血圧の日報」メール (Refs ippoan/alc-app#436) を実 DB まで通す。送り手は `MockMailer`。
 //!
-//! 前日 (日本時間 0:00〜24:00) に血圧を測った全員の一覧を、テナントの管理者 (`notify_recipients` の `enabled`・email あり・
-//! 結び付いた社員の role に manager か admin) のうち、グループ「血圧の日報を受け取らない」に入っていない人へ 1 人 1 通。テナントごとに引く。**テストの DB は他のテストと共有で、`run` は全テナントを回る**ので、
+//! 前日 (日本時間 0:00〜24:00) に血圧を測った全員の一覧を、テナントの管理者 (削除済みでない社員で role に manager か admin) のうち、
+//! 血圧の通知の設定 (`bp_notify_settings`。alc-migrations 186) で `daily_report` が true・email がある人へ 1 人 1 通。
+//! 既存の通知の宛先 (`notify_recipients`)・notify のグループは使わない。テナントごとに引く。**テストの DB は他のテストと共有で、`run` は全テナントを回る**ので、
 //! 件数は見ずに、このテストの宛先 (乱数のドメイン) に届いた分だけを見る。
 
 mod support;
@@ -9,7 +10,7 @@ mod support;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use measurements::report::{run, OPT_OUT_GROUP};
+use measurements::report::run;
 use support::*;
 use uuid::Uuid;
 
@@ -25,87 +26,48 @@ fn domain() -> String {
     format!("{}.example.test", Uuid::new_v4().simple())
 }
 
-async fn group(tenant: Uuid, name: &str) -> Uuid {
-    admin()
-        .await
-        .query_one(
-            "INSERT INTO alc_api.notify_groups (tenant_id, name) VALUES ($1, $2) RETURNING id",
-            &[&tenant, &name],
-        )
-        .await
-        .unwrap()
-        .get(0)
-}
-
-/// 宛先を 1 人作る (superuser で)。`role` の社員 (`deleted` なら削除済み) に結び付ける。`employee` が false なら結び付けない
-#[allow(clippy::too_many_arguments)]
+/// 管理者などの社員を 1 人作り (`role`。`deleted` なら削除済み)、`settings` なら血圧の通知の設定の行 (email と `daily_report`) も作る
+/// (superuser で)。`settings` が false なら設定の行は無い。社員の id を返す
 async fn recipient(
     tenant: Uuid,
     email: Option<&str>,
-    enabled: bool,
-    employee: bool,
+    daily_report: bool,
+    settings: bool,
     role: &[&str],
     deleted: bool,
 ) -> Uuid {
     let admin = admin().await;
     let role: Vec<String> = role.iter().map(|r| (*r).to_owned()).collect();
-    let emp_id: Option<Uuid> = if employee {
-        let id = Uuid::new_v4();
-        admin
-            .execute(
-                "INSERT INTO alc_api.employees (id, tenant_id, nfc_id, name, code, role, deleted_at) \
-                 VALUES ($1, $2, $3, '宛先の社員', $4, $5, CASE WHEN $6 THEN now() END)",
-                &[
-                    &id,
-                    &tenant,
-                    &id.to_string(),
-                    &id.simple().to_string()[..8].to_owned(),
-                    &role,
-                    &deleted,
-                ],
-            )
-            .await
-            .unwrap();
-        Some(id)
-    } else {
-        None
-    };
+    let id = Uuid::new_v4();
     admin
-        .query_one(
-            "INSERT INTO alc_api.notify_recipients \
-                 (tenant_id, name, provider, lineworks_user_id, email, enabled, employee_id) \
-             VALUES ($1, '受信者', 'lineworks', $2, $3, $4, $5) RETURNING id",
+        .execute(
+            "INSERT INTO alc_api.employees (id, tenant_id, nfc_id, name, code, role, deleted_at) \
+             VALUES ($1, $2, $3, '宛先の社員', $4, $5, CASE WHEN $6 THEN now() END)",
             &[
+                &id,
                 &tenant,
-                &Uuid::new_v4().to_string(),
-                &email,
-                &enabled,
-                &emp_id,
+                &id.to_string(),
+                &id.simple().to_string()[..8].to_owned(),
+                &role,
+                &deleted,
             ],
         )
         .await
-        .unwrap()
-        .get(0)
-}
-
-/// 受け取らないグループに入れる
-async fn opt_out(tenant: Uuid, recipient: Uuid, group_name: &str) {
-    let g = group(tenant, group_name).await;
-    join(g, recipient).await;
-}
-
-async fn join(g: Uuid, recipient: Uuid) {
-    admin()
-        .await
-        .execute(
-            "INSERT INTO alc_api.notify_recipient_groups (group_id, recipient_id) VALUES ($1, $2)",
-            &[&g, &recipient],
-        )
-        .await
         .unwrap();
+    if settings {
+        admin
+            .execute(
+                "INSERT INTO alc_api.bp_notify_settings (tenant_id, employee_id, email, daily_report) \
+                 VALUES ($1, $2, $3, $4)",
+                &[&tenant, &id, &email, &daily_report],
+            )
+            .await
+            .unwrap();
+    }
+    id
 }
 
-/// テナントと、`names` の管理者 (使える宛先・社員の role = admin)。外すグループはまだ無い
+/// テナントと、`names` の管理者 (社員の role = admin・設定の行で email あり・日報を受け取る)
 async fn setup(domain: &str, names: &[&str]) -> Uuid {
     let tenant = tenant().await;
     for n in names {
@@ -184,7 +146,7 @@ fn logs_sink() -> (measurements::LogSink, Arc<std::sync::Mutex<Vec<String>>>) {
 async fn test_sends_yesterdays_records_with_off_baseline_first() {
     let d = domain();
     let tenant = setup(&d, &["b", "a"]).await;
-    // 入らない人: 管理者でない・結び付きなし・email なし・disabled・削除済み・外した人
+    // 入らない人: 管理者でない・設定の行なし・email なし・日報を受け取らない・削除済み
     let off = |n: &str| Some(format!("{n}@{d}"));
     recipient(
         tenant,
@@ -215,16 +177,15 @@ async fn test_sends_yesterdays_records_with_off_baseline_first() {
         true,
     )
     .await;
-    let out = recipient(
+    recipient(
         tenant,
         off("optout").as_deref(),
-        true,
+        false,
         true,
         &["manager"],
         false,
     )
     .await;
-    opt_out(tenant, out, OPT_OUT_GROUP).await;
     // manager も入る (役割が複数でもよい)
     recipient(
         tenant,
@@ -335,7 +296,7 @@ async fn test_sends_yesterdays_records_with_off_baseline_first() {
 
     assert!(summary.sent >= 2, "{summary:?}");
     let sent = mine(&mailer, &d);
-    // 管理者 a・b と manager の mgr だけ。入らない人 (driver・結び付きなし・disabled・削除済み・外した人) には届かない
+    // 管理者 a・b と manager の mgr だけ。入らない人 (driver・設定の行なし・email なし・日報を受け取らない・削除済み) には届かない
     let mut to: Vec<_> = sent.iter().map(|m| m.to.clone()).collect();
     to.sort();
     assert_eq!(
@@ -415,7 +376,7 @@ async fn run_once(mailer: &Arc<MockMailer>) -> measurements::report::ReportSumma
 
 #[tokio::test]
 async fn test_admins_get_the_report_by_default() {
-    // 受け取らないグループを作っていなくても、管理者には届く (既定で送る)
+    // 設定の行を作った管理者には、日報を受け取る既定 (daily_report = true) で届く
     let d = domain();
     let tenant = setup(&d, &["a"]).await;
     day_record(tenant).await;
@@ -432,16 +393,15 @@ async fn test_admins_get_the_report_by_default() {
 async fn test_opting_out_removes_only_that_person() {
     let d = domain();
     let tenant = setup(&d, &["stays"]).await;
-    let out = recipient(
+    recipient(
         tenant,
         Some(&format!("out@{d}")),
-        true,
+        false,
         true,
         &["admin"],
         false,
     )
     .await;
-    opt_out(tenant, out, OPT_OUT_GROUP).await;
     day_record(tenant).await;
     let mailer = Arc::new(MockMailer::default());
 
@@ -453,73 +413,118 @@ async fn test_opting_out_removes_only_that_person() {
 }
 
 #[tokio::test]
-async fn test_the_old_opt_in_group_is_ignored() {
-    // 旧グループ「血圧の日報」のメンバーでも、管理者でなければ届かない。入っていても管理者の扱いは変わらない
+async fn test_an_admin_without_a_settings_row_gets_nothing() {
+    // 設定の行が無い管理者は email が無いので送らない (既存の通知の宛先に居ても、グループに入っていても使わない)
     let d = domain();
     let tenant = tenant().await;
-    let driver = recipient(
-        tenant,
-        Some(&format!("driver@{d}")),
-        true,
-        true,
-        &["driver"],
-        false,
-    )
-    .await;
-    let admin_r = recipient(
-        tenant,
-        Some(&format!("adm@{d}")),
-        true,
-        true,
-        &["admin"],
-        false,
-    )
-    .await;
-    let old = group(tenant, "血圧の日報").await;
-    join(old, driver).await;
-    join(old, admin_r).await;
+    let bare = recipient(tenant, None, true, false, &["admin"], false).await;
+    admin()
+        .await
+        .execute(
+            "INSERT INTO alc_api.notify_recipients \
+                 (tenant_id, name, provider, lineworks_user_id, email, enabled, employee_id) \
+             VALUES ($1, '受信者', 'lineworks', $2, $3, true, $4)",
+            &[
+                &tenant,
+                &Uuid::new_v4().to_string(),
+                &format!("bare@{d}"),
+                &bare,
+            ],
+        )
+        .await
+        .unwrap();
+    // 旧グループ「血圧の日報」・「血圧の日報を受け取らない」も、いまは何の意味も持たない
+    for name in ["血圧の日報", "血圧の日報を受け取らない"] {
+        let g: Uuid = admin()
+            .await
+            .query_one(
+                "INSERT INTO alc_api.notify_groups (tenant_id, name) VALUES ($1, $2) RETURNING id",
+                &[&tenant, &name],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        admin()
+            .await
+            .execute(
+                "INSERT INTO alc_api.notify_recipient_groups (group_id, recipient_id) \
+                 SELECT $1, id FROM alc_api.notify_recipients WHERE tenant_id = $2",
+                &[&g, &tenant],
+            )
+            .await
+            .unwrap();
+    }
     day_record(tenant).await;
     let mailer = Arc::new(MockMailer::default());
 
     run_once(&mailer).await;
 
-    let sent = mine(&mailer, &d);
-    assert_eq!(sent.len(), 1, "{sent:?}");
-    assert_eq!(sent[0].to, format!("adm@{d}"));
+    assert!(mine(&mailer, &d).is_empty());
 }
 
 #[tokio::test]
-async fn test_the_same_group_name_in_another_tenant_does_not_opt_out() {
-    // 別のテナントの同名のグループに同じ宛先がいても、このテナントの宛先は外れない
+async fn test_the_settings_email_is_used_not_the_notify_recipients_one() {
+    // 通知の宛先の email が別に在り「受け取らない」グループに入っていても、設定の email にだけ届く
     let d = domain();
-    let a = setup(&d, &["a"]).await;
-    let other = tenant().await;
-    let r = recipient(
-        other,
-        Some(&format!("o@{d}")),
+    let tenant = tenant().await;
+    let adm = recipient(
+        tenant,
+        Some(&format!("settings@{d}")),
         true,
         true,
         &["admin"],
         false,
     )
     .await;
-    opt_out(other, r, OPT_OUT_GROUP).await;
-    day_record(a).await;
+    let r: Uuid = admin()
+        .await
+        .query_one(
+            "INSERT INTO alc_api.notify_recipients \
+                 (tenant_id, name, provider, lineworks_user_id, email, enabled, employee_id) \
+             VALUES ($1, '受信者', 'lineworks', $2, $3, true, $4) RETURNING id",
+            &[
+                &tenant,
+                &Uuid::new_v4().to_string(),
+                &format!("recipient@{d}"),
+                &adm,
+            ],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let g: Uuid = admin()
+        .await
+        .query_one(
+            "INSERT INTO alc_api.notify_groups (tenant_id, name) VALUES ($1, '血圧の日報を受け取らない') RETURNING id",
+            &[&tenant],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    admin()
+        .await
+        .execute(
+            "INSERT INTO alc_api.notify_recipient_groups (group_id, recipient_id) VALUES ($1, $2)",
+            &[&g, &r],
+        )
+        .await
+        .unwrap();
+    day_record(tenant).await;
     let mailer = Arc::new(MockMailer::default());
 
     run_once(&mailer).await;
 
     let to: Vec<_> = mine(&mailer, &d).into_iter().map(|m| m.to).collect();
-    assert_eq!(to, [format!("a@{d}")]);
+    assert_eq!(to, [format!("settings@{d}")]);
 }
 
 #[tokio::test]
 async fn test_tenants_without_an_eligible_admin_get_nothing() {
     let d = domain();
-    // 宛先が無い・管理者でない・結び付きなし・email なし・disabled・削除済み・全員が外した。いずれも記録があっても送らない
+    // 宛先が無い・管理者でない・設定の行なし・email なし・日報を受け取らない・削除済み・全員が外した。いずれも記録があっても送らない
     let none = tenant().await;
     let mut tenants = vec![none];
-    for (email, enabled, employee, role, deleted) in [
+    for (email, daily_report, settings, role, deleted) in [
         (true, true, true, &["driver"][..], false),
         (true, true, false, &["admin"][..], false),
         (false, true, true, &["admin"][..], false),
@@ -528,20 +533,19 @@ async fn test_tenants_without_an_eligible_admin_get_nothing() {
     ] {
         let t = tenant().await;
         let email = email.then(|| format!("x@{d}"));
-        recipient(t, email.as_deref(), enabled, employee, role, deleted).await;
+        recipient(t, email.as_deref(), daily_report, settings, role, deleted).await;
         tenants.push(t);
     }
     let all_out = tenant().await;
-    let r = recipient(
+    recipient(
         all_out,
         Some(&format!("x@{d}")),
-        true,
+        false,
         true,
         &["manager"],
         false,
     )
     .await;
-    opt_out(all_out, r, OPT_OUT_GROUP).await;
     tenants.push(all_out);
     for t in &tenants {
         day_record(*t).await;
@@ -655,8 +659,8 @@ async fn test_one_tenants_lookup_failure_does_not_stop_the_others() {
     let su = admin().await;
     let policy = format!("report_fail_{}", failing.simple());
     su.batch_execute(&format!(
-        "CREATE POLICY {policy} ON alc_api.notify_recipients AS RESTRICTIVE FOR SELECT \
-         USING (CASE WHEN tenant_id = '{failing}'::uuid THEN 1 / (length(name) - length(name)) = 1 ELSE true END)"
+        "CREATE POLICY {policy} ON alc_api.bp_notify_settings AS RESTRICTIVE FOR SELECT \
+         USING (CASE WHEN tenant_id = '{failing}'::uuid THEN 1 / (length(email) - length(email)) = 1 ELSE true END)"
     ))
     .await
     .unwrap();
@@ -669,7 +673,7 @@ async fn test_one_tenants_lookup_failure_does_not_stop_the_others() {
         .unwrap();
 
     su.batch_execute(&format!(
-        "DROP POLICY {policy} ON alc_api.notify_recipients"
+        "DROP POLICY {policy} ON alc_api.bp_notify_settings"
     ))
     .await
     .unwrap();

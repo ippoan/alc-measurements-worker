@@ -4,7 +4,7 @@
 #   MEASUREMENTS_TEST_ADMIN_DATABASE_URL=... cargo llvm-cov --locked -p measurements --text > cov-measurements.txt
 #   bash scripts/check_coverage_100.sh --use-cache cov-measurements.txt
 #
-# 計測するのは `cargo test -p measurements` の全部 = 各 module の単体テスト (純粋関数) と tests/api_db.rs・files_db.rs・normal_tenko_db.rs・alert_db.rs・deferred_tenko_db.rs・bp_db.rs・report_db.rs
+# 計測するのは `cargo test -p measurements` の全部 = 各 module の単体テスト (純粋関数) と tests/api_db.rs・files_db.rs・normal_tenko_db.rs・alert_db.rs・deferred_tenko_db.rs・bp_db.rs・report_db.rs・bp_settings_db.rs
 # (口から実 DB まで。接続先が無ければ失敗する)。
 # worker 本体 (直下の src/、wasm 専用) は native で計測できないので対象外。
 
@@ -47,3 +47,7 @@ path = "crates/measurements/src/bp.rs"
 # 毎朝 7:00 の血圧の日報 (日本時間の前日の境・基準外を先頭・記録なし・宛先なし・送信の失敗・テナントごとの失敗)
 [[files]]
 path = "crates/measurements/src/report.rs"
+
+# 血圧の通知の設定の 4 口 (admin だけ・upsert の来ていない欄と null・一意違反の 409・氏名での結び付けの判定と確定の 1 transaction・メンバー一覧の失敗)
+[[files]]
+path = "crates/measurements/src/bp_settings.rs"

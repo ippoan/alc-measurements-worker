@@ -1,6 +1,6 @@
 //! 血圧の LINE WORKS 通知 (本人宛。Refs ippoan/alc-app#436)。血圧が初めて保存された `PUT /measurements/{id}` の後に、
-//! 測定した本人へ結果を LINE WORKS で送る。宛先は notify の既存の表 `notify_recipients` の、列 `employee_id`
-//! (社員との結び付け。alc-migrations 184) が測定の乗務員の行 (`enabled` かつ `lineworks_user_id` あり)。
+//! 測定した本人へ結果を LINE WORKS で送る。宛先は血圧の通知の設定の表 `bp_notify_settings` (alc-migrations 186。
+//! 設定の口は [`crate::bp_settings`]) の、測定の乗務員の行 (`notify_self` かつ `lineworks_user_id` あり)。既存の通知の宛先は使わない。
 //!
 //! # 送る条件
 //!
@@ -77,10 +77,10 @@ pub const BASELINE_COLUMNS: &str =
     "b.baseline_systolic, b.baseline_diastolic, b.systolic_tolerance, b.diastolic_tolerance";
 
 pub mod sql {
-    /// 本人の宛先 (LINE WORKS の user_id)。結び付いた宛先は社員ごとに 1 つ (alc-migrations 184 の一意索引)。
-    /// 使えない宛先 (`enabled` でない・user_id が NULL) は引かない
-    pub const RECIPIENTS: &str = "SELECT lineworks_user_id FROM notify_recipients \
-         WHERE tenant_id = $1 AND employee_id = $2 AND enabled AND lineworks_user_id IS NOT NULL \
+    /// 本人の宛先 (LINE WORKS の user_id)。血圧の通知の設定の表 `bp_notify_settings` (alc-migrations 186。1 社員 1 行) だけから引く。
+    /// 本人への通知を切った (`notify_self` が false)・user_id が無い社員は引かない。既存の通知の宛先 (`notify_recipients`) は使わない
+    pub const RECIPIENTS: &str = "SELECT lineworks_user_id FROM bp_notify_settings \
+         WHERE tenant_id = $1 AND employee_id = $2 AND notify_self AND lineworks_user_id IS NOT NULL \
          ORDER BY lineworks_user_id";
 
     /// 乗務員の基準値 (1 乗務員 1 行。無ければ 0 行)

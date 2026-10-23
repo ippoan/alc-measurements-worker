@@ -445,11 +445,13 @@ impl AlertMailer for MockMailer {
     }
 }
 
-/// alc-lineworks-worker の Service Binding の偽物。受けた要求を `requests` に残し、`status` (既定 204) を返す。
-/// `unreachable` なら届かない (fetch の失敗と同じ)
+/// alc-lineworks-worker の Service Binding の偽物。受けた POST を `requests`、GET を `gets` に残し、`status` (既定 204) を返す。
+/// GET の応答の本文は `body` (メンバー一覧の JSON)。`unreachable` なら届かない (fetch の失敗と同じ)
 pub struct MockService {
     pub requests: StdMutex<Vec<ServiceRequest>>,
+    pub gets: StdMutex<Vec<ServiceRequest>>,
     pub status: u16,
+    pub body: Vec<u8>,
     pub unreachable: bool,
 }
 
@@ -459,15 +461,41 @@ impl MockService {
     }
 
     pub fn with(status: u16, unreachable: bool) -> Arc<Self> {
+        Self::with_body(status, unreachable, b"")
+    }
+
+    /// GET のメンバー一覧が `body` (JSON) で、status が `status` の偽物
+    pub fn with_body(status: u16, unreachable: bool, body: &[u8]) -> Arc<Self> {
         Arc::new(MockService {
             requests: StdMutex::new(Vec::new()),
+            gets: StdMutex::new(Vec::new()),
             status,
+            body: body.to_vec(),
             unreachable,
         })
     }
 
+    /// メンバー一覧が `users` (`[{user_id, user_name, email}]`) の偽物
+    pub fn members(users: &Value) -> Arc<Self> {
+        Self::with_body(200, false, users.to_string().as_bytes())
+    }
+
     pub fn requests(&self) -> Vec<ServiceRequest> {
         self.requests.lock().unwrap().clone()
+    }
+
+    pub fn gets(&self) -> Vec<ServiceRequest> {
+        self.gets.lock().unwrap().clone()
+    }
+
+    fn answer(&self) -> Result<ServiceResponse, Unreachable> {
+        if self.unreachable {
+            return Err(Unreachable("fetch"));
+        }
+        Ok(ServiceResponse {
+            status: self.status,
+            body: self.body.clone(),
+        })
     }
 }
 
@@ -475,12 +503,14 @@ impl Service for MockService {
     fn post(&self, req: ServiceRequest) -> BoxFuture<'_, Result<ServiceResponse, Unreachable>> {
         Box::pin(async move {
             self.requests.lock().unwrap().push(req);
-            if self.unreachable {
-                return Err(Unreachable("fetch"));
-            }
-            Ok(ServiceResponse {
-                status: self.status,
-            })
+            self.answer()
+        })
+    }
+
+    fn get(&self, req: ServiceRequest) -> BoxFuture<'_, Result<ServiceResponse, Unreachable>> {
+        Box::pin(async move {
+            self.gets.lock().unwrap().push(req);
+            self.answer()
         })
     }
 }
