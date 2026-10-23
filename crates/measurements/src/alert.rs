@@ -133,14 +133,15 @@ pub fn compose_test() -> (String, String) {
 }
 
 /// グループの使える宛先の email を、渡された transaction の中で引く。(グループが在るか, email (昇順・重複なし))
-async fn recipient_emails(
+pub(crate) async fn recipient_emails(
     tx: &TenantTx<'_>,
     tenant_id: Uuid,
+    group: &str,
 ) -> Result<(bool, Vec<String>), tokio_postgres::Error> {
     let rows = tx
         .query_typed(
             RECIPIENTS,
-            &[(&ALERT_GROUP, Type::TEXT), (&tenant_id, Type::UUID)],
+            &[(&group, Type::TEXT), (&tenant_id, Type::UUID)],
         )
         .await?;
     let mut emails: Vec<String> = rows
@@ -163,7 +164,7 @@ pub async fn recipients(
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
             set_device_dev(tx, dev).await?;
-            recipient_emails(tx, tenant_id).await
+            recipient_emails(tx, tenant_id, ALERT_GROUP).await
         })
     })
     .await
@@ -179,7 +180,7 @@ async fn lookup(
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
             set_device_dev(tx, dev).await?;
-            let (group_exists, emails) = recipient_emails(tx, tenant_id).await?;
+            let (group_exists, emails) = recipient_emails(tx, tenant_id, ALERT_GROUP).await?;
             let name = tx
                 .query_typed_opt(
                     EMPLOYEE_NAME,
@@ -206,7 +207,12 @@ pub struct Outbox {
 
 impl Outbox {
     /// 宛先ごとに同じ件名・本文の 1 通
-    fn new(mailer: SharedMailer, emails: Vec<String>, subject: &str, body: &str) -> Self {
+    pub(crate) fn new(
+        mailer: SharedMailer,
+        emails: Vec<String>,
+        subject: &str,
+        body: &str,
+    ) -> Self {
         let mails = emails
             .into_iter()
             .map(|to| AlertMail {

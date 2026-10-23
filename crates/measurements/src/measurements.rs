@@ -25,6 +25,7 @@ use tokio_postgres::Error;
 use uuid::Uuid;
 
 use crate::alert::{self, should_alert, PendingAlert};
+use crate::bp::{self, should_notify, PendingBp};
 use crate::carins::normalize_carins_numbers;
 use crate::models::{
     CreateMeasurement, Measurement, MeasurementFilter, MeasurementsResponse, StartMeasurement,
@@ -110,10 +111,10 @@ pub mod sql {
         )
     }
 
-    /// 保存の前の値 (`FOR UPDATE`。同じ測定への PUT が並んでも、アルコール検知メールの条件を満たす保存は 1 つだけ)。
-    /// DB の列名は `alcohol_level` (API の欄 `alcohol_value` ではない)
-    pub const OLD_ALCOHOL_LEVEL: &str =
-        "SELECT alcohol_level FROM measurements WHERE id = $1 AND tenant_id = $2 FOR UPDATE";
+    /// 保存の前の値 (`FOR UPDATE`。同じ測定への PUT が並んでも、アルコール検知メール・血圧の通知の条件を満たす保存は 1 つだけ)。
+    /// DB の列名は `alcohol_level` (API の欄 `alcohol_value` ではない)。列は (アルコール値, 最高血圧)
+    pub const OLD_VALUES: &str = "SELECT alcohol_level, systolic FROM measurements \
+         WHERE id = $1 AND tenant_id = $2 FOR UPDATE";
 
     pub fn get() -> String {
         format!("SELECT {MEASUREMENT_COLUMNS} FROM measurements WHERE id = $1 AND tenant_id = $2")
@@ -239,6 +240,17 @@ pub async fn create(
     .await
 }
 
+/// 保存が起こす通知の条件 (どちらも更新後の行と旧値で決まる。送るかどうかはこのあと宛先を引いて決める)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Triggers {
+    /// アルコール検知メール ([`should_alert`])
+    pub alert: bool,
+    /// 血圧の本人への LINE WORKS ([`should_notify`])
+    pub bp: bool,
+}
+
+impl alc_worker_db::TxOutput for Triggers {}
+
 pub async fn update(
     pg: &mut PgClient,
     tenant_id: Uuid,
@@ -246,7 +258,7 @@ pub async fn update(
     id: Uuid,
     input: UpdateMeasurement,
     log: LogSink,
-) -> Result<Option<(UpdatedMeasurement, bool)>, Error> {
+) -> Result<Option<(UpdatedMeasurement, Triggers)>, Error> {
     let found = pg
         .tenant_tx(tenant_id, move |tx| {
             Box::pin(async move {
@@ -264,13 +276,15 @@ pub async fn update(
                         serde_json::to_value(&tenko).expect("NormalTenkoInput は JSON にできる")
                     });
                 // 旧値は UPDATE の前に読む (点呼の記録の区切りより前)。行が無ければ UPDATE も何も返さず Ok(None)
-                let old_level: Option<f64> = tx
+                let (old_level, old_systolic) = tx
                     .query_typed_opt(
-                        sql::OLD_ALCOHOL_LEVEL,
+                        sql::OLD_VALUES,
                         &[(&id, Type::UUID), (&tenant_id, Type::UUID)],
                     )
                     .await?
-                    .and_then(|r| r.get::<_, Option<f64>>(0));
+                    .map_or((None, None), |r| {
+                        (r.get::<_, Option<f64>>(0), r.get::<_, Option<i32>>(1))
+                    });
                 let row = tx
                     .query_typed_opt(
                         &sql::update(),
@@ -301,27 +315,30 @@ pub async fn update(
                 let m = Measurement::from_row(&row);
                 let tenko_pending: bool = row.get(MEASUREMENT_COLUMN_COUNT);
                 // 入力に値が無くても COALESCE で旧値が残るので、input ではなく UPDATE 後の m で見る
-                let alert = should_alert(old_level, m.alcohol_level);
+                let triggers = Triggers {
+                    alert: should_alert(old_level, m.alcohol_level),
+                    bp: should_notify(old_systolic, &m),
+                };
                 // 確定待ちの測定 (この保存で入れた、または前の保存で入れてまだ確定していない) は記録を作らない
                 // (確定の口か見回りが作る)
                 let marked = input.record_as_tenko && !tenko_pending;
                 let session_id = record_as_tenko_if_marked(tx, &m, marked, &tenko, &log).await;
-                Ok(Some((m, (session_id, tenko_pending), alert)))
+                Ok(Some((m, (session_id, tenko_pending), triggers)))
             })
         })
         .await?;
-    Ok(
-        found.map(|(measurement, (tenko_session_id, tenko_pending), alert)| {
+    Ok(found.map(
+        |(measurement, (tenko_session_id, tenko_pending), triggers)| {
             (
                 UpdatedMeasurement {
                     measurement,
                     tenko_session_id,
                     tenko_pending,
                 },
-                alert,
+                triggers,
             )
-        }),
-    )
+        },
+    ))
 }
 
 pub async fn get_one(
@@ -416,7 +433,14 @@ async fn update_measurement(
     Extension(dev): Extension<DeviceDevSlot>,
     Path(id): Path<Uuid>,
     Json(mut body): Json<UpdateMeasurement>,
-) -> Result<(Option<Extension<PendingAlert>>, Json<UpdatedMeasurement>), StatusCode> {
+) -> Result<
+    (
+        Option<Extension<PendingAlert>>,
+        Option<Extension<PendingBp>>,
+        Json<UpdatedMeasurement>,
+    ),
+    StatusCode,
+> {
     check_opt(&body.result_type, &VALID_RESULTS)?;
     check_opt(&body.status, &VALID_STATUSES)?;
     check_opt(&body.tenko_type, &VALID_TENKO_TYPES)?;
@@ -430,12 +454,13 @@ async fn update_measurement(
     let found = update(&mut pg, tenant_id, dev, id, body, state.log.clone())
         .await
         .map_err(|e| state.db_fail("measurement update", &e))?;
-    let (updated, alert) = found.ok_or(StatusCode::NOT_FOUND)?;
+    let (updated, triggers) = found.ok_or(StatusCode::NOT_FOUND)?;
     // 保存は commit 済み。宛先は lock を持ったまま引き、写真の読みと送信は応答の後 (Worker の wait_until)
-    let outbox = alert::prepare(&state, &mut pg, tenant_id, dev, alert, &updated.measurement).await;
-    let photo = updated.measurement.face_photo_url.as_deref();
-    let pending = PendingAlert::new(&state, tenant_id, outbox, photo);
-    Ok((pending.map(Extension), Json(updated)))
+    let m = &updated.measurement;
+    let outbox = alert::prepare(&state, &mut pg, tenant_id, dev, triggers.alert, m).await;
+    let pending = PendingAlert::new(&state, tenant_id, outbox, m.face_photo_url.as_deref());
+    let bp = bp::prepare(&state, &mut pg, tenant_id, dev, triggers.bp, m).await;
+    Ok((pending.map(Extension), bp.map(Extension), Json(updated)))
 }
 
 /// 測定作成 (完了済み) — オフラインキュー互換

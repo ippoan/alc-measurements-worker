@@ -65,4 +65,9 @@ mutate "staging の r2_buckets が本番の bucket alc-face-photos を指す" \
 mutate "staging 以外の env の r2_buckets が本番の bucket を指す" \
   's += "\n[env.other]\nname = \"x\"\nworkers_dev = false\npreview_urls = false\n\n[[env.other.r2_buckets]]\nbinding = \"MEASUREMENTS_R2\"\nbucket_name = \"alc-face-photos\"\n"'
 
+mutate "staging の ALC_LINEWORKS が本番の alc-lineworks を指す" \
+  's = s.replace("service = \"alc-lineworks-staging\"", "service = \"alc-lineworks\"", 1)'
+mutate "staging 以外の env の services が本番の alc-lineworks を指す" \
+  's += "\n[env.other]\nname = \"x\"\nworkers_dev = false\npreview_urls = false\n\n[[env.other.services]]\nbinding = \"ALC_LINEWORKS\"\nservice = \"alc-lineworks\"\n"'
+
 exit "$fail"

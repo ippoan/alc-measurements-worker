@@ -44,6 +44,16 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
 送り手は `send_email` の binding `ALERT_EMAIL` (**トップと staging の両方**・`destination_address` は書かない) と変数 `NOTIFY_EMAIL_FROM`。
 どちらかが無ければ送らない。
 
+## 血圧の通知 (`bp.rs`・`report.rs`・`service.rs`)
+- 本人への LINE WORKS: 完了の PUT で systolic が**初めて**入った保存 (旧 systolic が NULL。tx の中で `FOR UPDATE` の旧値と比べる) の後、
+  `notify_recipients` (`employee_id` = 測定の乗務員・`enabled`・`lineworks_user_id` あり。alc-migrations 184) へ。基準値は
+  `employee_health_baselines` (無ければ 120/80 ±10)、外れたら「基準から外れています」を足す。`bp::PendingBp` を応答の extension に入れ、
+  `src/lib.rs` が `ctx.wait_until` で送る (アルコール検知メールと同じ形)。dev 端末の要求・宛先なし・送信の失敗でも保存は成功。
+  送り先は alc-lineworks-worker の Service Binding `ALC_LINEWORKS` (本番 `alc-lineworks`・staging `alc-lineworks-staging`)。ログは固定の語と件数だけ。
+- 毎朝 7:00 (日本時間) の日報メール: 本番の cron `0 22 * * *` (`report::DAILY_CRON` と同じ文字列。staging の cron は見回りだけ)。
+  テナントを `tenants` から引き、notify グループ「血圧の日報」の使える宛先へ前日 (日本時間 0〜24 時) の一覧を 1 人 1 通。
+  テナントごとに失敗しても続ける。
+
 ## 規範
 - 公開範囲を弱めない: 本番・staging とも Service Binding だけ (どの env も `workers_dev`/`preview_urls` = false、route 無し)。
   Hyperdrive (`MEASUREMENTS_HYPERDRIVE`) は本番だけ。R2 `MEASUREMENTS_R2` は本番 `alc-face-photos`・staging `alc-face-photos-staging`
@@ -60,6 +70,6 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
   **`tenko.rs` の `status_for_result`・`record_payload`・`insert_record`・`TenkoSession` は rust (alc-tenko) と 2 か所に在る**
   (rust の自動点呼が同じものを使う)。片方を変えたらもう片方も変える (列・規則・record_hash の作り方)。
   serde_json に `preserve_order` を付けない (record_data の key の順 = hash が rust と変わる)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 17・api_db 9・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 28・api_db 9・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 8) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・Hyperdrive の設定の ID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-trouble-worker と同じ rev)。

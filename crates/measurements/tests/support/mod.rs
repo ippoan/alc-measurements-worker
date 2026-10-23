@@ -19,7 +19,9 @@ use axum::Router;
 use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
 use measurements::alert::{AlertMail, AlertMailer, MailError, PendingAlert, SharedMailer};
+use measurements::bp::PendingBp;
 use measurements::files::{FileStore, SharedStore, StoreError};
+use measurements::service::{Service, ServiceRequest, ServiceResponse, SharedService, Unreachable};
 use measurements::{router, AppState};
 use serde_json::Value;
 use tokio::sync::OnceCell;
@@ -367,6 +369,20 @@ pub fn build_mailer(pg: PgClient, mailer: Option<SharedMailer>) -> App {
 }
 
 pub fn build_full(pg: PgClient, files: Option<SharedStore>, mailer: Option<SharedMailer>) -> App {
+    build_all(pg, files, mailer, None)
+}
+
+/// LINE WORKS の送り先 (alc-lineworks-worker の Service Binding の偽物) も付ける
+pub fn build_lineworks(pg: PgClient, lineworks: Option<SharedService>) -> App {
+    build_all(pg, None, None, lineworks)
+}
+
+pub fn build_all(
+    pg: PgClient,
+    files: Option<SharedStore>,
+    mailer: Option<SharedMailer>,
+    lineworks: Option<SharedService>,
+) -> App {
     let logs = Arc::new(StdMutex::new(Vec::new()));
     let sink = logs.clone();
     let state = AppState {
@@ -374,6 +390,7 @@ pub fn build_full(pg: PgClient, files: Option<SharedStore>, mailer: Option<Share
         log: Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned())),
         files,
         mailer,
+        lineworks,
     };
     App {
         router: router().with_state(state),
@@ -424,6 +441,46 @@ impl AlertMailer for MockMailer {
             }
             self.sent.lock().unwrap().push(mail.clone());
             Ok(())
+        })
+    }
+}
+
+/// alc-lineworks-worker の Service Binding の偽物。受けた要求を `requests` に残し、`status` (既定 204) を返す。
+/// `unreachable` なら届かない (fetch の失敗と同じ)
+pub struct MockService {
+    pub requests: StdMutex<Vec<ServiceRequest>>,
+    pub status: u16,
+    pub unreachable: bool,
+}
+
+impl MockService {
+    pub fn ok() -> Arc<Self> {
+        Self::with(204, false)
+    }
+
+    pub fn with(status: u16, unreachable: bool) -> Arc<Self> {
+        Arc::new(MockService {
+            requests: StdMutex::new(Vec::new()),
+            status,
+            unreachable,
+        })
+    }
+
+    pub fn requests(&self) -> Vec<ServiceRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Service for MockService {
+    fn post(&self, req: ServiceRequest) -> BoxFuture<'_, Result<ServiceResponse, Unreachable>> {
+        Box::pin(async move {
+            self.requests.lock().unwrap().push(req);
+            if self.unreachable {
+                return Err(Unreachable("fetch"));
+            }
+            Ok(ServiceResponse {
+                status: self.status,
+            })
         })
     }
 }
@@ -505,6 +562,9 @@ pub async fn call_raw(
 ) -> Got {
     let mut resp = respond_raw(app, method, uri, tenant, headers, body).await;
     if let Some(pending) = resp.extensions_mut().remove::<PendingAlert>() {
+        pending.send().await;
+    }
+    if let Some(pending) = resp.extensions_mut().remove::<PendingBp>() {
         pending.send().await;
     }
     let status = resp.status().as_u16();
