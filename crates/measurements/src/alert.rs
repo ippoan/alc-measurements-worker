@@ -431,6 +431,7 @@ mod tests {
             medical_measured_at: None,
             face_verified: None,
             medical_manual_input: None,
+            device_id: None,
         };
         let (subject, body) = compose("山田\r\n太郎", &m);
         assert_eq!(subject, "アルコール検知: 山田  太郎");
