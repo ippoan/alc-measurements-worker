@@ -280,6 +280,7 @@ mod tests {
             medical_measured_at: Some(t),
             face_verified: None,
             medical_manual_input: None,
+            device_id: None,
         }
     }
 

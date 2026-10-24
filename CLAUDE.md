@@ -33,6 +33,10 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
   `{tenant}/{uuid}.jpg`・`{tenant}/blow-video/{uuid}.webm` の形に一致しなければ 500。rust は `{R2_PUBLIC_URL_BASE}/` を剥ぐが、
   その既定値に account ID が入り public repo に書けないため。**別 tenant の写真を指す URL は読めない (rust より厳しい)。**
 
+- rust に無い列 `measurements.device_id` (alc-migrations 190、TEXT NULL): 行を作る口 (`POST /start`・`POST`) だけが、リクエストヘッダー
+  `X-Device-Id` (auth-worker が検証済みの端末 token の sub から付ける。本文からは読まない) を入れる。無ければ NULL、1〜64 字の `[A-Za-z0-9:_-]`
+  でなければ NULL にして**測定は作る** (422 にしない。ログ 1 行。alc-vein-worker の `registered_device_id` と同じ規則。`measurements::device_id_from`)。`PUT` は触らない。応答の `device_id` に出る。
+
 ## アルコール検知メール (`alert.rs`・`src/mail.rs`)
 DB の列 `alcohol_level` が **旧が NULL か 0 以下 → 新が 0 より上** になった保存だけ、テナントの notify グループ「アルコール検知」
 (`notify_groups`・`notify_recipient_groups`・`notify_recipients` の既存の表。専用の表は作らない) の使える宛先 (`enabled`・email あり) へ
@@ -87,6 +91,6 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
   **`tenko.rs` の `status_for_result`・`record_payload`・`insert_record`・`TenkoSession` は rust (alc-tenko) と 2 か所に在る**
   (rust の自動点呼が同じものを使う)。片方を変えたらもう片方も変える (列・規則・record_hash の作り方)。
   serde_json に `preserve_order` を付けない (record_data の key の順 = hash が rust と変わる)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 35・api_db 9・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 17・bp_settings_db 18) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 35・api_db 10・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 17・bp_settings_db 18) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・Hyperdrive の設定の ID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-trouble-worker と同じ rev)。

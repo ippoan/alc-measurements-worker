@@ -34,6 +34,8 @@ pub struct Measurement {
     pub medical_measured_at: Option<DateTime<Utc>>,
     pub face_verified: Option<bool>,
     pub medical_manual_input: Option<bool>,
+    /// この行を作った端末の ID (auth-worker が端末の token から付けた `X-Device-Id`。無ければ NULL。alc-migrations 190)
+    pub device_id: Option<String>,
 }
 
 impl TxOutput for Measurement {}
@@ -42,10 +44,11 @@ impl TxOutput for Measurement {}
 /// 表には `is_dev` も在るが、rust の行型に無いので読まない (応答にも出ない)
 pub const MEASUREMENT_COLUMNS: &str = "id, tenant_id, employee_id, alcohol_level, result, device_use_count, \
      face_photo_url, video_url, measured_at, created_at, updated_at, status, \
-     temperature, systolic, diastolic, pulse, medical_measured_at, face_verified, medical_manual_input";
+     temperature, systolic, diastolic, pulse, medical_measured_at, face_verified, medical_manual_input, \
+     device_id";
 
 /// [`MEASUREMENT_COLUMNS`] の列の数 (= その後ろに足した列の位置)
-pub const MEASUREMENT_COLUMN_COUNT: usize = 19;
+pub const MEASUREMENT_COLUMN_COUNT: usize = 20;
 
 impl Measurement {
     /// [`MEASUREMENT_COLUMNS`] の順で並んだ行から読む
@@ -70,6 +73,7 @@ impl Measurement {
             medical_measured_at: r.get(16),
             face_verified: r.get(17),
             medical_manual_input: r.get(18),
+            device_id: r.get(19),
         }
     }
 }

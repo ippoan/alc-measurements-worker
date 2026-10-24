@@ -18,7 +18,7 @@
 use alc_core_wasm::{DeviceDevSlot, TenantId};
 use alc_worker_db::PgClient;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use tokio_postgres::types::{ToSql, Type};
@@ -64,8 +64,8 @@ pub mod sql {
 
     pub fn start() -> String {
         format!(
-            "INSERT INTO measurements (tenant_id, employee_id, status) \
-             VALUES ($1, $2, 'started') \
+            "INSERT INTO measurements (tenant_id, employee_id, status, device_id) \
+             VALUES ($1, $2, 'started', $3) \
              RETURNING {MEASUREMENT_COLUMNS}"
         )
     }
@@ -76,10 +76,10 @@ pub mod sql {
                  tenant_id, employee_id, alcohol_level, result, \
                  face_photo_url, measured_at, device_use_count, \
                  temperature, systolic, diastolic, pulse, medical_measured_at, \
-                 face_verified, medical_manual_input, video_url, status \
+                 face_verified, medical_manual_input, video_url, status, device_id \
              ) \
              VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()), COALESCE($7, 0), \
-                     $8, $9, $10, $11, $12, $13, $14, $15, 'completed') \
+                     $8, $9, $10, $11, $12, $13, $14, $15, 'completed', $16) \
              RETURNING {MEASUREMENT_COLUMNS}"
         )
     }
@@ -176,6 +176,7 @@ pub async fn start(
     tenant_id: Uuid,
     dev: bool,
     input: StartMeasurement,
+    device_id: Option<String>,
 ) -> Result<Measurement, Error> {
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
@@ -183,7 +184,11 @@ pub async fn start(
             let row = tx
                 .query_typed_one(
                     &sql::start(),
-                    &[(&tenant_id, Type::UUID), (&input.employee_id, Type::UUID)],
+                    &[
+                        (&tenant_id, Type::UUID),
+                        (&input.employee_id, Type::UUID),
+                        (&device_id, Type::TEXT),
+                    ],
                 )
                 .await?;
             Ok(Measurement::from_row(&row))
@@ -197,6 +202,7 @@ pub async fn create(
     tenant_id: Uuid,
     dev: bool,
     input: CreateMeasurement,
+    device_id: Option<String>,
     log: LogSink,
 ) -> Result<(Measurement, bool), Error> {
     pg.tenant_tx(tenant_id, move |tx| {
@@ -221,6 +227,7 @@ pub async fn create(
                         (&input.face_verified, Type::BOOL),
                         (&input.medical_manual_input, Type::BOOL),
                         (&input.video_url, Type::TEXT),
+                        (&device_id, Type::TEXT),
                     ],
                 )
                 .await?;
@@ -405,6 +412,26 @@ pub fn router() -> Router<AppState> {
         )
 }
 
+/// 端末の ID を載せるヘッダー。auth-worker が端末の token で来た要求にだけ付ける (検証済み token の sub。client の同名ヘッダーは届かない)
+const DEVICE_ID_HEADER: &str = "x-device-id";
+const MAX_DEVICE_ID_LEN: usize = 64;
+
+/// `X-Device-Id` を読む (本文からは読まない)。無い・1〜64 字の `[A-Za-z0-9:_-]` でない (alc-vein-worker の
+/// `registered_device_id` と同じ規則) なら `None` (= device_id は NULL)。**形が外れても測定は作る**
+/// (端末の ID は録画の切り出し用の付帯情報で、それで測定を失わない)。外れたときは値を出さずログ 1 行だけ
+pub fn device_id_from(headers: &HeaderMap, log: &LogSink) -> Option<String> {
+    let value = headers.get(DEVICE_ID_HEADER)?;
+    let valid = value.to_str().ok().filter(|s| {
+        (1..=MAX_DEVICE_ID_LEN).contains(&s.len())
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
+    });
+    if valid.is_none() {
+        log("measurements: X-Device-Id ignored: invalid shape");
+    }
+    valid.map(str::to_owned)
+}
+
 fn check(valid: bool) -> Result<(), StatusCode> {
     valid.then_some(()).ok_or(StatusCode::BAD_REQUEST)
 }
@@ -419,11 +446,13 @@ async fn start_measurement(
     State(state): State<AppState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
     Extension(dev): Extension<DeviceDevSlot>,
+    headers: HeaderMap,
     Json(body): Json<StartMeasurement>,
 ) -> Result<(StatusCode, Json<Measurement>), StatusCode> {
+    let device_id = device_id_from(&headers, &state.log);
     let dev = dev.get();
     let mut pg = state.pg.lock().await;
-    let m = start(&mut pg, tenant_id, dev, body)
+    let m = start(&mut pg, tenant_id, dev, body, device_id)
         .await
         .map_err(|e| state.db_fail("measurement start", &e))?;
     Ok((StatusCode::CREATED, Json(m)))
@@ -471,6 +500,7 @@ async fn create_measurement(
     State(state): State<AppState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
     Extension(dev): Extension<DeviceDevSlot>,
+    headers: HeaderMap,
     Json(mut body): Json<CreateMeasurement>,
 ) -> Result<
     (
@@ -480,6 +510,7 @@ async fn create_measurement(
     ),
     StatusCode,
 > {
+    let device_id = device_id_from(&headers, &state.log);
     check(VALID_RESULTS.contains(&body.result_type.as_str()))?;
     check_opt(&body.tenko_type, &VALID_TENKO_TYPES)?;
     normalize_carins_numbers(&mut body.carins_cert_no, &mut body.carins_vehicle_id)
@@ -487,7 +518,7 @@ async fn create_measurement(
 
     let dev = dev.get();
     let mut pg = state.pg.lock().await;
-    let (m, alert) = create(&mut pg, tenant_id, dev, body, state.log.clone())
+    let (m, alert) = create(&mut pg, tenant_id, dev, body, device_id, state.log.clone())
         .await
         .map_err(|e| state.db_fail("measurement create", &e))?;
     let outbox = alert::prepare(&state, &mut pg, tenant_id, dev, alert, &m).await;

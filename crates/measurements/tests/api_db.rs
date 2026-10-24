@@ -11,9 +11,10 @@ use support::*;
 use uuid::Uuid;
 
 /// rust の `Measurement` の JSON の key (応答の形。rust の mock テストの一覧と同じ)
-const MEASUREMENT_KEYS: [&str; 19] = [
+const MEASUREMENT_KEYS: [&str; 20] = [
     "alcohol_value",
     "created_at",
+    "device_id",
     "device_use_count",
     "diastolic",
     "employee_id",
@@ -790,4 +791,133 @@ async fn test_db_failure_is_500_with_fixed_log() {
         );
         assert!(!log.contains(&tenant.to_string()) && !log.contains(&id.to_string()));
     }
+}
+
+#[tokio::test]
+async fn test_device_id_header_goes_to_created_rows_only() {
+    // X-Device-Id は行を作る口 (start・POST) だけが読み、PUT は触らない。本文の device_id は読まない。
+    // 無ければ NULL、形が外れたら 422 invalid_device_id (行は作らない)
+    let app = app().await;
+    let tenant = tenant().await;
+    let emp = employee(tenant, "運行者", "DV1").await;
+    let json_ct = |id: &'static str| [("content-type", "application/json"), ("x-device-id", id)];
+
+    // start: ヘッダーの値が入り、応答にも出る (本文の device_id は無視)
+    let res = call_raw(
+        &app,
+        "POST",
+        "/api/measurements/start",
+        Some(tenant),
+        &json_ct("alarm:ab12_C-3"),
+        serde_json::to_vec(&json!({ "employee_id": emp, "device_id": "from-body" })).unwrap(),
+    )
+    .await;
+    assert_eq!(res.status, 201);
+    let started = res.json();
+    assert_eq!(started["device_id"], "alarm:ab12_C-3");
+    let id = started["id"].as_str().unwrap().to_string();
+
+    // PUT (別の端末のヘッダー付き) は device_id を変えない
+    let res = call_raw(
+        &app,
+        "PUT",
+        &format!("/api/measurements/{id}"),
+        Some(tenant),
+        &json_ct("other-device"),
+        serde_json::to_vec(&json!({ "status": "completed", "result_type": "pass" })).unwrap(),
+    )
+    .await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json()["device_id"], "alarm:ab12_C-3");
+    let got = call(
+        &app,
+        "GET",
+        &format!("/api/measurements/{id}"),
+        Some(tenant),
+        None,
+    )
+    .await;
+    assert_eq!(got.json()["device_id"], "alarm:ab12_C-3");
+
+    // POST: ヘッダーの値が入る。一覧にも出る
+    let mut body = measurement_body(emp, "pass", "2026-09-12T01:00:00Z", false, None);
+    body["device_id"] = json!("from-body");
+    let res = call_raw(
+        &app,
+        "POST",
+        "/api/measurements",
+        Some(tenant),
+        &json_ct("hub-1"),
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .await;
+    assert_eq!(res.status, 201);
+    assert_eq!(res.json()["device_id"], "hub-1");
+
+    // ヘッダー無し → NULL (start・POST とも)
+    let res = call(
+        &app,
+        "POST",
+        "/api/measurements/start",
+        Some(tenant),
+        Some(json!({ "employee_id": emp })),
+    )
+    .await;
+    assert_eq!(res.status, 201);
+    assert!(res.json()["device_id"].is_null());
+    let body = measurement_body(emp, "pass", "2026-09-12T02:00:00Z", false, None);
+    let res = call(&app, "POST", "/api/measurements", Some(tenant), Some(body)).await;
+    assert_eq!(res.status, 201);
+    assert!(res.json()["device_id"].is_null());
+    let list = call(&app, "GET", "/api/measurements", Some(tenant), None)
+        .await
+        .json();
+    let ids: Vec<&Value> = list["measurements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| &m["device_id"])
+        .collect();
+    assert_eq!(ids.iter().filter(|v| v.is_null()).count(), 2);
+    assert_eq!(
+        ids.iter().filter(|v| v.as_str() == Some("hub-1")).count(),
+        1
+    );
+
+    // 形が外れた値 (空・65 字・使えない文字・UTF-8 でない値) は device_id を NULL にして測定は作る (201)
+    let too_long = "a".repeat(65);
+    for bad in ["", too_long.as_str(), "a b", "a/b", "日本"] {
+        let res = call_raw(
+            &app,
+            "POST",
+            "/api/measurements/start",
+            Some(tenant),
+            &[("content-type", "application/json"), ("x-device-id", bad)],
+            serde_json::to_vec(&json!({ "employee_id": emp })).unwrap(),
+        )
+        .await;
+        assert_eq!(res.status, 201, "start {bad:?}");
+        assert!(res.json()["device_id"].is_null(), "start {bad:?}");
+        let body = measurement_body(emp, "pass", "2026-09-12T03:00:00Z", false, None);
+        let res = call_raw(
+            &app,
+            "POST",
+            "/api/measurements",
+            Some(tenant),
+            &[("content-type", "application/json"), ("x-device-id", bad)],
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .await;
+        assert_eq!(res.status, 201, "POST {bad:?}");
+        assert!(res.json()["device_id"].is_null(), "POST {bad:?}");
+    }
+    let logs = app.logs();
+    let ignored = logs
+        .iter()
+        .filter(|l| l.contains("X-Device-Id ignored"))
+        .count();
+    assert_eq!(ignored, 10, "外れた 10 回だけログ 1 行ずつ (値は出さない)");
+    assert!(logs
+        .iter()
+        .all(|l| !l.contains("a b") && !l.contains("日本")));
 }
