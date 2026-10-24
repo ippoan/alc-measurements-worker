@@ -884,26 +884,40 @@ async fn test_device_id_header_goes_to_created_rows_only() {
         1
     );
 
-    // 形が外れたら 422 (空・65 字・使えない文字・UTF-8 でない値)。どちらの口でも、行は作られない
+    // 形が外れた値 (空・65 字・使えない文字・UTF-8 でない値) は device_id を NULL にして測定は作る (201)
     let too_long = "a".repeat(65);
     for bad in ["", too_long.as_str(), "a b", "a/b", "日本"] {
-        for uri in ["/api/measurements/start", "/api/measurements"] {
-            let body = measurement_body(emp, "pass", "2026-09-12T03:00:00Z", false, None);
-            let res = call_raw(
-                &app,
-                "POST",
-                uri,
-                Some(tenant),
-                &[("content-type", "application/json"), ("x-device-id", bad)],
-                serde_json::to_vec(&body).unwrap(),
-            )
-            .await;
-            assert_eq!(res.status, 422, "{uri} {bad:?}");
-            assert_eq!(res.json(), json!({ "error": "invalid_device_id" }));
-        }
+        let res = call_raw(
+            &app,
+            "POST",
+            "/api/measurements/start",
+            Some(tenant),
+            &[("content-type", "application/json"), ("x-device-id", bad)],
+            serde_json::to_vec(&json!({ "employee_id": emp })).unwrap(),
+        )
+        .await;
+        assert_eq!(res.status, 201, "start {bad:?}");
+        assert!(res.json()["device_id"].is_null(), "start {bad:?}");
+        let body = measurement_body(emp, "pass", "2026-09-12T03:00:00Z", false, None);
+        let res = call_raw(
+            &app,
+            "POST",
+            "/api/measurements",
+            Some(tenant),
+            &[("content-type", "application/json"), ("x-device-id", bad)],
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .await;
+        assert_eq!(res.status, 201, "POST {bad:?}");
+        assert!(res.json()["device_id"].is_null(), "POST {bad:?}");
     }
-    let list = call(&app, "GET", "/api/measurements", Some(tenant), None)
-        .await
-        .json();
-    assert_eq!(list["total"], 4, "422 の要求は行を作らない");
+    let logs = app.logs();
+    let ignored = logs
+        .iter()
+        .filter(|l| l.contains("X-Device-Id ignored"))
+        .count();
+    assert_eq!(ignored, 10, "外れた 10 回だけログ 1 行ずつ (値は出さない)");
+    assert!(logs
+        .iter()
+        .all(|l| !l.contains("a b") && !l.contains("日本")));
 }

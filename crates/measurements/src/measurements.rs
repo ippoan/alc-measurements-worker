@@ -19,7 +19,6 @@ use alc_core_wasm::{DeviceDevSlot, TenantId};
 use alc_worker_db::PgClient;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use tokio_postgres::types::{ToSql, Type};
@@ -417,45 +416,20 @@ pub fn router() -> Router<AppState> {
 const DEVICE_ID_HEADER: &str = "x-device-id";
 const MAX_DEVICE_ID_LEN: usize = 64;
 
-/// 口の失敗 (status だけ、または本文つき)。`?` で [`StatusCode`] からそのまま変わる
-pub struct Rejection(Box<Response>);
-
-impl From<StatusCode> for Rejection {
-    fn from(status: StatusCode) -> Self {
-        Self(Box::new(status.into_response()))
+/// `X-Device-Id` を読む (本文からは読まない)。無い・1〜64 字の `[A-Za-z0-9:_-]` でない (alc-vein-worker の
+/// `registered_device_id` と同じ規則) なら `None` (= device_id は NULL)。**形が外れても測定は作る**
+/// (端末の ID は録画の切り出し用の付帯情報で、それで測定を失わない)。外れたときは値を出さずログ 1 行だけ
+pub fn device_id_from(headers: &HeaderMap, log: &LogSink) -> Option<String> {
+    let value = headers.get(DEVICE_ID_HEADER)?;
+    let valid = value.to_str().ok().filter(|s| {
+        (1..=MAX_DEVICE_ID_LEN).contains(&s.len())
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
+    });
+    if valid.is_none() {
+        log("measurements: X-Device-Id ignored: invalid shape");
     }
-}
-
-impl IntoResponse for Rejection {
-    fn into_response(self) -> Response {
-        *self.0
-    }
-}
-
-/// `X-Device-Id` を読む (本文からは読まない)。無ければ `None`。1〜64 文字の `[A-Za-z0-9:_-]` 以外は
-/// 422 `invalid_device_id` (alc-vein-worker の `registered_device_id` と同じ規則)
-pub fn device_id_from(headers: &HeaderMap) -> Result<Option<String>, Rejection> {
-    let Some(value) = headers.get(DEVICE_ID_HEADER) else {
-        return Ok(None);
-    };
-    value
-        .to_str()
-        .ok()
-        .filter(|s| {
-            (1..=MAX_DEVICE_ID_LEN).contains(&s.len())
-                && s.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
-        })
-        .map(|s| Some(s.to_owned()))
-        .ok_or_else(|| {
-            Rejection(Box::new(
-                (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(serde_json::json!({ "error": "invalid_device_id" })),
-                )
-                    .into_response(),
-            ))
-        })
+    valid.map(str::to_owned)
 }
 
 fn check(valid: bool) -> Result<(), StatusCode> {
@@ -474,8 +448,8 @@ async fn start_measurement(
     Extension(dev): Extension<DeviceDevSlot>,
     headers: HeaderMap,
     Json(body): Json<StartMeasurement>,
-) -> Result<(StatusCode, Json<Measurement>), Rejection> {
-    let device_id = device_id_from(&headers)?;
+) -> Result<(StatusCode, Json<Measurement>), StatusCode> {
+    let device_id = device_id_from(&headers, &state.log);
     let dev = dev.get();
     let mut pg = state.pg.lock().await;
     let m = start(&mut pg, tenant_id, dev, body, device_id)
@@ -534,9 +508,9 @@ async fn create_measurement(
         Option<Extension<PendingAlert>>,
         Json<Measurement>,
     ),
-    Rejection,
+    StatusCode,
 > {
-    let device_id = device_id_from(&headers)?;
+    let device_id = device_id_from(&headers, &state.log);
     check(VALID_RESULTS.contains(&body.result_type.as_str()))?;
     check_opt(&body.tenko_type, &VALID_TENKO_TYPES)?;
     normalize_carins_numbers(&mut body.carins_cert_no, &mut body.carins_vehicle_id)

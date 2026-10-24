@@ -35,7 +35,7 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 
 - rust に無い列 `measurements.device_id` (alc-migrations 190、TEXT NULL): 行を作る口 (`POST /start`・`POST`) だけが、リクエストヘッダー
   `X-Device-Id` (auth-worker が検証済みの端末 token の sub から付ける。本文からは読まない) を入れる。無ければ NULL、1〜64 字の `[A-Za-z0-9:_-]`
-  以外は 422 `invalid_device_id` (alc-vein-worker の `registered_device_id` と同じ規則。`measurements::device_id_from`)。`PUT` は触らない。応答の `device_id` に出る。
+  でなければ NULL にして**測定は作る** (422 にしない。ログ 1 行。alc-vein-worker の `registered_device_id` と同じ規則。`measurements::device_id_from`)。`PUT` は触らない。応答の `device_id` に出る。
 
 ## アルコール検知メール (`alert.rs`・`src/mail.rs`)
 DB の列 `alcohol_level` が **旧が NULL か 0 以下 → 新が 0 より上** になった保存だけ、テナントの notify グループ「アルコール検知」
