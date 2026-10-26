@@ -40,6 +40,14 @@ pub struct StoreError(pub &'static str);
 pub trait FileStore: Send + Sync {
     /// 無いキーも失敗 (rust の `storage.download` と同じく 500 にする)
     fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Vec<u8>, StoreError>>;
+
+    /// 置く ([`crate::upload`] の 3 口)
+    fn put<'a>(
+        &'a self,
+        key: &'a str,
+        bytes: Vec<u8>,
+        content_type: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 }
 
 pub type SharedStore = Arc<dyn FileStore>;

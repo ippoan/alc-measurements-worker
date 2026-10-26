@@ -51,3 +51,7 @@ path = "crates/measurements/src/report.rs"
 # 血圧の通知の設定の 4 口 (admin だけ・upsert の来ていない欄と null・一意違反の 409・氏名での結び付けの判定と確定の 1 transaction・メンバー一覧の失敗)
 [[files]]
 path = "crates/measurements/src/bp_settings.rs"
+
+# upload の 3 口 (R2 はモック。binding 無し・multipart・uuid・R2 の失敗)
+[[files]]
+path = "crates/measurements/src/upload.rs"
