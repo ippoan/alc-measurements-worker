@@ -10,7 +10,8 @@ publish = false
 # 出どころは直下の Cargo.toml の [workspace.dependencies] の 1 か所 (ここに git / path を書かない)
 alc-core-wasm = { workspace = true }
 alc-worker-db = { workspace = true }
-axum = { version = "0.8", default-features = false, features = ["json", "query"] }
+# multipart は upload の 3 口 (rust と同じ axum の Multipart。multer は pure Rust で wasm32 でもビルドできる)
+axum = { version = "0.8", default-features = false, features = ["json", "multipart", "query"] }
 # 行の時刻 (rust-alc-api と同じ chrono の JSON の形)。NaiveDate は車検期限 (carins_expires_on)
 chrono = { version = "0.4", default-features = false, features = ["serde", "alloc"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

@@ -19,8 +19,12 @@ rust-alc-api と同じ。
 
 | `/api/measurements/{id}/face-photo` | GET | R2 の顔写真 (`image/jpeg`、`Cache-Control: private, max-age=3600`)。測定が無い・URL が NULL は 404、キーを取り出せない・R2 の失敗は 500、R2 の binding が無ければ 503 |
 | `/api/measurements/{id}/video` | GET | R2 の動画 (`video/webm`)。上と同じ |
+| `/api/upload/face-photo` | POST | multipart の最初の 1 つを R2 の `{tenant}/{uuid}.jpg` に `image/jpeg` で置き、`{url, filename}` を返す。R2 の binding が無ければ 503、multipart が読めない・空は 400、R2 の失敗は 500 |
+| `/api/upload/blow-video` | POST | 同じく `{tenant}/blow-video/{uuid}.webm` に `video/webm` |
+| `/api/upload/report-audio` | POST | 同じく `{tenant}/report-audio/{uuid}.webm` に `audio/webm` |
 
 キーは保存した URL から要求の `tenant_id` で切り出す (`{tenant}/{uuid}.jpg`・`{tenant}/blow-video/{uuid}.webm`)。rust と違い、別 tenant の URL は読めない (500)。
+upload の口が返す `url` は **rust と違い** `r2://alc-media/{key}` (rust は account ID の入った `{R2_PUBLIC_URL_BASE}/{key}`。bucket は公開しておらず、どちらの URL も開いて読むことはない。読み手は上のキーの切り出しだけ)。
 
 **通常点呼の記録**: 保存の本文に `record_as_tenko: true` があり、保存の後の状態が `completed` なら、同じ transaction で
 点呼セッションと点呼記録を 1 組作る (rust と同じ)。結果 `fail` / `over` は中止 (中止理由「アルコール検知」)、`pass` / `normal` は完了、

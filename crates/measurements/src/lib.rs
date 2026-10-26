@@ -12,6 +12,8 @@
 //!   [`files::FileStore`] で差し替える)
 //! - [`deferred`] — 点呼の記録の確定を後回しにした測定の確定 (`POST /api/measurements/{id}/tenko` と、worker の定時実行の
 //!   見回り [`deferred::sweep`])。rust に無い
+//! - [`upload`] — 顔写真・吹きかけ動画・運行報告の音声を R2 に置く口 (`/api/upload/{face-photo,blow-video,report-audio}`)。
+//!   rust の `alc-misc` の upload.rs の写し (Refs ippoan/rust-alc-api#680)
 //! - [`bp_settings`] — 血圧の通知の設定 (`/api/bp-notify/...` の 4 口。admin だけ。本人への LINE WORKS と日報メールの宛先を
 //!   専用の表 `bp_notify_settings` で持つ)
 //! - [`alert`] — アルコール検知メール (測定のアルコール値が 0 より上になった保存で、notify のグループ「アルコール検知」の
@@ -34,6 +36,7 @@ pub mod models;
 pub mod report;
 pub mod service;
 pub mod tenko;
+pub mod upload;
 
 use std::sync::Arc;
 
@@ -101,6 +104,7 @@ pub fn router() -> Router<AppState> {
     // 後に足した route_layer が外側: slot を置く → tenant と dev の印を読む → 口
     let api = measurements::router()
         .merge(files::router())
+        .merge(upload::router())
         .merge(bp_settings::router())
         .route_layer(middleware::from_fn(require_tenant_header))
         .route_layer(middleware::from_fn(with_device_dev_slot));

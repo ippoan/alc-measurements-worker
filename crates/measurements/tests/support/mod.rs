@@ -316,11 +316,13 @@ impl App {
 }
 
 /// R2 のモック。`objects` に在るキーだけ返し、無いキーは失敗 (本物の R2 の「オブジェクト無し」と同じ)。
-/// 読まれたキーを `gets` に残す
+/// 読まれたキーを `gets` に、置いたものを `puts` (キー, Content-Type) に残す。`fail_put` で置くのを失敗させる
 #[derive(Default)]
 pub struct MockStore {
     pub objects: StdMutex<std::collections::HashMap<String, Vec<u8>>>,
     pub gets: StdMutex<Vec<String>>,
+    pub puts: StdMutex<Vec<(String, String)>>,
+    pub fail_put: std::sync::atomic::AtomicBool,
 }
 
 impl MockStore {
@@ -337,6 +339,10 @@ impl MockStore {
     pub fn gets(&self) -> Vec<String> {
         self.gets.lock().unwrap().clone()
     }
+
+    pub fn puts(&self) -> Vec<(String, String)> {
+        self.puts.lock().unwrap().clone()
+    }
 }
 
 impl FileStore for MockStore {
@@ -349,6 +355,25 @@ impl FileStore for MockStore {
                 .get(key)
                 .cloned()
                 .ok_or(StoreError("missing"))
+        })
+    }
+
+    fn put<'a>(
+        &'a self,
+        key: &'a str,
+        bytes: Vec<u8>,
+        content_type: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            if self.fail_put.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StoreError("put"));
+            }
+            self.puts
+                .lock()
+                .unwrap()
+                .push((key.to_owned(), content_type.to_owned()));
+            self.objects.lock().unwrap().insert(key.to_owned(), bytes);
+            Ok(())
         })
     }
 }

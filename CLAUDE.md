@@ -3,7 +3,8 @@
 測定の Worker `alc-measurements` (Refs ippoan/alc-app#436、ippoan/rust-alc-api#697)。rust-alc-api の `crates/alc-misc` の
 測定の口を移す先で、path・method・JSON の形・status は rust と同じ (運行者端末・管理画面がそのまま使う)。いまの口は
 `/api/measurements` の 5 本 (`crates/measurements/src/measurements.rs`): `POST /start`・`PUT /{id}`・`POST`・`GET`・`GET /{id}`、
-と顔写真・動画の 2 本 (`files.rs`): `GET /{id}/face-photo`・`GET /{id}/video` (R2 `MEASUREMENTS_R2` から読むだけ)。
+と顔写真・動画の 2 本 (`files.rs`): `GET /{id}/face-photo`・`GET /{id}/video` (R2 `MEASUREMENTS_R2` から読む)、
+upload の 3 本 (`upload.rs`): `POST /api/upload/{face-photo,blow-video,report-audio}` (R2 に置く。Refs ippoan/rust-alc-api#680)。
 印 `record_as_tenko` 付きの完了の保存は、同じ transaction で点呼セッションと点呼記録を作る (`tenko.rs`。電子車検証の照合は `carins.rs`)。
 直下 = Worker (wasm 専用)、`crates/measurements/` = 口・SQL。
 
@@ -32,6 +33,8 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - 顔写真・動画のキーは、保存した URL の中で `/{要求の tenant_id}/` が**最後に**現れる位置から後ろを取り (`files::extract_key`)、
   `{tenant}/{uuid}.jpg`・`{tenant}/blow-video/{uuid}.webm` の形に一致しなければ 500。rust は `{R2_PUBLIC_URL_BASE}/` を剥ぐが、
   その既定値に account ID が入り public repo に書けないため。**別 tenant の写真を指す URL は読めない (rust より厳しい)。**
+- upload の 3 口のキー・Content-Type は rust と同じ (`{tenant}/{uuid}.jpg`・`{tenant}/blow-video/{uuid}.webm`・`{tenant}/report-audio/{uuid}.webm`)。
+  返す `url` は rust と違い `r2://alc-media/{key}` (`upload::URL_PREFIX`。読み手は上の `extract_key` だけで接頭辞を見ない)。uuid は `gen_random_uuid()`。
 
 - rust に無い列 `measurements.device_id` (alc-migrations 190、TEXT NULL): 行を作る口 (`POST /start`・`POST`) だけが、リクエストヘッダー
   `X-Device-Id` (auth-worker が検証済みの端末 token の sub から付ける。本文からは読まない) を入れる。無ければ NULL、1〜64 字の `[A-Za-z0-9:_-]`
@@ -91,6 +94,6 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
   **`tenko.rs` の `status_for_result`・`record_payload`・`insert_record`・`TenkoSession` は rust (alc-tenko) と 2 か所に在る**
   (rust の自動点呼が同じものを使う)。片方を変えたらもう片方も変える (列・規則・record_hash の作り方)。
   serde_json に `preserve_order` を付けない (record_data の key の順 = hash が rust と変わる)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 35・api_db 10・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 17・bp_settings_db 18) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 37・api_db 10・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 17・bp_settings_db 18・upload_db 2) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・Hyperdrive の設定の ID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-trouble-worker と同じ rev)。
