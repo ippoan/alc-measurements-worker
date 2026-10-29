@@ -14,6 +14,8 @@ alc-worker-db = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["json", "multipart", "query"] }
 # 行の時刻 (rust-alc-api と同じ chrono の JSON の形)。NaiveDate は車検期限 (carins_expires_on)
 chrono = { version = "0.4", default-features = false, features = ["serde", "alloc"] }
+# 段の口の SQL を定数で組む (ippoan/alc-tenko-worker の sessions.rs から移したもの)
+const_format = "0.2"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 # 点呼記録の record_data。preserve_order を付けない (rust と同じく key の昇順で並ぶ = record_hash が同じになる)

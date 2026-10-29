@@ -12,7 +12,7 @@ rust-alc-api と同じ。
 | path | method | 内容 |
 |---|---|---|
 | `/api/measurements/start` | POST | `{"employee_id"}` だけで status = `started` の測定を作る (201) |
-| `/api/measurements/{id}` | PUT | 来た欄だけ変える (200)。結果・状態・点呼の種別・点呼方法・本人確認の方法・電子車検証の番号の検証は 400、無ければ 404。応答は測定の欄 + `tenko_session_id` |
+| `/api/measurements/{id}` | PUT | 来た欄だけ変える (200)。結果・状態・点呼の種別・点呼方法・本人確認の方法・電子車検証の番号の検証と、`record_as_tenko` と `tenko_session_id` の同時指定は 400、無ければ 404、`tenko_session_id` のセッションが合わなければ 409。応答は測定の欄 + `tenko_session_id` (+ `tenko_session`) |
 | `/api/measurements` | POST | 完了済みの測定を 1 件作る (201。オフラインの送り直し) |
 | `/api/measurements` | GET | 絞り込み (`employee_id`・`result_type`/`result`・`date_from`/`from`・`date_to`/`to`・`status`) と `measured_at` の新しい順のページ (`per_page` 既定 50・上限 100、`page` 既定 1・下限 1)。応答は `{measurements, total, page, per_page}` |
 | `/api/measurements/{id}` | GET | 1 件 (無ければ 404) |
@@ -33,13 +33,38 @@ upload の口が返す `url` は **rust と違い** `r2://alc-media/{key}` (rust
 PUT は点呼方法 (`通常点呼` / `IT点呼`) と本人確認の方法を受け、応答の `tenko_session_id` に作った (または既に在る) セッションの id を載せる。
 POST は点呼方法・本人確認の方法を受けない (通常点呼・記録なし)。
 
+## 点呼のセッション (`/api/tenko/sessions*`。Refs ippoan/rust-alc-api#680)
+
+点呼セッションと点呼記録を書く worker はこの worker だけ (ippoan/alc-tenko-worker の段の口から移した。規則は
+`crates/measurements/src/tenko/record.rs` の 1 か所)。path・method・JSON の形・status は alc-tenko-worker の時と同じ。
+
+| path | method | 内容 |
+|---|---|---|
+| `/api/tenko/sessions` | GET | 一覧 (`employee_id`・`status`・`tenko_type`・`tenko_method`・`judgment_pending`・`date_from`・`date_to`・`page`・`per_page`) |
+| `/api/tenko/sessions/{id}` | GET | 1 件 |
+| `/api/tenko/sessions/start` | POST | 開始 (201。予定ありは予定を消費して自動点呼、予定なしは遠隔点呼) |
+| `/api/tenko/sessions/{id}/{medical,self-declaration,daily-inspection,carrying-items,instruction-confirm,report,escalate-remote}` | PUT | 段 |
+| `/api/tenko/sessions/{id}/{cancel,interrupt,resume,self-resume}` | POST | 中止・中断・再開 (管理者)・自己再開 |
+| `/api/tenko/sessions/{id}/judgment` | POST | 運行管理者の判定 |
+| `/api/tenko/sessions/{id}/alcohol` | PUT | **旧い**アルコールの段 (本文の結果を信じる)。alc-app が下の測定の保存に移ったら消す |
+
+- **アルコールの段は測定の保存で進める**: 完了の `PUT /api/measurements/{id}` に `tenko_session_id` を付けると、同じ transaction で
+  本人確認済みのセッションを **測定の行の** 結果・アルコール値・顔写真・測定時刻から進める (検知なら中止で閉じて記録)。
+  セッションが無い・乗務員が違う・進められない status は 409 (測定も書かない)。この測定で既に進めたセッション (再送) は進め直さない。
+  進めるのに失敗しても測定の保存は残る
+- **遠隔点呼は判定待ち (`judgment_pending`)**: 乗務員の側の最後の段 (指示の確認・運行報告) で閉じず、運行管理者の判定で閉じて
+  (OK も NG も `completed`) 記録を書く (判定が記録の hash に入る)。記録の後の押し直しは 409 `already_recorded`。
+  判定待ちを足す前に閉じた記録の判定は今までどおり列だけ書く (押し直し可)
+- webhook (アルコール検知・運行報告・中断・日常点検 NG) は応答の後に ippoan/alc-tenko-worker の `POST /internal/webhooks/fire` へ
+  Service Binding `ALC_TENKO` で渡す (送信・署名・再送はあちら)。dev端末の要求は渡さない
+
 dev端末の要求 (`X-Device-Dev: 1`) の行は dev の行になり、dev の要求からだけ見える (rust と同じ。alc-migrations 153)。
 
 ## 構成
 
 - 直下 (`src/`) — Worker 本体 (wasm 専用)。DB への経路 (`src/db.rs`: staging = Workers VPC → PgBouncer、
   本番 = Hyperdrive `MEASUREMENTS_HYPERDRIVE`、ローカル = `DATABASE_URL`) と workers-rs への載せ方
-- `crates/measurements/` — 口と SQL (native でもビルドでき、`tests/api_db.rs`・`tests/normal_tenko_db.rs` が実 DB で通す)
+- `crates/measurements/` — 口と SQL (native でもビルドでき、`tests/*_db.rs` が実 DB で通す。点呼のセッションは `tests/tenko_flow_db.rs`)
 - `scripts/` — 公開範囲の検査 (`check-exposure.sh` と陰性対照)、migration の取得、coverage の gate
 
 デプロイ: PR → `wrangler deploy --dry-run`、main への merge → staging、タグ `v*` (Tag Release を手動) → 本番。

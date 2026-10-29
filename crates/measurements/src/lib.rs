@@ -4,8 +4,9 @@
 //! - [`measurements`] — `/api/measurements` の 5 口 (開始・更新・作成・一覧・取得)。rust の `alc-misc` の
 //!   measurements.rs と repo/measurements.rs の写し
 //! - [`models`] — 入出力の形 (rust の `alc_core::models` の Measurement 系の写し。serde の rename / alias も同じ)
-//! - [`tenko`] — 通常点呼の記録 (完了した測定から点呼セッションと点呼記録を作る副作用)。rust の `alc-tenko` の
-//!   normal_tenko.rs と、tenko_sessions.rs・repo/tenko_sessions.rs の共有部分の写し
+//! - [`tenko`] — 点呼の記録の入口 (Refs ippoan/rust-alc-api#680。点呼セッションと点呼記録を書く worker はここだけ):
+//!   通常点呼・IT点呼 (完了した測定から作る副作用)、自動点呼・遠隔点呼の段 (`/api/tenko/sessions*`。ippoan/alc-tenko-worker から
+//!   移した)、測定の保存で進めるアルコールの段、運行管理者の判定、webhook の渡し (ippoan/alc-tenko-worker の内部の口へ)
 //! - [`carins`] — 電子車検証の番号の検査と、車検期限の照合 (rust の `alc-core` の car_inspections の写し)
 //!
 //! - [`files`] — 顔写真・動画の口 (`/api/measurements/{id}/face-photo`・`/video`。R2 から読んで返す。置き場は
@@ -20,7 +21,8 @@
 //!   メンバーへ 1 人 1 通。送り手は [`alert::AlertMailer`] で差し替える)
 //!
 //! 全部の口が `X-Tenant-ID` を要る (auth-worker が付ける。無い・UUID でない → 401。`alc_core_wasm::require_tenant_header`)。
-//! rust と同じく role は見ない (例外は [`alert::alert_test`]・[`report::bp_report_test`] のテスト送信と血圧の通知の設定の口で、`X-User-Role` が admin でなければ 403)。dev端末の印 `X-Device-Dev` は rust と同じく接続の設定 `app.device_dev` に通す
+//! rust と同じく role は見ない (例外は [`alert::alert_test`]・[`report::bp_report_test`] のテスト送信と血圧の通知の設定の口で、`X-User-Role` が admin でなければ 403。
+//! 点呼の再開・判定は管理者ログインか運行管理者の鍵を見る ([`tenko::flow`]・[`tenko::judgment`]))。dev端末の印 `X-Device-Dev` は rust と同じく接続の設定 `app.device_dev` に通す
 //! (`require_tenant_header` が認証の後に書く `DeviceDevSlot` を口が読み、[`set_device_dev`] で立てる)。
 //! DB は `PgClient::tenant_tx` + `query_typed` 系だけ (名前付き prepared statement は使わない)。
 //! ログ・エラー応答は固定の語だけ (エラーの文・識別子・入力値を載せない。DB のエラーは `kind` = SQLSTATE か固定の label)。
@@ -64,6 +66,8 @@ pub struct AppState {
     pub mailer: Option<alert::SharedMailer>,
     /// LINE WORKS の送り先 (ippoan/alc-lineworks-worker の Service Binding `ALC_LINEWORKS`)。無ければ血圧の本人通知は送らない
     pub lineworks: Option<service::SharedService>,
+    /// 点呼の webhook の渡し先 (ippoan/alc-tenko-worker の Service Binding `ALC_TENKO`)。無ければ渡さない (ログ 1 行)
+    pub tenko: Option<service::SharedService>,
     /// 今の時刻 (血圧の日報のテスト送信が「前日」を決めるのに使う)
     pub now: NowFn,
 }
@@ -106,6 +110,7 @@ pub fn router() -> Router<AppState> {
         .merge(files::router())
         .merge(upload::router())
         .merge(bp_settings::router())
+        .merge(tenko::router())
         .route_layer(middleware::from_fn(require_tenant_header))
         .route_layer(middleware::from_fn(with_device_dev_slot));
     Router::new()

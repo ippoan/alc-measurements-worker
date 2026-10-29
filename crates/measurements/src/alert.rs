@@ -43,7 +43,7 @@ use uuid::Uuid;
 
 use crate::files::{read_media, Media, SharedStore};
 use crate::models::Measurement;
-use crate::tenko::sql::EMPLOYEE_NAME;
+use crate::tenko::record::sql::EMPLOYEE_NAME;
 use crate::{set_device_dev, AppState, LogSink};
 
 /// 宛先のグループの名前 (テナントごとに notify の画面で作る。`notify_groups` は (tenant_id, name) が UNIQUE)

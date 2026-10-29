@@ -4,7 +4,7 @@
 #   MEASUREMENTS_TEST_ADMIN_DATABASE_URL=... cargo llvm-cov --locked -p measurements --text > cov-measurements.txt
 #   bash scripts/check_coverage_100.sh --use-cache cov-measurements.txt
 #
-# 計測するのは `cargo test -p measurements` の全部 = 各 module の単体テスト (純粋関数) と tests/api_db.rs・files_db.rs・normal_tenko_db.rs・alert_db.rs・deferred_tenko_db.rs・bp_db.rs・report_db.rs・bp_settings_db.rs
+# 計測するのは `cargo test -p measurements` の全部 = 各 module の単体テスト (純粋関数) と tests/api_db.rs・files_db.rs・normal_tenko_db.rs・alert_db.rs・deferred_tenko_db.rs・bp_db.rs・report_db.rs・bp_settings_db.rs・tenko_flow_db.rs
 # (口から実 DB まで。接続先が無ければ失敗する)。
 # worker 本体 (直下の src/、wasm 専用) は native で計測できないので対象外。
 
@@ -24,9 +24,29 @@ path = "crates/measurements/src/files.rs"
 [[files]]
 path = "crates/measurements/src/models.rs"
 
-# 通常点呼の記録 (SAVEPOINT・冪等・既存の session の id・記録の失敗で測定を残す)
+# 点呼の記録の規則 (行の型・列の順・結果の閉じ方・hash・記録の INSERT・区切り)
 [[files]]
-path = "crates/measurements/src/tenko.rs"
+path = "crates/measurements/src/tenko/record.rs"
+
+# 通常点呼・IT点呼の記録 (SAVEPOINT・冪等・既存の session の id・記録の失敗で測定を残す)
+[[files]]
+path = "crates/measurements/src/tenko/normal.rs"
+
+# 自動点呼・遠隔点呼の段 (一覧・1 件・開始と各段・安全判定・中断と再開・遠隔点呼の判定待ち・DB の失敗)
+[[files]]
+path = "crates/measurements/src/tenko/flow.rs"
+
+# アルコールの段 (測定の保存で進める・再送・409・区切りの失敗で測定を残す・旧い段の口)
+[[files]]
+path = "crates/measurements/src/tenko/alcohol.rs"
+
+# 運行管理者の判定 (判定待ちを閉じて記録・記録の後の 409・判定待ちを足す前の記録・記録の失敗で戻す)
+[[files]]
+path = "crates/measurements/src/tenko/judgment.rs"
+
+# 点呼の webhook の渡し (dev・binding 無し・断る・届かない)
+[[files]]
+path = "crates/measurements/src/tenko/fire.rs"
 
 # 電子車検証の番号の検査と車検期限の照合
 [[files]]

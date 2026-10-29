@@ -29,6 +29,7 @@ use axum::http::{HeaderValue, Response, StatusCode};
 use futures_util::lock::Mutex;
 use measurements::alert::PendingAlert;
 use measurements::bp::PendingBp;
+use measurements::tenko::fire::PendingFire;
 use measurements::{router, AppState, LogSink};
 use tower_service::Service;
 use worker::{
@@ -47,6 +48,9 @@ const NOTIFY_EMAIL_FROM_VAR: &str = "NOTIFY_EMAIL_FROM";
 
 /// alc-lineworks-worker の Service Binding (wrangler.toml の `[[services]]`。血圧の本人への LINE WORKS)。無ければ送らない
 const ALC_LINEWORKS_BINDING: &str = "ALC_LINEWORKS";
+
+/// alc-tenko-worker の Service Binding (wrangler.toml の `[[services]]`。点呼の webhook の渡し先)。無ければ渡さない
+const ALC_TENKO_BINDING: &str = "ALC_TENKO";
 
 /// 送り手を作る。binding が無い・差出人が未設定なら `None`
 fn alert_mailer(env: &Env) -> Option<measurements::alert::SharedMailer> {
@@ -100,6 +104,10 @@ async fn fetch(req: HttpRequest, env: Env, ctx: Context) -> Result<Response<Body
             .service(ALC_LINEWORKS_BINDING)
             .ok()
             .map(|f| Arc::new(ServiceBinding::new(f)) as measurements::service::SharedService),
+        tenko: env
+            .service(ALC_TENKO_BINDING)
+            .ok()
+            .map(|f| Arc::new(ServiceBinding::new(f)) as measurements::service::SharedService),
         now: Arc::new(|| {
             measurements::report::from_millis(worker::Date::now().as_millis() as f64)
                 .unwrap_or_default()
@@ -119,6 +127,12 @@ async fn fetch(req: HttpRequest, env: Env, ctx: Context) -> Result<Response<Body
     if let Some(pending) = resp.extensions_mut().remove::<PendingBp>() {
         ctx.wait_until(async move {
             let _ = pending.send().await;
+        });
+    }
+    // 点呼の webhook も、応答を返した後に alc-tenko-worker へ渡す
+    if let Some(pending) = resp.extensions_mut().remove::<PendingFire>() {
+        ctx.wait_until(async move {
+            pending.send().await;
         });
     }
     // どの版が応えたかを応答ヘッダーで分かるようにする。binding が取れなければ何も付けない

@@ -20,7 +20,7 @@
 #   - env 配下 (env.staging を含む) の r2_buckets が本番の bucket (トップレベルの r2_buckets の bucket_name) を指さない
 #     (いまは R2 を持たない。顔写真・動画の口で足すときのための検査)
 #   - env 配下 (env.staging を含む) の services が本番の Worker (トップレベルの services の service) を指さない
-#     (ALC_LINEWORKS は本番が alc-lineworks、staging は alc-lineworks-staging)
+#     (ALC_LINEWORKS は本番が alc-lineworks、staging は alc-lineworks-staging。ALC_TENKO は alc-tenko と alc-tenko-staging)
 # 違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
 #
 #   bash scripts/check-exposure.sh [wrangler.toml]

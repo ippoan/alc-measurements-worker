@@ -33,7 +33,9 @@ use crate::models::{
     UpdateMeasurement, UpdatedMeasurement, MEASUREMENT_COLUMNS, MEASUREMENT_COLUMN_COUNT,
 };
 use crate::report;
-use crate::tenko::{record_as_tenko_if_marked, NormalTenkoInput};
+use crate::tenko::alcohol::{advance, lock_for_measurement};
+use crate::tenko::fire::{Event, PendingFire};
+use crate::tenko::{record_as_tenko_if_marked, NormalTenkoInput, TenkoSession};
 use crate::{set_device_dev, AppState, LogSink};
 
 /// 測定の結果 (`measurements_result_check` と同じ 5 つ)
@@ -114,8 +116,8 @@ pub mod sql {
     }
 
     /// 保存の前の値 (`FOR UPDATE`。同じ測定への PUT が並んでも、アルコール検知メール・血圧の通知の条件を満たす保存は 1 つだけ)。
-    /// DB の列名は `alcohol_level` (API の欄 `alcohol_value` ではない)。列は (アルコール値, 最高血圧)
-    pub const OLD_VALUES: &str = "SELECT alcohol_level, systolic FROM measurements \
+    /// DB の列名は `alcohol_level` (API の欄 `alcohol_value` ではない)。列は (アルコール値, 最高血圧, 乗務員)
+    pub const OLD_VALUES: &str = "SELECT alcohol_level, systolic, employee_id FROM measurements \
          WHERE id = $1 AND tenant_id = $2 FOR UPDATE";
 
     pub fn get() -> String {
@@ -260,6 +262,24 @@ pub struct Triggers {
 
 impl alc_worker_db::TxOutput for Triggers {}
 
+/// 測定の保存の結果
+pub enum Updated {
+    /// 測定が無い (404)
+    NotFound,
+    /// `tenko_session_id` のセッションが無い・乗務員が違う・進められない status (409。何も書いていない)
+    SessionMismatch,
+    /// 保存した。点呼の webhook (アルコール検知) があれば応答の後に渡す
+    Saved(Box<UpdatedMeasurement>, Triggers, Option<Event>),
+}
+
+/// transaction の中の結果 (測定・(点呼セッションの id, 確定待ち)・通知の条件・(進めたセッション, webhook))
+type Saved = (
+    Measurement,
+    (Option<Uuid>, bool),
+    Triggers,
+    Option<(TenkoSession, Option<Event>)>,
+);
+
 pub async fn update(
     pg: &mut PgClient,
     tenant_id: Uuid,
@@ -267,8 +287,10 @@ pub async fn update(
     id: Uuid,
     input: UpdateMeasurement,
     log: LogSink,
-) -> Result<Option<(UpdatedMeasurement, Triggers)>, Error> {
-    let found = pg
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Updated, Error> {
+    // 外側の None = セッションが合わない、内側の None = 測定が無い
+    let found: Option<Option<Saved>> = pg
         .tenant_tx(tenant_id, move |tx| {
             Box::pin(async move {
                 set_device_dev(tx, dev).await?;
@@ -285,15 +307,26 @@ pub async fn update(
                         serde_json::to_value(&tenko).expect("NormalTenkoInput は JSON にできる")
                     });
                 // 旧値は UPDATE の前に読む (点呼の記録の区切りより前)。行が無ければ UPDATE も何も返さず Ok(None)
-                let (old_level, old_systolic) = tx
+                let old = tx
                     .query_typed_opt(
                         sql::OLD_VALUES,
                         &[(&id, Type::UUID), (&tenant_id, Type::UUID)],
                     )
-                    .await?
-                    .map_or((None, None), |r| {
-                        (r.get::<_, Option<f64>>(0), r.get::<_, Option<i32>>(1))
-                    });
+                    .await?;
+                let (old_level, old_systolic) = old.as_ref().map_or((None, None), |r| {
+                    (r.get::<_, Option<f64>>(0), r.get::<_, Option<i32>>(1))
+                });
+                // アルコールの段を進めるセッションは測定の UPDATE の前に押さえる (合わなければ何も書かずに 409)。
+                // 測定が無ければ下の UPDATE が 0 行で 404
+                let session = match (input.tenko_session_id, &old) {
+                    (Some(sid), Some(r)) => {
+                        match lock_for_measurement(tx, tenant_id, sid, id, r.get(2)).await? {
+                            Some(cur) => Some(cur),
+                            None => return Ok(None),
+                        }
+                    }
+                    _ => None,
+                };
                 let row = tx
                     .query_typed_opt(
                         &sql::update(),
@@ -319,7 +352,7 @@ pub async fn update(
                     )
                     .await?;
                 let Some(row) = row else {
-                    return Ok(None);
+                    return Ok(Some(None));
                 };
                 let m = Measurement::from_row(&row);
                 let tenko_pending: bool = row.get(MEASUREMENT_COLUMN_COUNT);
@@ -332,21 +365,38 @@ pub async fn update(
                 // (確定の口か見回りが作る)
                 let marked = input.record_as_tenko && !tenko_pending;
                 let session_id = record_as_tenko_if_marked(tx, &m, marked, &tenko, &log).await;
-                Ok(Some((m, (session_id, tenko_pending), triggers)))
+                let advanced = match session {
+                    Some(cur) => Some(advance(tx, cur, &m, now, &log).await),
+                    None => None,
+                };
+                Ok(Some(Some((
+                    m,
+                    (session_id, tenko_pending),
+                    triggers,
+                    advanced,
+                ))))
             })
         })
         .await?;
-    Ok(found.map(
-        |(measurement, (tenko_session_id, tenko_pending), triggers)| {
-            (
-                UpdatedMeasurement {
-                    measurement,
-                    tenko_session_id,
-                    tenko_pending,
-                },
-                triggers,
-            )
-        },
+    let Some(found) = found else {
+        return Ok(Updated::SessionMismatch);
+    };
+    let Some((measurement, (session_id, tenko_pending), triggers, advanced)) = found else {
+        return Ok(Updated::NotFound);
+    };
+    let (tenko_session, event) = match advanced {
+        Some((s, event)) => (Some(s), event),
+        None => (None, None),
+    };
+    Ok(Updated::Saved(
+        Box::new(UpdatedMeasurement {
+            measurement,
+            tenko_session_id: tenko_session.as_ref().map(|s| s.id).or(session_id),
+            tenko_pending,
+            tenko_session,
+        }),
+        triggers,
+        event,
     ))
 }
 
@@ -469,6 +519,7 @@ async fn update_measurement(
     (
         Option<Extension<PendingAlert>>,
         Option<Extension<PendingBp>>,
+        Option<Extension<PendingFire>>,
         Json<UpdatedMeasurement>,
     ),
     StatusCode,
@@ -480,19 +531,32 @@ async fn update_measurement(
     check_opt(&body.identity_method, &VALID_IDENTITY_METHODS)?;
     normalize_carins_numbers(&mut body.carins_cert_no, &mut body.carins_vehicle_id)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
+    // 通常点呼の新しいセッションと、既存のセッションを進めるのは同時にできない
+    check(!(body.record_as_tenko && body.tenko_session_id.is_some()))?;
 
     let dev = dev.get();
+    let now = (state.now)();
     let mut pg = state.pg.lock().await;
-    let found = update(&mut pg, tenant_id, dev, id, body, state.log.clone())
+    let found = update(&mut pg, tenant_id, dev, id, body, state.log.clone(), now)
         .await
         .map_err(|e| state.db_fail("measurement update", &e))?;
-    let (updated, triggers) = found.ok_or(StatusCode::NOT_FOUND)?;
+    let (updated, triggers, event) = match found {
+        Updated::Saved(u, t, e) => (*u, t, e),
+        Updated::NotFound => return Err(StatusCode::NOT_FOUND),
+        Updated::SessionMismatch => return Err(StatusCode::CONFLICT),
+    };
+    let fire = PendingFire::new(&state, tenant_id, dev, event.into_iter().collect());
     // 保存は commit 済み。宛先は lock を持ったまま引き、写真の読みと送信は応答の後 (Worker の wait_until)
     let m = &updated.measurement;
     let outbox = alert::prepare(&state, &mut pg, tenant_id, dev, triggers.alert, m).await;
     let pending = PendingAlert::new(&state, tenant_id, outbox, m.face_photo_url.as_deref());
     let bp = bp::prepare(&state, &mut pg, tenant_id, dev, triggers.bp, m).await;
-    Ok((pending.map(Extension), bp.map(Extension), Json(updated)))
+    Ok((
+        pending.map(Extension),
+        bp.map(Extension),
+        fire.map(Extension),
+        Json(updated),
+    ))
 }
 
 /// 測定作成 (完了済み) — オフラインキュー互換
