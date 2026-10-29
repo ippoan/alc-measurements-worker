@@ -28,6 +28,19 @@ pub const TENKO_TYPE_NORMAL: &str = "normal";
 /// 測定の保存 (PUT) が `IT点呼` を指定してきたときだけ、そちらで記録する (Refs ippoan/alc-app#387)
 pub const TENKO_METHOD_NORMAL: &str = "通常点呼";
 
+/// 運行管理者の判定で閉じる点呼方法。完了する結果でも判定待ち (`judgment_pending`) で作り、記録は判定で書く
+/// ([`super::judgment`]。判定が記録の hash に入る。Refs ippoan/rust-alc-api#680)。検知 (中止) は判定を待たずに閉じる
+pub const TENKO_METHOD_IT: &str = "IT点呼";
+
+/// 結果で決まった status を、点呼方法で読み替える (IT点呼の完了は判定待ち)
+pub fn session_status<'a>(closed: &'a str, tenko_method: &str) -> &'a str {
+    if closed == "completed" && tenko_method == TENKO_METHOD_IT {
+        super::flow::JUDGMENT_PENDING
+    } else {
+        closed
+    }
+}
+
 /// 測定の保存に付いてくる、通常点呼の記録だけに使う値 (値の検査は handler で済ませてある)。
 /// rust の `NormalTenkoInput` (tenant_tx の閉包に持ち込むので owned)。
 ///
@@ -73,7 +86,7 @@ pub mod sql {
                  $10, $11, $12, $13, $14, \
                  $15, \
                  NULL, $16, \
-                 $17, NOW(), $18, \
+                 $17, CASE WHEN $4 = 'judgment_pending' THEN NULL ELSE NOW() END, $18, \
                  $19, $20, $21, $22, \
                  $23 \
              ) \
@@ -138,6 +151,7 @@ async fn carins_expiry(
 /// 完了した通常点呼の測定から、点呼セッションと点呼記録を 1 組作る (rust の `normal_tenko::record`)。
 ///
 /// * 結果が `error` / 無し → `Ok(None)` (測定だけ残す。エラーにしない)
+/// * IT点呼の完了は判定待ち (`judgment_pending`。`completed_at` は NULL) で作り、記録は書かない (判定で書く)
 /// * `tenko_type` が `None` → `normal`
 /// * 既に記録済み (同じ測定、または同じ乗務員・同じ測定時刻) → `Ok(None)`
 ///   — migration 141 の部分 unique に `ON CONFLICT DO NOTHING` で任せる (先勝ち。2 回目の `identity_method` も書かない)
@@ -153,6 +167,7 @@ pub async fn record(
     };
     let tenko_type = input.tenko_type.as_deref().unwrap_or(TENKO_TYPE_NORMAL);
     let tenko_method = input.tenko_method.as_deref().unwrap_or(TENKO_METHOD_NORMAL);
+    let status = session_status(status, tenko_method);
     let cert_no = input.carins_cert_no.as_deref();
     let vehicle_id = input.carins_vehicle_id.as_deref();
     let (carins_expires_on, carins_matched_by) =
@@ -194,7 +209,9 @@ pub async fn record(
         return Ok(None);
     };
 
-    write_record(tx, &session).await?;
+    if session.status != super::flow::JUDGMENT_PENDING {
+        write_record(tx, &session).await?;
+    }
     Ok(Some(session))
 }
 
@@ -266,4 +283,16 @@ pub async fn record_as_tenko_if_marked(
             ));
             None
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn it_tenko_waits_for_the_judgment() {
+        assert_eq!(session_status("completed", "IT点呼"), "judgment_pending");
+        assert_eq!(session_status("cancelled", "IT点呼"), "cancelled");
+        assert_eq!(session_status("completed", "通常点呼"), "completed");
+    }
 }

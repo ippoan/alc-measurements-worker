@@ -40,6 +40,14 @@ async fn call_with(
     call_raw(app, method, uri, tenant, &h, bytes).await
 }
 
+/// 測定を 1 件作り、完了の保存 (`tenko_session_id` 付き) でアルコールの段を進める。応答の `tenko_session` を返す
+async fn measure(app: &App, t: Uuid, emp: Uuid, session: &str, result: &str) -> Value {
+    let m = support::start_measurement(app, t, emp).await;
+    let mut body = support::completed_body(result, "2026-10-22T21:59:00Z", false, None, None);
+    body["tenko_session_id"] = json!(session);
+    support::put_measurement_ok(app, t, &m, &body).await["tenko_session"].clone()
+}
+
 /// ログが固定の頭で始まり、識別子・名前・番号を含まないこと
 fn assert_logs_clean(app: &App, secrets: &[String]) {
     for line in app.logs() {
@@ -308,15 +316,8 @@ async fn pre_operation_auto_flow_writes_record() {
         json!([{ "item_id": item, "item_name": "免許証", "checked": true }])
     );
 
-    let alc = send(
-        &app,
-        "PUT",
-        &uri("alcohol"),
-        t,
-        Some(json!({ "alcohol_result": "pass", "alcohol_value": 0.0 })),
-    )
-    .await;
-    assert_eq!(alc.json()["status"], "instruction_pending");
+    let alc = measure(&app, t, emp, &id, "normal").await;
+    assert_eq!(alc["status"], "instruction_pending");
     assert!(records(id.parse().unwrap()).await.is_empty());
 
     let done = send(&app, "PUT", &uri("instruction-confirm"), t, None).await;
@@ -338,7 +339,7 @@ async fn pre_operation_auto_flow_writes_record() {
     assert!(events(&app).is_empty());
 }
 
-/// 業務後の遠隔点呼 (予定なし): アルコール → 運行報告 (指示が無ければ完了して記録)。報告は webhook を積む。
+/// 業務後の遠隔点呼 (予定なし): アルコール → 運行報告 (指示が無ければ判定待ち)。報告は webhook を積む。
 /// 予定の指示があれば指示の確認へ進み、記録はまだ書かない
 #[tokio::test]
 async fn post_operation_report_and_webhook() {
@@ -385,15 +386,7 @@ async fn post_operation_report_and_webhook() {
         400
     );
     assert_eq!(
-        send(
-            &app,
-            "PUT",
-            &uri("alcohol"),
-            t,
-            Some(json!({ "alcohol_result": "normal", "alcohol_value": 0.0 }))
-        )
-        .await
-        .json()["status"],
+        measure(&app, t, emp, &id, "normal").await["status"],
         "report_pending"
     );
 
@@ -497,151 +490,6 @@ async fn post_operation_report_and_webhook() {
     );
 }
 
-/// アルコール検知は中止して記録を書き、webhook を積む。dev端末の要求では積まない (dev の行は本番から見えない)
-#[tokio::test]
-async fn alcohol_detected_cancels_and_dev_does_not_queue() {
-    let app = app().await;
-    let t = tenant().await;
-    let emp = employee(t, "点呼 三郎").await;
-    let id = sess(
-        t,
-        emp,
-        "pre_operation",
-        "自動点呼",
-        "identity_verified",
-        &[("responsible_manager_name", "'管理 太郎'")],
-    )
-    .await;
-    let uri = format!("/api/tenko/sessions/{id}/alcohol");
-    assert_eq!(
-        send(
-            &app,
-            "PUT",
-            &uri,
-            t,
-            Some(json!({ "alcohol_result": "bogus", "alcohol_value": 0.1 }))
-        )
-        .await
-        .status,
-        400
-    );
-    let s = send(&app, "PUT", &uri, t, Some(json!({ "alcohol_result": "fail", "alcohol_value": 0.25, "alcohol_face_photo_url": "https://p.example.invalid/f.jpg" }))).await.json();
-    assert_eq!(
-        (
-            s["status"].clone(),
-            s["cancel_reason"].clone(),
-            s["completed_at"].clone()
-        ),
-        (
-            json!("cancelled"),
-            json!("アルコール検知"),
-            json!("2026-10-22T22:00:00Z")
-        )
-    );
-    assert_eq!(records(id).await.len(), 1);
-    let ev = events(&app);
-    assert_eq!(ev[0].0, "alcohol_detected");
-    assert_eq!(ev[0].1["data"]["employee_name"], "点呼 三郎");
-    assert_eq!(ev[0].1["data"]["alcohol_value"], 0.25);
-    assert_eq!(ev[0].1["data"]["responsible_manager_name"], "管理 太郎");
-    // 状態が違う・無い
-    assert_eq!(
-        send(
-            &app,
-            "PUT",
-            &uri,
-            t,
-            Some(json!({ "alcohol_result": "pass", "alcohol_value": 0.0 }))
-        )
-        .await
-        .status,
-        400
-    );
-    let none = format!("/api/tenko/sessions/{}/alcohol", Uuid::new_v4());
-    assert_eq!(
-        send(
-            &app,
-            "PUT",
-            &none,
-            t,
-            Some(json!({ "alcohol_result": "pass", "alcohol_value": 0.0 }))
-        )
-        .await
-        .status,
-        404
-    );
-    // 通常点呼 (種類が業務前・業務後でない) の結果は rust と同じく 500
-    let normal = sess(t, emp, "normal", "通常点呼", "identity_verified", &[]).await;
-    assert_eq!(
-        send(
-            &app,
-            "PUT",
-            &format!("/api/tenko/sessions/{normal}/alcohol"),
-            t,
-            Some(json!({ "alcohol_result": "pass", "alcohol_value": 0.0 }))
-        )
-        .await
-        .status,
-        500
-    );
-
-    // dev端末: 行は dev の軸に入り、webhook は積まない。本番の要求からは見えない
-    let dev = [("X-Device-Dev", "1")];
-    let started = send_h(
-        &app,
-        "POST",
-        "/api/tenko/sessions/start",
-        t,
-        &dev,
-        Some(json!({ "employee_id": emp, "tenko_type": "post_operation" })),
-    )
-    .await
-    .json();
-    let did = started["id"].as_str().unwrap().to_owned();
-    let alc = send_h(
-        &app,
-        "PUT",
-        &format!("/api/tenko/sessions/{did}/alcohol"),
-        t,
-        &dev,
-        Some(json!({ "alcohol_result": "over", "alcohol_value": 0.3 })),
-    )
-    .await
-    .json();
-    assert_eq!(alc["status"], "cancelled");
-    assert!(events(&app).is_empty());
-    let is_dev: bool = admin()
-        .await
-        .query_one(
-            "SELECT is_dev FROM alc_api.tenko_sessions WHERE id = $1",
-            &[&did.parse::<Uuid>().unwrap()],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    assert!(is_dev);
-    assert_eq!(
-        send(&app, "GET", &format!("/api/tenko/sessions/{did}"), t, None)
-            .await
-            .status,
-        404
-    );
-    assert_eq!(
-        send_h(
-            &app,
-            "GET",
-            &format!("/api/tenko/sessions/{did}"),
-            t,
-            &dev,
-            None
-        )
-        .await
-        .status,
-        200
-    );
-}
-
-/// 安全判定の失敗 (基準値の外・自己申告) は中断して記録と webhook。管理者の再開・手動の中断・中止の検査
 #[tokio::test]
 async fn safety_judgment_interrupt_resume_and_cancel() {
     let app = app().await;
@@ -1678,12 +1526,6 @@ async fn db_failures_are_500() {
         ),
         (
             "PUT",
-            s("alcohol"),
-            Some(json!({ "alcohol_result": "pass", "alcohol_value": 0.0 })),
-            "session alcohol",
-        ),
-        (
-            "PUT",
             s("escalate-remote"),
             Some(json!({ "reason": "x" })),
             "session escalate",
@@ -1939,6 +1781,14 @@ async fn judgment_closes_pending_and_writes_record() {
         (json!("completed"), json!("it"))
     );
     assert_eq!(records(it).await[0].1, "IT点呼");
+    // 1 件: 閉じたセッションは判定付きで読める。無い id なら 404
+    let one = send(&app, "GET", &format!("/api/tenko/sessions/{it}"), t, None).await;
+    assert_eq!(
+        (one.status, one.json()["manager_judgment"].clone()),
+        (200, json!("ok"))
+    );
+    let gone = format!("/api/tenko/sessions/{}", Uuid::new_v4());
+    assert_eq!(send(&app, "GET", &gone, t, None).await.status, 404);
 
     // 自動点呼は判定を待たない: 業務後の運行報告 (予定の指示なし) で完了して記録を書く
     let auto = sess(t, emp, "post_operation", "自動点呼", "report_pending", &[]).await;

@@ -36,7 +36,7 @@ path = "crates/measurements/src/tenko/normal.rs"
 [[files]]
 path = "crates/measurements/src/tenko/flow.rs"
 
-# アルコールの段 (測定の保存で進める・再送・409・区切りの失敗で測定を残す・旧い段の口)
+# アルコールの段 (測定の保存で進める・再送・409・区切りの失敗で測定を残す)
 [[files]]
 path = "crates/measurements/src/tenko/alcohol.rs"
 

@@ -313,7 +313,8 @@ async fn test_confirm_it_tenko_records_method() {
     assert_eq!(res.json()["tenko_method"], "IT点呼");
     let (sessions, records) = type_and_method(tenant, &id).await;
     assert_eq!(sessions, vec![("pre_operation".into(), "IT点呼".into())]);
-    assert_eq!(records, vec![("pre_operation".into(), "IT点呼".into())]);
+    // IT点呼 は判定待ちで作り、記録は運行管理者の判定で書く
+    assert!(records.is_empty());
 
     let again = confirm(&app, tenant, &id, "IT点呼").await;
     assert_eq!(
@@ -405,7 +406,14 @@ async fn test_confirm_dev_measurement_records_dev_rows() {
     let emp = employee(tenant, "運行者", "DF7").await;
     let (id, _) =
         deferred_measurement(&app, tenant, emp, "normal", "2026-10-20T06:00:00Z", true).await;
-    let res = confirm_as(&app, tenant, &id, true, json!({ "tenko_method": "IT点呼" })).await;
+    let res = confirm_as(
+        &app,
+        tenant,
+        &id,
+        true,
+        json!({ "tenko_method": "通常点呼" }),
+    )
+    .await;
     assert_eq!(res.status, 200);
     assert_eq!(dev_flags(tenant, &id).await, vec![(true, true)]);
 }

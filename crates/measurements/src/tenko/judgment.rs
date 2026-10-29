@@ -25,11 +25,10 @@ use tokio_postgres::types::Type;
 use uuid::Uuid;
 
 use super::flow::{fetch, one, run, Arg, Flow, JUDGMENT_PENDING};
+use super::normal::TENKO_METHOD_IT;
 use super::record::{write_record, TenkoSession, SESSION_COLUMNS};
 use crate::AppState;
 
-/// 点呼方法 `IT点呼`
-pub const TENKO_METHOD_IT: &str = "IT点呼";
 /// 確認の方法: 通話で確認 (IT点呼 の判定)
 pub const JUDGMENT_METHOD_IT: &str = "it";
 /// 確認の方法: 本人が来て対面で確認した

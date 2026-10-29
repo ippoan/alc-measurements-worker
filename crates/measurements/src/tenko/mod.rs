@@ -5,8 +5,8 @@
 //! - [`normal`] — 通常点呼・IT点呼 (完了した測定から、同じ transaction でセッションと記録を 1 組作る)
 //! - [`flow`] — 自動点呼・遠隔点呼の段 (`/tenko/sessions*`: 一覧・1 件・開始・医療・自己申告と安全判定・日常点検・携行品・
 //!   指示の確認・運行報告・遠隔点呼への切り替え・中止・中断・再開・自己再開)
-//! - [`alcohol`] — アルコールの段。測定の保存 (`PUT /measurements/{id}` の `tenko_session_id`) で、**測定の行の値から**進める。
-//!   旧い段の口 `PUT /tenko/sessions/{id}/alcohol` (クライアントの本文を信じる) は alc-app が移るまでのつなぎで、後で消す
+//! - [`alcohol`] — アルコールの段。測定の保存 (`PUT /measurements/{id}` の `tenko_session_id`) で、**測定の行の値から**進める
+//!   (アルコールの結果を本文で受ける段の口は無い)
 //! - [`judgment`] — 運行管理者の判定 (`POST /tenko/sessions/{id}/judgment`)。判定待ち (`judgment_pending`) を閉じて記録を書く
 //! - [`fire`] — 点呼の節目の webhook を、応答の後に ippoan/alc-tenko-worker の内部の口へ渡す (送信はあちらの 1 か所)
 
@@ -28,7 +28,5 @@ use crate::AppState;
 
 /// 点呼のセッションの口 (`/tenko/sessions*`)
 pub fn router() -> Router<AppState> {
-    flow::router()
-        .merge(alcohol::router())
-        .merge(judgment::router())
+    flow::router().merge(judgment::router())
 }

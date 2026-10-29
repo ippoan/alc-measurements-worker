@@ -96,12 +96,12 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
   通常点呼・IT点呼 = `tenko/normal.rs`、自動点呼・遠隔点呼の段 = `tenko/flow.rs`、アルコールの段 = `tenko/alcohol.rs`、判定 = `tenko/judgment.rs`。
   record_data・record_hash の作り方を変えない。serde_json に `preserve_order` を付けない (record_data の key の順 = hash が変わる)。
 - 点呼の記録は内側の区切り (`SAVEPOINT`。名前は定数) で作り、失敗しても測定の保存・段の更新は残す。例外は判定: 記録が書けなければ判定ごと 500。
-- アルコールの段は測定の保存 (`PUT /measurements/{id}` の `tenko_session_id`) で**測定の行の値から**進める。旧い段の口 `PUT …/alcohol`
-  (本文の結果を信じる) は alc-app のキオスクが移るまでのつなぎ。移ったら消し、auth-worker の振り分けからも外す。
-- 遠隔点呼は最後の段で `judgment_pending` (alc-migrations 195) にし、記録は判定で書く。IT点呼 (測定の確定の口) はまだ `completed` で作る
-  (auth-worker の振り分けが移るまで、判定は alc-tenko-worker の旧い口に届くため)。振り分けの後に `judgment_pending` へ切り替える。
+- アルコールの段は測定の保存 (`PUT /measurements/{id}` の `tenko_session_id`) で**測定の行の値から**進める。アルコールの結果を本文で受ける
+  段の口 (`PUT …/alcohol`) は消した (足し直さない)。
+- 遠隔点呼 (最後の段) と IT点呼 (測定の保存・確定の口) は、完了する結果でも `judgment_pending` (alc-migrations 195) で作り、記録は判定で書く。
+  検知 (中止) は判定を待たずに閉じて記録する。
 - 点呼の webhook は送らない: `PendingFire` を応答の extension に入れ、`src/lib.rs` が `wait_until` で alc-tenko-worker の
   `/internal/webhooks/fire` へ渡す (Service Binding `ALC_TENKO`。本番 `alc-tenko`・staging `alc-tenko-staging`)。dev の要求は渡さない。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 43・api_db 10・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 17・bp_settings_db 18・upload_db 2・tenko_flow_db 15) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 44・api_db 10・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 17・bp_settings_db 18・upload_db 2・tenko_flow_db 14) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・Hyperdrive の設定の ID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-trouble-worker と同じ rev)。
