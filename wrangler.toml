@@ -63,6 +63,13 @@ NOTIFY_EMAIL_FROM = "alc-alert@ippoan.org"
 binding = "ALC_LINEWORKS"
 service = "alc-lineworks"
 
+# 点呼の webhook (Refs ippoan/rust-alc-api#680): 点呼の段 (アルコール検知・運行報告・中断・日常点検 NG) が閉じた後に、
+# ippoan/alc-tenko-worker の POST /internal/webhooks/fire を Service Binding で呼んで渡す (crates/measurements/src/tenko/fire.rs。
+# 送信・署名・再送はあちら)。binding は env に継承されないので、staging は下で staging の Worker を指す
+[[services]]
+binding = "ALC_TENKO"
+service = "alc-tenko"
+
 # 本番の定時実行 (Refs ippoan/alc-app#436、src/lib.rs の scheduled)。
 #   * 1 分ごと: 点呼の確定を後回しにしたまま 2 分を過ぎた測定を `通常点呼` で確定する見回り
 #     (crates/measurements/src/deferred.rs)
@@ -107,6 +114,10 @@ bucket_name = "alc-face-photos-staging"
 [[env.staging.services]]
 binding = "ALC_LINEWORKS"
 service = "alc-lineworks-staging"
+
+[[env.staging.services]]
+binding = "ALC_TENKO"
+service = "alc-tenko-staging"
 
 # アルコール検知メール。トップレベルと同じ binding と差出人 (destination_address は書かない)
 [[env.staging.send_email]]

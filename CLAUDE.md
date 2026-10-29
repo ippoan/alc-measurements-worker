@@ -5,7 +5,8 @@
 `/api/measurements` の 5 本 (`crates/measurements/src/measurements.rs`): `POST /start`・`PUT /{id}`・`POST`・`GET`・`GET /{id}`、
 と顔写真・動画の 2 本 (`files.rs`): `GET /{id}/face-photo`・`GET /{id}/video` (R2 `MEASUREMENTS_R2` から読む)、
 upload の 3 本 (`upload.rs`): `POST /api/upload/{face-photo,blow-video,report-audio}` (R2 に置く。Refs ippoan/rust-alc-api#680)。
-印 `record_as_tenko` 付きの完了の保存は、同じ transaction で点呼セッションと点呼記録を作る (`tenko.rs`。電子車検証の照合は `carins.rs`)。
+印 `record_as_tenko` 付きの完了の保存は、同じ transaction で点呼セッションと点呼記録を作る (`tenko/normal.rs`。電子車検証の照合は `carins.rs`)。
+点呼のセッションの口 `/api/tenko/sessions*` (自動点呼・遠隔点呼の段・判定。`tenko/`) もここ (ippoan/alc-tenko-worker から移した。Refs ippoan/rust-alc-api#680)。
 直下 = Worker (wasm 専用)、`crates/measurements/` = 口・SQL。
 
 **呼び手は auth-worker の Service Binding だけ** (auth-worker が JWT を検証し `X-Tenant-ID` を付け直す。この Worker は
@@ -84,16 +85,23 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
   (staging が本番 bucket を指さない。R2 の await は tenant_tx の中に入れない)。`wrangler.toml` の表の順を変えない (新しい表は `[build]` より後)。
 - **ログ・エラー応答は固定の語だけ。** エラーの文 (`{e}`)・tenant_id などの識別子・入力値 (車検証の番号など) を出さない。
   DB の失敗は `measurements: <段> failed: db (<kind>)` (kind は SQLSTATE か固定の label)。応答の本文は rust と同じく空。
-- role は見ない (rust も `X-Tenant-ID` だけ。例外はテスト送信の 2 口 (alert-test・bp-report-test) と血圧の通知の設定の 4 口)。dev端末の印 `X-Device-Dev: 1` は rust と同じく `app.device_dev` に通す
+- role は見ない (rust も `X-Tenant-ID` だけ。例外はテスト送信の 2 口 (alert-test・bp-report-test) と血圧の通知の設定の 4 口、点呼の再開・判定)。dev端末の印 `X-Device-Dev: 1` は rust と同じく `app.device_dev` に通す
   (`set_device_dev`。tenant_tx の最初の文。列 `is_dev` の既定値と RLS が dev の行を分ける。alc-migrations 153)。
   印は kit の `require_tenant_header` が書く `DeviceDevSlot` から読む (ヘッダを口で読み直さない)。
   **dev 端末の印を tenant_tx の中で立てている。kit に口ができたら置き換える。**
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。名前付き prepared statement 禁止。Row を tx の外へ出さない。
   WHERE に tenant_id も明示する。列は `SELECT *` にせず、行型の欄の順に並べる (`MEASUREMENT_COLUMNS`・`SESSION_COLUMNS`。位置で読む)。
-- 点呼の記録は内側の区切り (`SAVEPOINT`。名前は `tenko.rs` の定数) で作り、失敗しても測定の保存は残す。
-  **`tenko.rs` の `status_for_result`・`record_payload`・`insert_record`・`TenkoSession` は rust (alc-tenko) と 2 か所に在る**
-  (rust の自動点呼が同じものを使う)。片方を変えたらもう片方も変える (列・規則・record_hash の作り方)。
-  serde_json に `preserve_order` を付けない (record_data の key の順 = hash が rust と変わる)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 37・api_db 10・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 17・bp_settings_db 18・upload_db 2) はテストを足したら上げる。
+- **点呼セッション・点呼記録を書く worker はここだけ** (Refs ippoan/rust-alc-api#680。`/api/tenko/sessions*` は ippoan/alc-tenko-worker から移した)。
+  規則 (`TenkoSession`・`SESSION_COLUMNS`・`status_for_result`・`record_payload`・`write_record`・`in_savepoint`) は `tenko/record.rs` の 1 か所。
+  通常点呼・IT点呼 = `tenko/normal.rs`、自動点呼・遠隔点呼の段 = `tenko/flow.rs`、アルコールの段 = `tenko/alcohol.rs`、判定 = `tenko/judgment.rs`。
+  record_data・record_hash の作り方を変えない。serde_json に `preserve_order` を付けない (record_data の key の順 = hash が変わる)。
+- 点呼の記録は内側の区切り (`SAVEPOINT`。名前は定数) で作り、失敗しても測定の保存・段の更新は残す。例外は判定: 記録が書けなければ判定ごと 500。
+- アルコールの段は測定の保存 (`PUT /measurements/{id}` の `tenko_session_id`) で**測定の行の値から**進める。旧い段の口 `PUT …/alcohol`
+  (本文の結果を信じる) は alc-app のキオスクが移るまでのつなぎ。移ったら消し、auth-worker の振り分けからも外す。
+- 遠隔点呼は最後の段で `judgment_pending` (alc-migrations 195) にし、記録は判定で書く。IT点呼 (測定の確定の口) はまだ `completed` で作る
+  (auth-worker の振り分けが移るまで、判定は alc-tenko-worker の旧い口に届くため)。振り分けの後に `judgment_pending` へ切り替える。
+- 点呼の webhook は送らない: `PendingFire` を応答の extension に入れ、`src/lib.rs` が `wait_until` で alc-tenko-worker の
+  `/internal/webhooks/fire` へ渡す (Service Binding `ALC_TENKO`。本番 `alc-tenko`・staging `alc-tenko-staging`)。dev の要求は渡さない。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 43・api_db 10・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 17・bp_settings_db 18・upload_db 2・tenko_flow_db 15) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・Hyperdrive の設定の ID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-trouble-worker と同じ rev)。

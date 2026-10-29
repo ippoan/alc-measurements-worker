@@ -153,6 +153,11 @@ pub struct UpdateMeasurement {
     /// 確定は `POST /measurements/{id}/tenko` か、見回り (2 分後に `通常点呼`)。rust には無い (Refs ippoan/alc-app#436)
     #[serde(default)]
     pub defer_tenko: Option<bool>,
+    /// 自動点呼・遠隔点呼の本人確認済みのセッション。status が completed の保存で、**この測定の行の**結果からアルコールの段を
+    /// 進める ([`crate::tenko::alcohol`])。`record_as_tenko` と一緒には付けられない (400)。セッションが無い・乗務員が違う・
+    /// 進められない status なら保存ごと 409 (Refs ippoan/rust-alc-api#680)
+    #[serde(default)]
+    pub tenko_session_id: Option<Uuid>,
     #[serde(alias = "alcohol_level")]
     pub alcohol_value: Option<f64>,
     #[serde(alias = "result")]
@@ -183,6 +188,9 @@ pub struct UpdatedMeasurement {
     /// (確定を後回しにしない保存の応答は今までと同じ形。Refs ippoan/alc-app#436)
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub tenko_pending: bool,
+    /// `tenko_session_id` を付けた保存の、進めた後 (進めなかったら今) のセッション。付けない保存の応答には欄ごと出さない
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenko_session: Option<crate::tenko::TenkoSession>,
 }
 
 /// `GET /api/measurements` の query (rust の `MeasurementFilter`)

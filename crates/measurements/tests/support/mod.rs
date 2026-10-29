@@ -22,6 +22,7 @@ use measurements::alert::{AlertMail, AlertMailer, MailError, PendingAlert, Share
 use measurements::bp::PendingBp;
 use measurements::files::{FileStore, SharedStore, StoreError};
 use measurements::service::{Service, ServiceRequest, ServiceResponse, SharedService, Unreachable};
+use measurements::tenko::fire::PendingFire;
 use measurements::{router, AppState};
 use serde_json::Value;
 use tokio::sync::OnceCell;
@@ -143,6 +144,7 @@ async fn migrate(su: &Client) {
         "_runtime_role.sql",
         "_tenko_sessions_identity_method.sql",
         "_measurements_tenko_pending.sql",
+        "_tenko_sessions_judgment_pending.sql",
     ] {
         assert!(
             files
@@ -307,6 +309,8 @@ pub async fn car_inspection(
 pub struct App {
     pub router: Router,
     pub logs: Arc<StdMutex<Vec<String>>>,
+    /// 点呼の webhook の渡し先の偽物 ([`build_tenko`] だけ)
+    pub tenko: Option<Arc<MockService>>,
 }
 
 impl App {
@@ -408,6 +412,23 @@ pub fn build_all(
     mailer: Option<SharedMailer>,
     lineworks: Option<SharedService>,
 ) -> App {
+    build_every(pg, files, mailer, lineworks, None)
+}
+
+/// 点呼の webhook の渡し先 (alc-tenko-worker の Service Binding の偽物) も付ける
+pub fn build_tenko(pg: PgClient, tenko: Arc<MockService>) -> App {
+    let mut app = build_every(pg, None, None, None, Some(tenko.clone()));
+    app.tenko = Some(tenko);
+    app
+}
+
+pub fn build_every(
+    pg: PgClient,
+    files: Option<SharedStore>,
+    mailer: Option<SharedMailer>,
+    lineworks: Option<SharedService>,
+    tenko: Option<SharedService>,
+) -> App {
     let logs = Arc::new(StdMutex::new(Vec::new()));
     let sink = logs.clone();
     let state = AppState {
@@ -416,11 +437,13 @@ pub fn build_all(
         files,
         mailer,
         lineworks,
+        tenko,
         now: Arc::new(|| "2026-10-22T22:00:00Z".parse().unwrap()),
     };
     App {
         router: router().with_state(state),
         logs,
+        tenko: None,
     }
 }
 
@@ -621,6 +644,9 @@ pub async fn call_raw(
         pending.send().await;
     }
     if let Some(pending) = resp.extensions_mut().remove::<PendingBp>() {
+        pending.send().await;
+    }
+    if let Some(pending) = resp.extensions_mut().remove::<PendingFire>() {
         pending.send().await;
     }
     let status = resp.status().as_u16();

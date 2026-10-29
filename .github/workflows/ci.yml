@@ -61,10 +61,10 @@ jobs:
       # テストの準備が流す SQL を ippoan/alc-migrations から取る (版は scripts/ALC_MIGRATIONS_REV)
       - run: bash scripts/fetch-migrations.sh
       - uses: taiki-e/install-action@cargo-llvm-cov
-      # 単体テスト (純粋関数) と tests/api_db.rs・files_db.rs・normal_tenko_db.rs・alert_db.rs・deferred_tenko_db.rs・bp_db.rs・report_db.rs・bp_settings_db.rs (口から実 DB まで) を計測つきで 1 回だけ走らせる。
+      # 単体テスト (純粋関数) と tests/api_db.rs・files_db.rs・normal_tenko_db.rs・alert_db.rs・deferred_tenko_db.rs・bp_db.rs・report_db.rs・bp_settings_db.rs・tenko_flow_db.rs (口から実 DB まで) を計測つきで 1 回だけ走らせる。
       # テストの target ごとに本数を固定する (減ったら落ちる。テストを足したらここの数も上げる)。
       # 接続文字列は runner の中の使い捨ての DB のもので、secret ではない。
-      - name: lib・api_db・files_db・normal_tenko_db・alert_db・deferred_tenko_db・bp_db・report_db・bp_settings_db + Coverage 100% gate
+      - name: lib・api_db・files_db・normal_tenko_db・alert_db・deferred_tenko_db・bp_db・report_db・bp_settings_db・tenko_flow_db + Coverage 100% gate
         env:
           MEASUREMENTS_TEST_ADMIN_DATABASE_URL: postgresql://postgres:test@localhost:5432/postgres
           CARGO_TERM_COLOR: never
@@ -75,7 +75,7 @@ jobs:
           cargo llvm-cov --locked -p measurements --no-report 2>&1 | tee "$RUNNER_TEMP/measurements-test.txt"
           # target ごとの結果の行だけを見る (ほかの target の行と取り違えない)
           awk '/Running unittests src\/lib\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/measurements-test.txt" \
-            | grep -Eq '^test result: ok\. 37 passed; 0 failed; 0 ignored'
+            | grep -Eq '^test result: ok\. 43 passed; 0 failed; 0 ignored'
           awk '/Running tests\/api_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/measurements-test.txt" \
             | grep -Eq '^test result: ok\. 10 passed; 0 failed; 0 ignored'
           awk '/Running tests\/files_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/measurements-test.txt" \
@@ -94,6 +94,8 @@ jobs:
             | grep -Eq '^test result: ok\. 18 passed; 0 failed; 0 ignored'
           awk '/Running tests\/upload_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/measurements-test.txt" \
             | grep -Eq '^test result: ok\. 2 passed; 0 failed; 0 ignored'
+          awk '/Running tests\/tenko_flow_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/measurements-test.txt" \
+            | grep -Eq '^test result: ok\. 15 passed; 0 failed; 0 ignored'
           # -p を付けないと直下の package (worker) だけが対象になり、報告が空になる
           cargo llvm-cov report --locked -p measurements --text > "$RUNNER_TEMP/measurements-cov.txt"
           bash scripts/check_coverage_100.sh --use-cache "$RUNNER_TEMP/measurements-cov.txt"
