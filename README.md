@@ -46,13 +46,14 @@ POST は点呼方法・本人確認の方法を受けない (通常点呼・記�
 | `/api/tenko/sessions/{id}/{medical,self-declaration,daily-inspection,carrying-items,instruction-confirm,report,escalate-remote}` | PUT | 段 |
 | `/api/tenko/sessions/{id}/{cancel,interrupt,resume,self-resume}` | POST | 中止・中断・再開 (管理者)・自己再開 |
 | `/api/tenko/sessions/{id}/judgment` | POST | 運行管理者の判定 |
-| `/api/tenko/sessions/{id}/alcohol` | PUT | **旧い**アルコールの段 (本文の結果を信じる)。alc-app が下の測定の保存に移ったら消す |
 
 - **アルコールの段は測定の保存で進める**: 完了の `PUT /api/measurements/{id}` に `tenko_session_id` を付けると、同じ transaction で
   本人確認済みのセッションを **測定の行の** 結果・アルコール値・顔写真・測定時刻から進める (検知なら中止で閉じて記録)。
   セッションが無い・乗務員が違う・進められない status は 409 (測定も書かない)。この測定で既に進めたセッション (再送) は進め直さない。
   進めるのに失敗しても測定の保存は残る
-- **遠隔点呼は判定待ち (`judgment_pending`)**: 乗務員の側の最後の段 (指示の確認・運行報告) で閉じず、運行管理者の判定で閉じて
+- **アルコールの結果を本文で受ける段の口は無い** (旧い `PUT …/alcohol` は消した)
+- **遠隔点呼・IT点呼は判定待ち (`judgment_pending`)**: 遠隔点呼は乗務員の側の最後の段 (指示の確認・運行報告)、IT点呼は測定の保存
+  (完了する結果) で閉じず、運行管理者の判定で閉じて
   (OK も NG も `completed`) 記録を書く (判定が記録の hash に入る)。記録の後の押し直しは 409 `already_recorded`。
   判定待ちを足す前に閉じた記録の判定は今までどおり列だけ書く (押し直し可)
 - webhook (アルコール検知・運行報告・中断・日常点検 NG) は応答の後に ippoan/alc-tenko-worker の `POST /internal/webhooks/fire` へ

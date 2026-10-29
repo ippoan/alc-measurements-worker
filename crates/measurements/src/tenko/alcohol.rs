@@ -6,39 +6,27 @@
 //! 検知 (`fail` / `over`) なら中止で閉じて記録を書き、webhook `alcohol_detected` を渡す。進めるのは内側の区切りの中で、
 //! 失敗しても測定の保存は残す。
 //!
-//! 旧い段の口 `PUT /tenko/sessions/{id}/alcohol` ([`alcohol_handler`]) はクライアントの本文の `alcohol_result` を信じる
-//! (ippoan/alc-tenko-worker から写したまま)。**alc-app のキオスクが測定の保存に移るまでのつなぎで、移った後に消す**
-//! (auth-worker の振り分けからも外す)。
+//! アルコールの結果を本文で受ける段の口 (`PUT /tenko/sessions/{id}/alcohol`) は消した (alc-app のキオスクが測定の保存に移った)。
 
-use alc_core_wasm::{DeviceDevSlot, TenantId};
 use alc_worker_db::TenantTx;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::routing::put;
-use axum::{Extension, Json, Router};
 use chrono::{DateTime, Utc};
 use const_format::concatcp;
-use serde::Deserialize;
 use serde_json::json;
 use tokio_postgres::types::Type;
 use tokio_postgres::Error;
 use uuid::Uuid;
 
 use super::fire::Event;
-use super::flow::{fetch, now, one, run, Flow};
+use super::flow::{fetch, one};
 use super::record::{
     employee_name, in_savepoint, record_or_log, status_for_result, Savepoint, TenkoSession,
     SESSION_COLUMNS,
 };
 use crate::models::Measurement;
-use crate::{AppState, LogSink};
+use crate::LogSink;
 
 /// アルコールの段を進められる status
 pub const ALCOHOL_STATUS: &str = "identity_verified";
-
-/// 旧い段の口が受ける結果 (rust と同じ 5 つ)
-const VALID_RESULTS: [&str; 5] = ["pass", "fail", "normal", "over", "error"];
 
 /// 測定の保存で段を進める区切り (失敗しても測定の保存は残す)
 pub const SP_ALCOHOL: Savepoint = Savepoint {
@@ -51,27 +39,14 @@ pub mod sql {
     use super::*;
 
     /// $1 status / $2 measurement_id / $3 alcohol_result / $4 alcohol_value / $5 alcohol_face_photo_url /
-    /// $6 cancel_reason / $7 completed_at / $8 alcohol_tested_at (無ければ今) / $9 id / $10 tenant_id
+    /// $6 cancel_reason / $7 completed_at / $8 alcohol_tested_at (測定時刻) / $9 id / $10 tenant_id
     pub const UPDATE_ALCOHOL: &str = concatcp!(
         "UPDATE alc_api.tenko_sessions SET status = $1, measurement_id = $2, alcohol_result = $3, alcohol_value = $4, \
-             alcohol_tested_at = COALESCE($8, NOW()), alcohol_face_photo_url = $5, cancel_reason = $6, completed_at = $7, \
+             alcohol_tested_at = $8, alcohol_face_photo_url = $5, cancel_reason = $6, completed_at = $7, \
              updated_at = NOW() \
          WHERE id = $9 AND tenant_id = $10 RETURNING ",
         SESSION_COLUMNS
     );
-}
-
-/// rust の `SubmitAlcoholResult` (旧い段の口の本文)
-#[derive(Debug, Clone, Deserialize)]
-pub struct SubmitAlcohol {
-    pub measurement_id: Option<Uuid>,
-    pub alcohol_result: String,
-    pub alcohol_value: f64,
-    pub alcohol_face_photo_url: Option<String>,
-}
-
-pub fn router() -> Router<AppState> {
-    Router::new().route("/tenko/sessions/{id}/alcohol", put(alcohol_handler))
 }
 
 /// アルコールの段の次 (検知なら中止。業務前は指示の確認、業務後は運行報告)。種別が業務前・業務後でなければ `None`
@@ -86,17 +61,17 @@ fn next_status(cancelled: bool, tenko_type: &str) -> Option<&'static str> {
     }
 }
 
-/// 段を進めて、検知なら記録と webhook を作る (旧い段の口と測定の保存で同じもの)
+/// 段を進めて、検知なら記録と webhook を作る
 #[allow(clippy::too_many_arguments)]
 async fn apply(
     tx: &TenantTx<'_>,
     cur: &TenkoSession,
     next: &str,
-    measurement_id: Option<Uuid>,
+    measurement_id: Uuid,
     result: &str,
     value: Option<f64>,
     face_photo_url: &Option<String>,
-    tested_at: Option<DateTime<Utc>>,
+    tested_at: DateTime<Utc>,
     at: DateTime<Utc>,
     log: &LogSink,
 ) -> Result<(TenkoSession, Option<Event>), Error> {
@@ -188,11 +163,11 @@ pub async fn advance(
         tx,
         &cur,
         next,
-        Some(m.id),
+        m.id,
         result,
         m.alcohol_level,
         &m.face_photo_url,
-        Some(m.measured_at),
+        m.measured_at,
         at,
         log,
     );
@@ -203,60 +178,6 @@ pub async fn advance(
             (cur, None)
         }
     }
-}
-
-/// 旧い段の口 (クライアントの本文の結果で進める)。**alc-app のキオスクが測定の保存に移ったら消す**
-async fn alcohol_handler(
-    State(state): State<AppState>,
-    Extension(TenantId(tenant_id)): Extension<TenantId>,
-    Extension(dev): Extension<DeviceDevSlot>,
-    Path(id): Path<Uuid>,
-    Json(body): Json<SubmitAlcohol>,
-) -> Response {
-    if !VALID_RESULTS.contains(&body.alcohol_result.as_str()) {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    let at = now(&state);
-    let log = state.log.clone();
-    run(
-        state,
-        tenant_id,
-        dev.get(),
-        "session alcohol",
-        false,
-        move |tx| {
-            Box::pin(async move {
-                let Some(cur) = fetch(tx, tenant_id, id).await? else {
-                    return Ok(StatusCode::NOT_FOUND.into());
-                };
-                if cur.status != ALCOHOL_STATUS {
-                    return Ok(StatusCode::BAD_REQUEST.into());
-                }
-                let is_fail = matches!(
-                    status_for_result(Some(body.alcohol_result.as_str())),
-                    Some(("cancelled", _))
-                );
-                let Some(next) = next_status(is_fail, &cur.tenko_type) else {
-                    return Ok(StatusCode::INTERNAL_SERVER_ERROR.into());
-                };
-                let (s, event) = apply(
-                    tx,
-                    &cur,
-                    next,
-                    body.measurement_id,
-                    &body.alcohol_result,
-                    Some(body.alcohol_value),
-                    &body.alcohol_face_photo_url,
-                    None,
-                    at,
-                    &log,
-                )
-                .await?;
-                Ok(Flow::Session(Box::new(s), event))
-            })
-        },
-    )
-    .await
 }
 
 #[cfg(test)]

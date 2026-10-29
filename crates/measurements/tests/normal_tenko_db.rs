@@ -700,20 +700,25 @@ async fn test_put_without_tenko_method_stays_normal_and_returns_session_id() {
 
 #[tokio::test]
 async fn test_put_it_tenko_records_method_on_session_and_record() {
-    // IT点呼 は session と record の両方に書かれ、状態の決まり方は通常点呼と同じ
+    // IT点呼 は判定待ち (judgment_pending) で作り、記録は運行管理者の判定で書く。検知 (中止) だけは判定を待たずに閉じて記録する
     let app = app().await;
     let tenant = tenant().await;
     let emp = employee(tenant, "運行者", "NT31").await;
 
     // (送る種別, 記録される種別, 結果, 期待する状態)
     let cases = [
-        (None, "normal", "normal", "completed"),
-        (Some("pre_operation"), "pre_operation", "pass", "completed"),
+        (None, "normal", "normal", "judgment_pending"),
+        (
+            Some("pre_operation"),
+            "pre_operation",
+            "pass",
+            "judgment_pending",
+        ),
         (
             Some("post_operation"),
             "post_operation",
             "normal",
-            "completed",
+            "judgment_pending",
         ),
         // アルコール検知は IT点呼 でも中止 (status_for_result を共有している)
         (Some("pre_operation"), "pre_operation", "over", "cancelled"),
@@ -732,20 +737,25 @@ async fn test_put_it_tenko_records_method_on_session_and_record() {
         assert_eq!(rows[0].3, status, "結果 {result} → {status}");
 
         let expected = vec![(recorded_type.to_string(), "IT点呼".to_string())];
+        let records = if status == "cancelled" {
+            expected.clone()
+        } else {
+            vec![]
+        };
         assert_eq!(
             type_and_method(tenant, &m_id).await,
-            (expected.clone(), expected),
-            "session・record とも点呼方法は 'IT点呼' (tenko_type={tenko_type:?})"
+            (expected, records),
+            "session の点呼方法は 'IT点呼'。記録は中止のときだけ (tenko_type={tenko_type:?})"
         );
     }
-    assert_eq!(counts_any_method(tenant).await, (4, 4));
+    assert_eq!(counts_any_method(tenant).await, (4, 1));
     assert_eq!(
         counts(tenant).await,
         (0, 0),
         "'通常点呼' の行は 1 つもできていない"
     );
 
-    // 判定待ちは専用の状態ではなく manager_judgment IS NULL で表す
+    // 判定はまだ無い
     let judged: i64 = admin()
         .await
         .query_one(
@@ -779,22 +789,20 @@ async fn test_put_resend_returns_same_session_id() {
 
     let first = put_measurement_ok(&app, tenant, &m_id, &body).await;
     let first_id = first["tenko_session_id"].as_str().unwrap().to_string();
-    assert_eq!(counts_any_method(tenant).await, (1, 1));
-    let ic_card = (
-        vec![Some("ic_card".to_string())],
-        vec![(true, Some("ic_card".to_string()))],
-    );
+    assert_eq!(counts_any_method(tenant).await, (1, 0));
+    // IT点呼 は判定待ちなので記録はまだ無い (本人確認の方法は session の列にだけ在る)
+    let ic_card = (vec![Some("ic_card".to_string())], vec![]);
     assert_eq!(identity_methods(tenant, &m_id).await, ic_card);
 
     // 同じ内容で再送 (ON CONFLICT DO NOTHING は対象指定なしなので、行数と id の両方で確かめる)
     for _ in 0..2 {
         let again = put_measurement_ok(&app, tenant, &m_id, &body).await;
         assert_eq!(again["tenko_session_id"], first_id, "再送でも同じ id");
-        assert_eq!(again["status"], "completed");
+        assert_eq!(again["status"], "completed", "測定の status");
     }
     assert_eq!(
         counts_any_method(tenant).await,
-        (1, 1),
+        (1, 0),
         "再送で session も record も増えない"
     );
     let rows = session_rows(tenant, &m_id).await;
@@ -813,10 +821,10 @@ async fn test_put_resend_returns_same_session_id() {
     let it = vec![("pre_operation".to_string(), "IT点呼".to_string())];
     assert_eq!(
         type_and_method(tenant, &m_id).await,
-        (it.clone(), it),
+        (it, vec![]),
         "先に記録された点呼方法のまま"
     );
-    assert_eq!(counts_any_method(tenant).await, (1, 1));
+    assert_eq!(counts_any_method(tenant).await, (1, 0));
 
     // 本人確認の方法も先勝ち: 送らない再送 (上) でも、別の値の再送でも書き換えない
     assert_eq!(
@@ -833,7 +841,7 @@ async fn test_put_resend_returns_same_session_id() {
         ic_card,
         "別の値の再送でも、先に記録された本人確認の方法のまま"
     );
-    assert_eq!(counts_any_method(tenant).await, (1, 1));
+    assert_eq!(counts_any_method(tenant).await, (1, 0));
 
     // 同じ乗務員・同じ測定時刻の別の測定 (offline 保存へ回った経路) は (employee_id, started_at) の unique が弾く。
     // その測定には session が紐づいていないので、応答の id は null
@@ -841,7 +849,7 @@ async fn test_put_resend_returns_same_session_id() {
     let json = put_measurement_ok(&app, tenant, &other, &body).await;
     assert_eq!(json["status"], "completed", "測定自体は保存される");
     assert!(json["tenko_session_id"].is_null());
-    assert_eq!(counts_any_method(tenant).await, (1, 1));
+    assert_eq!(counts_any_method(tenant).await, (1, 0));
 }
 
 /// session の 1 行の identity_method を DB で直接 (rust は `/api/tenko/sessions/{id}` の応答で見る。その口は rust に在る)
@@ -882,19 +890,24 @@ async fn test_put_identity_method_is_stored_on_session_and_record_data() {
             !json.as_object().unwrap().contains_key("identity_method"),
             "測定の応答の形は変えていない"
         );
+        // IT点呼 は判定待ちで記録がまだ無い (判定で書く記録の record_data に入る)
+        let is_it = tenko_method == Some("IT点呼");
+        let in_record = if is_it {
+            vec![]
+        } else {
+            vec![(true, Some(identity.to_string()))]
+        };
         assert_eq!(
             identity_methods(tenant, &m_id).await,
-            (
-                vec![Some(identity.to_string())],
-                vec![(true, Some(identity.to_string()))]
-            ),
+            (vec![Some(identity.to_string())], in_record),
             "session の列と record_data の両方に入る (identity_method={identity})"
         );
         let method = tenko_method.unwrap_or("通常点呼").to_string();
         let expected = vec![("normal".to_string(), method)];
+        let records = if is_it { vec![] } else { expected.clone() };
         assert_eq!(
             type_and_method(tenant, &m_id).await,
-            (expected.clone(), expected),
+            (expected, records),
             "点呼方法は identity_method に引きずられない"
         );
         let session_id = json["tenko_session_id"].as_str().unwrap();
@@ -923,7 +936,8 @@ async fn test_put_identity_method_is_stored_on_session_and_record_data() {
         none,
         "2 回目の保存は書かない"
     );
-    assert_eq!(counts_any_method(tenant).await, (6, 6));
+    // IT点呼 の 2 件は判定待ちで記録がまだ無い
+    assert_eq!(counts_any_method(tenant).await, (6, 4));
 
     // 知らない値は 400 (測定も更新しない・session も作らない)
     let m_id = start_measurement(&app, tenant, emp).await;
@@ -936,7 +950,8 @@ async fn test_put_identity_method_is_stored_on_session_and_record_data() {
         "started",
         "400 の PUT は測定を更新しない"
     );
-    assert_eq!(counts_any_method(tenant).await, (6, 6));
+    // IT点呼 の 2 件は判定待ちで記録がまだ無い
+    assert_eq!(counts_any_method(tenant).await, (6, 4));
 }
 
 #[tokio::test]
@@ -1066,38 +1081,83 @@ async fn judgment_view(
     (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4))
 }
 
+/// 判定を打てる運行管理者 (role に manager)
+async fn judge(tenant: Uuid, code: &str) -> Uuid {
+    let id = employee(tenant, "運行管理者", code).await;
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.employees SET role = ARRAY['manager'] WHERE id = $1",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    id
+}
+
+/// 管理者ログインで判定を打つ
+async fn post_judgment(app: &App, tenant: Uuid, session_id: &str, body: Value) -> Got {
+    let bytes = serde_json::to_vec(&body).unwrap();
+    call_raw(
+        app,
+        "POST",
+        &format!("/api/tenko/sessions/{session_id}/judgment"),
+        Some(tenant),
+        &[
+            ("content-type", "application/json"),
+            ("X-User-ID", "0b9f5a52-6a1e-4c1b-9d2a-3f4e5d6c7b8a"),
+            ("X-User-Email", "admin@example.invalid"),
+            ("X-User-Role", "admin"),
+        ],
+        bytes,
+    )
+    .await
+}
+
 #[tokio::test]
-async fn test_it_tenko_session_accepts_manager_judgment() {
-    // IT点呼 の session は保存の直後に完了扱いで、判定はまだ無い (= 判定待ち)。判定を書けば status は変わらない
+async fn test_it_tenko_session_waits_for_manager_judgment() {
+    // IT点呼 の session は保存の直後は判定待ちで、記録はまだ無い。判定で閉じて記録を書く (判定が record_data に入る)
     let app = app().await;
     let tenant = tenant().await;
     let emp = employee(tenant, "運行者", "NT35").await;
-    let manager = employee(tenant, "運行管理者", "NT35M").await;
+    let manager = judge(tenant, "NT35M").await;
 
     let session_id =
         tenko_session_via_put(&app, tenant, emp, "2026-09-13T08:00:00Z", Some("IT点呼")).await;
     let (method, status, measurement_id, judgment, judgment_method) =
         judgment_view(&session_id).await;
     assert_eq!(method, "IT点呼");
-    assert_eq!(status, "completed");
+    assert_eq!(status, "judgment_pending");
     assert!(measurement_id.is_some());
     assert_eq!((judgment, judgment_method), (None, None));
+    assert_eq!(counts_any_method(tenant).await, (1, 0));
 
-    // 判定の口 (rust) が書く列を書いても、点呼の行の形 (状態・点呼方法) は保たれる
-    admin()
-        .await
-        .execute(
-            "UPDATE alc_api.tenko_sessions
-             SET manager_judgment = 'ok', manager_judgment_by = $2, manager_judgment_method = 'it'
-             WHERE id = $1",
-            &[&Uuid::parse_str(&session_id).unwrap(), &manager],
-        )
-        .await
-        .unwrap();
+    let res = post_judgment(
+        &app,
+        tenant,
+        &session_id,
+        serde_json::json!({ "judgment": "ok", "judged_by_employee_id": manager, "method": "it" }),
+    )
+    .await;
+    assert_eq!(res.status, 200);
     let after = judgment_view(&session_id).await;
     assert_eq!(after.0, "IT点呼");
-    assert_eq!(after.1, "completed", "判定は status を変えない");
-    assert_eq!(after.3.as_deref(), Some("ok"));
+    assert_eq!(after.1, "completed", "判定で閉じる");
+    assert_eq!(
+        (after.3.as_deref(), after.4.as_deref()),
+        (Some("ok"), Some("it"))
+    );
+    let data: Value = admin()
+        .await
+        .query_one(
+            "SELECT record_data FROM alc_api.tenko_records WHERE session_id = $1",
+            &[&Uuid::parse_str(&session_id).unwrap()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(data["manager_judgment"], "ok");
+    assert_eq!(data["manager_judgment_method"], "it");
 }
 
 #[tokio::test]
@@ -1171,28 +1231,25 @@ async fn test_list_pending_it_tenko_sessions() {
 
 #[tokio::test]
 async fn test_csv_reads_in_person_it_tenko_as_in_person_tenko() {
-    // 記録簿の CSV (rust) が読み替える元の行: 記録の tenko_method は保存のときの点呼方法のまま
-    // ('IT点呼' 3 件と '通常点呼' 1 件)。判定の後も記録の行は書き換わらない (記録は不変)
+    // 記録簿の CSV が読み替える元の行: 記録の tenko_method は保存のときの点呼方法のまま。
+    // IT点呼 の記録は判定で書かれる ('IT点呼' 2 件と '通常点呼' 1 件。判定待ちの 1 件はまだ記録が無い)
     let app = app().await;
     let tenant = tenant().await;
     let emp = employee(tenant, "運行者", "NT43").await;
 
+    let manager = judge(tenant, "NT43M").await;
+
     let s_in_person =
         tenko_session_via_put(&app, tenant, emp, "2026-09-16T08:00:00Z", Some("IT点呼")).await;
-    let _s_it =
+    let s_it =
         tenko_session_via_put(&app, tenant, emp, "2026-09-16T09:00:00Z", Some("IT点呼")).await;
     let _s_pending =
         tenko_session_via_put(&app, tenant, emp, "2026-09-16T10:00:00Z", Some("IT点呼")).await;
     let s_normal = tenko_session_via_put(&app, tenant, emp, "2026-09-16T11:00:00Z", None).await;
-    admin()
-        .await
-        .execute(
-            "UPDATE alc_api.tenko_sessions SET manager_judgment = 'ok', manager_judgment_method = 'in_person'
-             WHERE id = $1",
-            &[&Uuid::parse_str(&s_in_person).unwrap()],
-        )
-        .await
-        .unwrap();
+    for (sid, method) in [(&s_in_person, "in_person"), (&s_it, "it")] {
+        let body = serde_json::json!({ "judgment": "ok", "judged_by_employee_id": manager, "method": method });
+        assert_eq!(post_judgment(&app, tenant, sid, body).await.status, 200);
+    }
 
     let records: Vec<(Uuid, String)> = admin()
         .await
@@ -1205,7 +1262,7 @@ async fn test_csv_reads_in_person_it_tenko_as_in_person_tenko() {
         .iter()
         .map(|r| (r.get(0), r.get(1)))
         .collect();
-    assert_eq!(records.len(), 4);
+    assert_eq!(records.len(), 3);
     let normal_sid = Uuid::parse_str(&s_normal).unwrap();
     for (session_id, tenko_method) in &records {
         let expected = if *session_id == normal_sid {
