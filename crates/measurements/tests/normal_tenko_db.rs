@@ -66,7 +66,6 @@ async fn test_normal_measurement_creates_tenko_session_and_record() {
         Some(rec.get::<_, Uuid>(7).to_string()),
         "record_data はセッションの JSON"
     );
-    support::assert_record_matches_copy(rec.get(7)).await;
 }
 
 #[tokio::test]
@@ -417,8 +416,7 @@ async fn test_remote_tenko_session_is_not_caught_by_normal_flow_index() {
         .get(0);
     let updated = su
         .execute(
-            "UPDATE alc_api.tenko_sessions SET measurement_id = $2, alcohol_result = 'pass', alcohol_value = 0
-             WHERE id = $1",
+            "UPDATE alc_api.tenko_sessions SET measurement_id = $2 WHERE id = $1",
             &[&remote, &m_id],
         )
         .await

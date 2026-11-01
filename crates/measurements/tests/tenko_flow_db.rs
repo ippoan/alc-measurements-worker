@@ -402,7 +402,6 @@ async fn pre_operation_auto_flow_writes_record() {
         hash,
         &format!("{:x}", Sha256::digest(data.to_string().as_bytes()))
     );
-    support::assert_record_matches_copy(id.parse().unwrap()).await;
     assert!(events(&app).is_empty());
 }
 
@@ -1696,7 +1695,7 @@ async fn reject_triggers() {
              CREATE TRIGGER tenko_test_reject_record BEFORE INSERT ON alc_api.tenko_records \
              FOR EACH ROW EXECUTE FUNCTION alc_api.tenko_test_reject_record(); \
              CREATE OR REPLACE FUNCTION alc_api.tenko_test_reject_alcohol() RETURNS trigger LANGUAGE plpgsql AS $$ \
-             BEGIN IF NEW.location = 'TEST-REJECT-ALCOHOL' AND NEW.alcohol_result IS NOT NULL THEN \
+             BEGIN IF NEW.location = 'TEST-REJECT-ALCOHOL' AND NEW.measurement_id IS DISTINCT FROM OLD.measurement_id THEN \
              RAISE EXCEPTION 'test reject'; END IF; RETURN NEW; END $$; \
              DROP TRIGGER IF EXISTS tenko_test_reject_alcohol ON alc_api.tenko_sessions; \
              CREATE TRIGGER tenko_test_reject_alcohol BEFORE UPDATE ON alc_api.tenko_sessions \
@@ -2054,7 +2053,6 @@ async fn alcohol_detected_from_the_measurement() {
     let recs = records(sid).await;
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].0, "cancelled");
-    support::assert_record_matches_copy(sid).await;
     let ev = events(&app);
     assert_eq!(ev.len(), 1);
     assert_eq!(ev[0].0, "alcohol_detected");

@@ -274,17 +274,14 @@ pub mod sql {
     );
 
     /// 以下の更新は $(最後の 2 つ) = id / tenant_id。行が無ければ 0 行 (rust は `fetch_one` で 500 だった。下の口は
-    /// 直前に同じ transaction で読んでいるので起きない)
+    /// 直前に同じ transaction で読んでいるので起きない)。体温・血圧の段はセッションの段だけ進める (値は測定)
     pub const UPDATE_MEDICAL: &str = concatcp!(
-        "WITH s AS (UPDATE alc_api.tenko_sessions SET status = 'self_declaration_pending', \
-             temperature = COALESCE($1, temperature), systolic = COALESCE($2, systolic), \
-             diastolic = COALESCE($3, diastolic), pulse = COALESCE($4, pulse), \
-             medical_measured_at = COALESCE($5, NOW()), medical_manual_input = $6, updated_at = NOW() \
-         WHERE id = $7 AND tenant_id = $8",
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET status = 'self_declaration_pending', updated_at = NOW() \
+         WHERE id = $1 AND tenant_id = $2",
         RETURNING_SESSION
     );
 
-    /// 体温・血圧の段の値を値の置き場の測定に書く (セッションの [`UPDATE_MEDICAL`] と同じ規則。セッションを更新する前に流し、
+    /// 体温・血圧の段の値を値の置き場の測定に書く (来た値だけ変え、時刻は無ければ NOW())。セッションを更新する前に流し、
     /// セッションの応答は測定から読む)。$1 temperature / $2 systolic / $3 diastolic / $4 pulse / $5 medical_measured_at /
     /// $6 medical_manual_input / $7 measurement_id / $8 tenant_id
     pub const MEDICAL_TO_MEASUREMENT: &str =
@@ -960,20 +957,11 @@ async fn medical_handler(
                     ],
                 )
                 .await?;
-                // セッションの値の列への写し (読む側は測定に移った。写しは段階 3 の次の PR でやめる)
+                // セッションは段だけ進める (値は測定に書いた。応答の値はその測定から読む)
                 let s = one(
                     tx,
                     sql::UPDATE_MEDICAL,
-                    &[
-                        (&body.temperature, Type::FLOAT8),
-                        (&body.systolic, Type::INT4),
-                        (&body.diastolic, Type::INT4),
-                        (&body.pulse, Type::INT4),
-                        (&body.medical_measured_at, Type::TIMESTAMPTZ),
-                        (&body.medical_manual_input, Type::BOOL),
-                        (&id, Type::UUID),
-                        (&tenant_id, Type::UUID),
-                    ],
+                    &[(&id, Type::UUID), (&tenant_id, Type::UUID)],
                 )
                 .await?;
                 Ok(Flow::Session(Box::new(s), None))
