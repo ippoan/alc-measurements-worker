@@ -24,7 +24,9 @@ use serde_json::json;
 use tokio_postgres::types::Type;
 use uuid::Uuid;
 
-use super::flow::{fetch, one, run, Arg, Flow, JUDGMENT_PENDING};
+use super::flow::{
+    beyond_prod_manager, fetch, one, prod_manager_key, run, Arg, Flow, JUDGMENT_PENDING,
+};
 use super::normal::TENKO_METHOD_IT;
 use super::record::{write_record, TenkoSession, RETURNING_SESSION};
 use crate::AppState;
@@ -104,6 +106,7 @@ async fn judgment_handler(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let dev = slot.get();
+    let prod_manager = prod_manager_key(&slot, admin);
     run(
         state,
         tenant_id,
@@ -133,7 +136,7 @@ async fn judgment_handler(
                     return Ok(StatusCode::NOT_FOUND.into());
                 };
                 // dev でない運行管理者の鍵が判定できるのは IT点呼 の記録だけ (記録の列で決める)
-                if !admin && !dev && cur.tenko_method != TENKO_METHOD_IT {
+                if beyond_prod_manager(prod_manager, &cur) {
                     return Ok(StatusCode::FORBIDDEN.into());
                 }
                 let method = body.method.as_deref();

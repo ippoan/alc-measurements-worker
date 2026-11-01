@@ -8,6 +8,8 @@
 //! - 段: `PUT …/medical`・`…/self-declaration` (安全判定を続けて行う)・`…/daily-inspection`・`…/carrying-items`・
 //!   `…/instruction-confirm`・`…/report`・`…/escalate-remote`、`POST …/cancel`・`…/interrupt`・`…/resume`・`…/self-resume`
 //! - アルコールの段は [`super::alcohol`]、運行管理者の判定は [`super::judgment`]
+//! - 取り消し・中断・再開は運行管理者の鍵でも送れる (運行管理者の点呼の一覧から)。範囲は判定と同じ
+//!   ([`prod_manager_key`])。再開は管理者ログインか運行管理者の鍵だけ (キオスクの鍵は 401)
 //!
 //! 点呼が閉じた段 (完了・中止・中断) では、点呼の記録 (`tenko_records`、不変) を書く ([`record_or_log`]。失敗しても
 //! 区切りだけ戻してセッションの更新は残す)。**遠隔点呼は乗務員の側が終わっても閉じない**: 指示の確認・運行報告の
@@ -40,6 +42,7 @@ use tokio_postgres::{Error, Row};
 use uuid::Uuid;
 
 use super::fire::{Event, PendingFire};
+use super::normal::TENKO_METHOD_IT;
 use super::record::{
     employee_name, record_or_log, TenkoSession, MEASUREMENT_JOIN, RETURNING_SESSION,
     SESSION_COLUMNS,
@@ -536,6 +539,18 @@ pub fn resume_to(session: &TenkoSession) -> &'static str {
     } else {
         "daily_inspection_pending"
     }
+}
+
+/// 本番の (dev でない) 運行管理者の鍵の要求か (管理者ログインは除く)。この鍵が触れる点呼は IT点呼 だけで、
+/// 開発用の席の鍵はどの点呼にも触れる (判定・取り消し・中断・再開で同じ範囲。2026-11-02 ユーザー決定)。
+/// キオスクの鍵はここに当たらない (乗務員が自分の点呼をやめる口は今までどおり)
+pub fn prod_manager_key(slot: &DeviceDevSlot, admin: bool) -> bool {
+    !admin && slot.is_tenko_manager() && !slot.get()
+}
+
+/// [`prod_manager_key`] の要求が触れない点呼か (403)
+pub fn beyond_prod_manager(prod_manager: bool, session: &TenkoSession) -> bool {
+    prod_manager && session.tenko_method != TENKO_METHOD_IT
 }
 
 // --- transaction の中の部品 ---
@@ -1139,10 +1154,12 @@ async fn cancel_handler(
     State(state): State<AppState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
     Extension(dev): Extension<DeviceDevSlot>,
+    user: Option<Extension<AuthUser>>,
     Path(id): Path<Uuid>,
     Json(body): Json<Reason>,
 ) -> Response {
     let log = state.log.clone();
+    let prod_manager = prod_manager_key(&dev, user.is_some());
     run(
         state,
         tenant_id,
@@ -1154,6 +1171,9 @@ async fn cancel_handler(
                 let Some(cur) = fetch(tx, tenant_id, id).await? else {
                     return Ok(StatusCode::NOT_FOUND.into());
                 };
+                if beyond_prod_manager(prod_manager, &cur) {
+                    return Ok(StatusCode::FORBIDDEN.into());
+                }
                 // 判定待ちは乗務員の側が終わっている (閉じるのは運行管理者の判定)。ただし遠隔点呼の判定待ちは
                 // 運行管理者を通話で呼んでいる間なので、出ないときに乗務員がやめられる (2026-11-01 ユーザー決定)。
                 // IT点呼 の判定待ちは今までどおり取り消せない
@@ -1456,10 +1476,12 @@ async fn interrupt_handler(
     State(state): State<AppState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
     Extension(dev): Extension<DeviceDevSlot>,
+    user: Option<Extension<AuthUser>>,
     Path(id): Path<Uuid>,
     Json(body): Json<Reason>,
 ) -> Response {
     let at = now(&state);
+    let prod_manager = prod_manager_key(&dev, user.is_some());
     run(
         state,
         tenant_id,
@@ -1471,6 +1493,9 @@ async fn interrupt_handler(
                 let Some(cur) = fetch(tx, tenant_id, id).await? else {
                     return Ok(StatusCode::NOT_FOUND.into());
                 };
+                if beyond_prod_manager(prod_manager, &cur) {
+                    return Ok(StatusCode::FORBIDDEN.into());
+                }
                 if is_terminal(&cur.status) {
                     return Ok(StatusCode::BAD_REQUEST.into());
                 }
@@ -1512,13 +1537,20 @@ async fn resume_handler(
     State(state): State<AppState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
     Extension(dev): Extension<DeviceDevSlot>,
-    Extension(user): Extension<AuthUser>,
+    user: Option<Extension<AuthUser>>,
     Path(id): Path<Uuid>,
     Json(body): Json<Resume>,
 ) -> Response {
+    // 管理者ログイン (AuthUser が入る) か、運行管理者の鍵だけ通す。キオスクの鍵は弾く (キオスクは self-resume)
+    if user.is_none() && !dev.is_tenko_manager() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     if body.reason.trim().is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let prod_manager = prod_manager_key(&dev, user.is_some());
+    // 運行管理者の鍵からは NULL のまま (承認した管理者の列なので、ログインの無い席で埋めると嘘になる)
+    let by = user.map(|Extension(u)| u.user_id);
     run(
         state,
         tenant_id,
@@ -1530,11 +1562,13 @@ async fn resume_handler(
                 let Some(cur) = fetch(tx, tenant_id, id).await? else {
                     return Ok(StatusCode::NOT_FOUND.into());
                 };
+                if beyond_prod_manager(prod_manager, &cur) {
+                    return Ok(StatusCode::FORBIDDEN.into());
+                }
                 if cur.status != "interrupted" {
                     return Ok(StatusCode::BAD_REQUEST.into());
                 }
                 let to = resume_to(&cur);
-                let by = Some(user.user_id);
                 let s = one(
                     tx,
                     sql::RESUME,

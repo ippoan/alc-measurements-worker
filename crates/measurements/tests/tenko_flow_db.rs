@@ -594,7 +594,7 @@ async fn safety_judgment_interrupt_resume_and_cancel() {
         ("tenko_interrupted", json!(["systolic", "illness"]))
     );
 
-    // 管理者の再開: 理由が必須・AuthUser が要る (無いと rust と同じく 500)・中断中だけ
+    // 管理者の再開: 理由が必須・管理者ログインか運行管理者の鍵が要る (キオスクの鍵は 401)・中断中だけ
     assert_eq!(
         send_h(
             &app,
@@ -618,7 +618,7 @@ async fn safety_judgment_interrupt_resume_and_cancel() {
         )
         .await
         .status,
-        500
+        401
     );
     let r = send_h(
         &app,
@@ -2242,4 +2242,76 @@ async fn remote_judgment_pending_can_be_cancelled_by_driver() {
     )
     .await;
     assert_eq!(got.status, 400);
+}
+
+/// 運行管理者の点呼の一覧から送る取り消し・中断・再開 (運行管理者の鍵)。範囲は判定と同じ: 開発用の席の鍵はどの点呼も、
+/// 本番の席の鍵は IT点呼 だけ (2026-11-02 ユーザー決定)。再開を送った人の列は席の鍵では NULL のまま
+#[tokio::test]
+async fn manager_key_cancel_interrupt_resume_scope() {
+    let app = app().await;
+    let t = tenant().await;
+    let emp = employee(t, "席 三郎").await;
+    let key = [("X-Device-Role", "device-tenko-manager")];
+    let dev_key = [
+        ("X-Device-Role", "device-tenko-manager"),
+        ("X-Device-Dev", "1"),
+    ];
+    let u = |id: Uuid, step: &str| format!("/api/tenko/sessions/{id}/{step}");
+    let reason = || Some(json!({ "reason": "席から" }));
+
+    // 本番の席の鍵: IT点呼 でない点呼には触れない (403。行は変わらない)
+    let remote = sess(t, emp, "pre_operation", "遠隔点呼", "medical_pending", &[]).await;
+    for step in ["cancel", "interrupt"] {
+        assert_eq!(
+            send_h(&app, "POST", &u(remote, step), t, &key, reason())
+                .await
+                .status,
+            403,
+            "{step}"
+        );
+    }
+    let stopped = sess(t, emp, "pre_operation", "自動点呼", "interrupted", &[]).await;
+    assert_eq!(
+        send_h(&app, "POST", &u(stopped, "resume"), t, &key, reason())
+            .await
+            .status,
+        403
+    );
+    assert_eq!(session_status(remote).await, "medical_pending");
+    assert_eq!(session_status(stopped).await, "interrupted");
+
+    // 本番の席の鍵: IT点呼 は中断 → 再開 → 取り消しまで通る
+    let it = sess(t, emp, "normal", "IT点呼", "self_declaration_pending", &[]).await;
+    let i = send_h(&app, "POST", &u(it, "interrupt"), t, &key, reason())
+        .await
+        .json();
+    assert_eq!(i["status"], "interrupted");
+    let r = send_h(&app, "POST", &u(it, "resume"), t, &key, reason())
+        .await
+        .json();
+    assert_eq!(
+        (r["status"].clone(), r["resumed_by_user_id"].clone()),
+        (json!("daily_inspection_pending"), Value::Null)
+    );
+    let c = send_h(&app, "POST", &u(it, "cancel"), t, &key, reason())
+        .await
+        .json();
+    assert_eq!(c["status"], "cancelled");
+
+    // 開発用の席の鍵: どの点呼にも触れる (前の版で残った dev 軸の遠隔点呼を一覧から取り消す)
+    let dev = [("is_dev", "true")];
+    let remote = sess(t, emp, "pre_operation", "遠隔点呼", "medical_pending", &dev).await;
+    let c = send_h(&app, "POST", &u(remote, "cancel"), t, &dev_key, reason())
+        .await
+        .json();
+    assert_eq!(c["status"], "cancelled");
+    let auto = sess(t, emp, "pre_operation", "自動点呼", "medical_pending", &dev).await;
+    let i = send_h(&app, "POST", &u(auto, "interrupt"), t, &dev_key, reason())
+        .await
+        .json();
+    assert_eq!(i["status"], "interrupted");
+    let r = send_h(&app, "POST", &u(auto, "resume"), t, &dev_key, reason())
+        .await
+        .json();
+    assert_eq!(r["status"], "daily_inspection_pending");
 }
