@@ -64,31 +64,23 @@ pub struct NormalTenkoInput {
 }
 
 pub mod sql {
-    /// 通常点呼のセッション (rust の normal_tenko.rs の `record` の INSERT と同じ列・同じ値)。
-    /// 記録済み (migration 141 の部分 unique。同じ測定、または同じ乗務員・同じ測定時刻) は `ON CONFLICT DO NOTHING`
-    /// で 0 行 (先勝ち)
+    /// 通常点呼のセッション (rust の normal_tenko.rs の `record` の INSERT。値 (アルコール・体温・血圧) は写さず、
+    /// 測定を measurement_id で指す)。記録済み (migration 141 の部分 unique。同じ測定、または同じ乗務員・同じ測定時刻) は
+    /// `ON CONFLICT DO NOTHING` で 0 行 (先勝ち)
     pub fn insert_session() -> String {
         format!(
             "WITH s AS (INSERT INTO tenko_sessions ( \
                  tenant_id, employee_id, schedule_id, tenko_type, status, \
-                 measurement_id, alcohol_result, alcohol_value, alcohol_tested_at, \
-                 alcohol_face_photo_url, \
-                 temperature, systolic, diastolic, pulse, medical_measured_at, \
-                 medical_manual_input, \
-                 responsible_manager_name, cancel_reason, \
+                 measurement_id, responsible_manager_name, cancel_reason, \
                  started_at, completed_at, tenko_method, \
                  carins_cert_no, carins_vehicle_id, carins_expires_on, carins_matched_by, \
                  identity_method \
              ) VALUES ( \
                  $1, $2, NULL, $3, $4, \
-                 $5, $6, $7, $8, \
-                 $9, \
-                 $10, $11, $12, $13, $14, \
-                 $15, \
-                 NULL, $16, \
-                 $17, CASE WHEN $4 = 'judgment_pending' THEN NULL ELSE NOW() END, $18, \
-                 $19, $20, $21, $22, \
-                 $23 \
+                 $5, NULL, $6, \
+                 $7, CASE WHEN $4 = 'judgment_pending' THEN NULL ELSE NOW() END, $8, \
+                 $9, $10, $11, $12, \
+                 $13 \
              ) \
              ON CONFLICT DO NOTHING{}",
             super::super::record::RETURNING_SESSION
@@ -181,16 +173,6 @@ pub async fn record(
                 (&tenko_type, Type::TEXT),
                 (&status, Type::TEXT),
                 (&m.id, Type::UUID),
-                (&m.result, Type::TEXT),
-                (&m.alcohol_level, Type::FLOAT8),
-                (&m.measured_at, Type::TIMESTAMPTZ),
-                (&m.face_photo_url, Type::TEXT),
-                (&m.temperature, Type::FLOAT8),
-                (&m.systolic, Type::INT4),
-                (&m.diastolic, Type::INT4),
-                (&m.pulse, Type::INT4),
-                (&m.medical_measured_at, Type::TIMESTAMPTZ),
-                (&m.medical_manual_input, Type::BOOL),
                 (&cancel_reason, Type::TEXT),
                 (&m.measured_at, Type::TIMESTAMPTZ),
                 (&tenko_method, Type::TEXT),

@@ -38,13 +38,12 @@ pub const SP_ALCOHOL: Savepoint = Savepoint {
 pub mod sql {
     use super::*;
 
-    /// $1 status / $2 measurement_id / $3 alcohol_result / $4 alcohol_value / $5 alcohol_face_photo_url /
-    /// $6 cancel_reason / $7 completed_at / $8 alcohol_tested_at (測定時刻) / $9 id / $10 tenant_id
+    /// アルコールの値はセッションに写さない (値の置き場は測定。セッションは measurement_id で指す)。
+    /// $1 status / $2 measurement_id / $3 cancel_reason / $4 completed_at / $5 id / $6 tenant_id
     pub const UPDATE_ALCOHOL: &str = concatcp!(
-        "WITH s AS (UPDATE alc_api.tenko_sessions SET status = $1, measurement_id = $2, alcohol_result = $3, alcohol_value = $4, \
-             alcohol_tested_at = $8, alcohol_face_photo_url = $5, cancel_reason = $6, completed_at = $7, \
-             updated_at = NOW() \
-         WHERE id = $9 AND tenant_id = $10",
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET status = $1, measurement_id = $2, cancel_reason = $3, \
+             completed_at = $4, updated_at = NOW() \
+         WHERE id = $5 AND tenant_id = $6",
         RETURNING_SESSION
     );
 
@@ -81,8 +80,6 @@ async fn apply(
     measurement_id: Uuid,
     result: &str,
     value: Option<f64>,
-    face_photo_url: &Option<String>,
-    tested_at: DateTime<Utc>,
     at: DateTime<Utc>,
     log: &LogSink,
 ) -> Result<(TenkoSession, Option<Event>), Error> {
@@ -108,12 +105,8 @@ async fn apply(
         &[
             (&next, Type::TEXT),
             (&measurement_id, Type::UUID),
-            (&result, Type::TEXT),
-            (&value, Type::FLOAT8),
-            (face_photo_url, Type::TEXT),
             (&cancel_reason, Type::TEXT),
             (&completed_at, Type::TIMESTAMPTZ),
-            (&tested_at, Type::TIMESTAMPTZ),
             (&cur.id, Type::UUID),
             (&cur.tenant_id, Type::UUID),
         ],
@@ -182,18 +175,7 @@ pub async fn advance(
     let Some(next) = next_status(closed == "cancelled", &cur.tenko_type) else {
         return (cur, None);
     };
-    let body = apply(
-        tx,
-        &cur,
-        next,
-        m.id,
-        result,
-        m.alcohol_level,
-        &m.face_photo_url,
-        m.measured_at,
-        at,
-        log,
-    );
+    let body = apply(tx, &cur, next, m.id, result, m.alcohol_level, at, log);
     match in_savepoint(tx, &SP_ALCOHOL, body).await {
         Ok(done) => done,
         Err(stage) => {
