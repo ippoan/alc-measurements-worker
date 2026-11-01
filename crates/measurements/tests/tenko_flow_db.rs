@@ -1732,11 +1732,9 @@ async fn judgment_closes_pending_and_writes_record() {
     assert!(c["instruction_confirmed_at"].is_string());
     assert!(records(pre).await.is_empty());
 
-    // 判定待ちは乗務員の側から中止・中断・自己再開できない
-    for (method, step, b) in [
-        ("POST", "cancel", json!({})),
-        ("POST", "interrupt", json!({})),
-    ] {
+    // 判定待ちは乗務員の側から中断・自己再開できない (取り消しは遠隔点呼なら下の
+    // remote_judgment_pending_can_be_cancelled_by_driver)
+    for (method, step, b) in [("POST", "interrupt", json!({}))] {
         let got = send(
             &app,
             method,
@@ -2177,4 +2175,45 @@ async fn alcohol_failures_keep_the_measurement() {
         assert!(app.logs().contains(&line.to_owned()), "{line}");
         assert_logs_clean(&app, &[t.to_string(), sid.to_string()]);
     }
+}
+
+/// 遠隔点呼の判定待ち (運行管理者を通話で呼んでいる間) は、運行管理者が出ないとき乗務員が取り消せる。
+/// 取り消すと中止の記録を書く。IT点呼 の判定待ちは今までどおり取り消せない (2026-11-01 ユーザー決定)
+#[tokio::test]
+async fn remote_judgment_pending_can_be_cancelled_by_driver() {
+    let app = app().await;
+    let t = tenant().await;
+    let emp = employee(t, "遠隔 二郎").await;
+    let pre = sess(t, emp, "pre_operation", "遠隔点呼", "judgment_pending", &[]).await;
+    let got = send(
+        &app,
+        "POST",
+        &format!("/api/tenko/sessions/{pre}/cancel"),
+        t,
+        Some(json!({ "reason": "運行管理者が通話に出なかったため乗務員が中止" })),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    let s = got.json();
+    assert_eq!(
+        (s["status"].clone(), s["cancel_reason"].clone()),
+        (
+            json!("cancelled"),
+            json!("運行管理者が通話に出なかったため乗務員が中止")
+        )
+    );
+    let recs = records(pre).await;
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].0, "cancelled");
+
+    let it = sess(t, emp, "normal", "IT点呼", "judgment_pending", &[]).await;
+    let got = send(
+        &app,
+        "POST",
+        &format!("/api/tenko/sessions/{it}/cancel"),
+        t,
+        Some(json!({ "reason": "x" })),
+    )
+    .await;
+    assert_eq!(got.status, 400);
 }
