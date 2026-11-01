@@ -1122,11 +1122,12 @@ async fn cancel_handler(
                 let Some(cur) = fetch(tx, tenant_id, id).await? else {
                     return Ok(StatusCode::NOT_FOUND.into());
                 };
-                // 判定待ちは乗務員の側が終わっている (閉じるのは運行管理者の判定)
-                if matches!(
-                    cur.status.as_str(),
-                    "completed" | "cancelled" | JUDGMENT_PENDING
-                ) {
+                // 判定待ちは乗務員の側が終わっている (閉じるのは運行管理者の判定)。ただし遠隔点呼の判定待ちは
+                // 運行管理者を通話で呼んでいる間なので、出ないときに乗務員がやめられる (2026-11-01 ユーザー決定)。
+                // IT点呼 の判定待ちは今までどおり取り消せない
+                let closed = matches!(cur.status.as_str(), "completed" | "cancelled");
+                let judging = cur.status == JUDGMENT_PENDING && cur.tenko_method != REMOTE;
+                if closed || judging {
                     return Ok(StatusCode::BAD_REQUEST.into());
                 }
                 let s = one(
