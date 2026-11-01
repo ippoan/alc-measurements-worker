@@ -69,7 +69,7 @@ pub mod sql {
     /// で 0 行 (先勝ち)
     pub fn insert_session() -> String {
         format!(
-            "INSERT INTO tenko_sessions ( \
+            "WITH s AS (INSERT INTO tenko_sessions ( \
                  tenant_id, employee_id, schedule_id, tenko_type, status, \
                  measurement_id, alcohol_result, alcohol_value, alcohol_tested_at, \
                  alcohol_face_photo_url, \
@@ -90,9 +90,8 @@ pub mod sql {
                  $19, $20, $21, $22, \
                  $23 \
              ) \
-             ON CONFLICT DO NOTHING \
-             RETURNING {}",
-            super::super::record::SESSION_COLUMNS
+             ON CONFLICT DO NOTHING{}",
+            super::super::record::RETURNING_SESSION
         )
     }
 

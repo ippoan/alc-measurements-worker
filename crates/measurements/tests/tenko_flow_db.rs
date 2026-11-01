@@ -100,6 +100,30 @@ async fn sess(
     if !extra.iter().any(|(c, _)| *c == "started_at") {
         extra.push(("started_at", "NOW()"));
     }
+    // 値 (体温・血圧) は値の置き場の測定に入れ、セッションはそれを指す (セッションの値の列は読まれない)
+    let (values, mut extra): (Vec<_>, Vec<_>) = extra
+        .into_iter()
+        .partition(|(c, _)| ["temperature", "systolic", "diastolic", "pulse"].contains(c));
+    if !values.is_empty() {
+        let cols: String = values.iter().map(|(c, _)| format!(", {c}")).collect();
+        let vals: String = values.iter().map(|(_, v)| format!(", {v}")).collect();
+        let mid: Uuid = admin()
+            .await
+            .query_one(
+                &format!(
+                    "INSERT INTO alc_api.measurements (tenant_id, employee_id, status{cols}) \
+                     VALUES ($1, $2, 'started'{vals}) RETURNING id"
+                ),
+                &[&t, &emp],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        extra.push((
+            "measurement_id",
+            Box::leak(format!("'{mid}'").into_boxed_str()),
+        ));
+    }
     let cols: String = extra.iter().map(|(c, _)| format!(", {c}")).collect();
     let vals: String = extra.iter().map(|(_, v)| format!(", {v}")).collect();
     admin()
@@ -378,6 +402,7 @@ async fn pre_operation_auto_flow_writes_record() {
         hash,
         &format!("{:x}", Sha256::digest(data.to_string().as_bytes()))
     );
+    support::assert_record_matches_copy(id.parse().unwrap()).await;
     assert!(events(&app).is_empty());
 }
 
@@ -2017,6 +2042,8 @@ async fn alcohol_detected_from_the_measurement() {
     let mut body = support::completed_body("over", "2026-10-22T21:58:00Z", false, None, None);
     body["alcohol_value"] = json!(0.25);
     body["tenko_session_id"] = json!(sid);
+    // キオスクのアルコールの保存は体温を送らない (alc-app の completedMeasurementFields)
+    body.as_object_mut().unwrap().remove("temperature");
     let r = support::put_measurement_ok(&app, t, &m, &body).await;
     let s = &r["tenko_session"];
     assert_eq!(
@@ -2027,6 +2054,7 @@ async fn alcohol_detected_from_the_measurement() {
     let recs = records(sid).await;
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].0, "cancelled");
+    support::assert_record_matches_copy(sid).await;
     let ev = events(&app);
     assert_eq!(ev.len(), 1);
     assert_eq!(ev[0].0, "alcohol_detected");

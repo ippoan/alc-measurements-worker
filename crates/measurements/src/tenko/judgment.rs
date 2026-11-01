@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use super::flow::{fetch, one, run, Arg, Flow, JUDGMENT_PENDING};
 use super::normal::TENKO_METHOD_IT;
-use super::record::{write_record, TenkoSession, SESSION_COLUMNS};
+use super::record::{write_record, TenkoSession, RETURNING_SESSION};
 use crate::AppState;
 
 /// 確認の方法: 通話で確認 (IT点呼 の判定)
@@ -50,19 +50,19 @@ pub mod sql {
 
     /// 判定待ちを閉じる。$1 judgment / $2 reason / $3 判定した人 / $4 確認の方法 / $5 id / $6 tenant_id
     pub const CLOSE: &str = concatcp!(
-        "UPDATE alc_api.tenko_sessions SET status = 'completed', completed_at = NOW(), manager_judgment = $1, \
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET status = 'completed', completed_at = NOW(), manager_judgment = $1, \
              manager_judgment_reason = $2, manager_judgment_by = $3, manager_judgment_method = $4, updated_at = NOW() \
-         WHERE id = $5 AND tenant_id = $6 RETURNING ",
-        SESSION_COLUMNS
+         WHERE id = $5 AND tenant_id = $6",
+        RETURNING_SESSION
     );
 
     /// 判定待ちを足す前の記録の判定 (列だけ)。確認の方法は省略時に既存の値を保つ (押し直しで OK / NG だけ直せるように)
     pub const MANAGER_JUDGMENT: &str = concatcp!(
-        "UPDATE alc_api.tenko_sessions SET manager_judgment = $1, manager_judgment_reason = $2, \
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET manager_judgment = $1, manager_judgment_reason = $2, \
              manager_judgment_by = $3, manager_judgment_method = COALESCE($4, manager_judgment_method), \
              updated_at = NOW() \
-         WHERE id = $5 AND tenant_id = $6 RETURNING ",
-        SESSION_COLUMNS
+         WHERE id = $5 AND tenant_id = $6",
+        RETURNING_SESSION
     );
 
     /// 判定が点呼の記録に入っているか。$1 session_id / $2 tenant_id

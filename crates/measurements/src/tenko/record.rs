@@ -80,18 +80,36 @@ pub struct TenkoSession {
 
 impl TxOutput for TenkoSession {}
 
-/// rust の `RETURNING *` / `SELECT *` の代わり。[`TenkoSession`] の欄の順 (Worker は位置で読む)
-pub const SESSION_COLUMNS: &str = "id, tenant_id, employee_id, schedule_id, tenko_type, tenko_method, status, \
-     identity_verified_at, identity_face_photo_url, measurement_id, alcohol_result, alcohol_value, \
-     alcohol_tested_at, alcohol_face_photo_url, temperature, systolic, diastolic, pulse, \
-     medical_measured_at, medical_manual_input, instruction_confirmed_at, report_vehicle_road_status, \
-     report_driver_alternation, report_no_report, report_vehicle_road_audio_url, \
-     report_driver_alternation_audio_url, report_submitted_at, location, responsible_manager_name, \
-     cancel_reason, interrupted_at, resumed_at, resume_reason, resumed_by_user_id, self_declaration, \
-     safety_judgment, daily_inspection, carrying_items_checked, started_at, completed_at, carins_cert_no, \
-     carins_vehicle_id, carins_expires_on, carins_matched_by, escalated_to_remote_at, \
-     remote_escalation_reason, manager_judgment, manager_judgment_reason, manager_judgment_by, \
-     manager_judgment_method, identity_method, created_at, updated_at";
+/// rust の `RETURNING *` / `SELECT *` の代わり。[`TenkoSession`] の欄の順 (Worker は位置で読む)。
+/// セッションは別名 `s`、値 (アルコール・体温・血圧) は [`MEASUREMENT_JOIN`] の測定 `m` から読む (値の置き場は測定。
+/// tenko-unify 段階 3)。アルコールの 4 欄は測定の `result` が入るまで NULL — 測定は点呼の開始で `started` (measured_at は
+/// 作った時刻) で在るので、素の値を出すとアルコールの段より前に測定時刻が入ってしまう
+pub const SESSION_COLUMNS: &str = "s.id, s.tenant_id, s.employee_id, s.schedule_id, s.tenko_type, s.tenko_method, \
+     s.status, s.identity_verified_at, s.identity_face_photo_url, s.measurement_id, m.result, \
+     CASE WHEN m.result IS NOT NULL THEN m.alcohol_level END, \
+     CASE WHEN m.result IS NOT NULL THEN m.measured_at END, \
+     CASE WHEN m.result IS NOT NULL THEN m.face_photo_url END, m.temperature, m.systolic, m.diastolic, m.pulse, \
+     m.medical_measured_at, m.medical_manual_input, s.instruction_confirmed_at, s.report_vehicle_road_status, \
+     s.report_driver_alternation, s.report_no_report, s.report_vehicle_road_audio_url, \
+     s.report_driver_alternation_audio_url, s.report_submitted_at, s.location, s.responsible_manager_name, \
+     s.cancel_reason, s.interrupted_at, s.resumed_at, s.resume_reason, s.resumed_by_user_id, s.self_declaration, \
+     s.safety_judgment, s.daily_inspection, s.carrying_items_checked, s.started_at, s.completed_at, \
+     s.carins_cert_no, s.carins_vehicle_id, s.carins_expires_on, s.carins_matched_by, s.escalated_to_remote_at, \
+     s.remote_escalation_reason, s.manager_judgment, s.manager_judgment_reason, s.manager_judgment_by, \
+     s.manager_judgment_method, s.identity_method, s.created_at, s.updated_at";
+
+/// セッション `s` が指す測定 `m` (無ければ値の欄は全部 NULL)
+pub const MEASUREMENT_JOIN: &str =
+    " LEFT JOIN alc_api.measurements m ON m.tenant_id = s.tenant_id AND m.id = s.measurement_id";
+
+/// 書き換えた行を [`SESSION_COLUMNS`] で返す。文を `WITH s AS (` で始め、`RETURNING` の代わりにこれで閉じる
+/// (`RETURNING` は測定を結合できないため)。測定は同じ transaction の前の文までの値で読む
+pub const RETURNING_SESSION: &str = const_format::concatcp!(
+    " RETURNING *) SELECT ",
+    SESSION_COLUMNS,
+    " FROM s",
+    MEASUREMENT_JOIN
+);
 
 impl TenkoSession {
     pub fn from_row(r: &Row) -> Self {
