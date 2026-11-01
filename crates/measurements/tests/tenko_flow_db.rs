@@ -204,17 +204,36 @@ async fn pre_operation_auto_flow_writes_record() {
         .unwrap()
         .get(0);
 
-    let got = send(
+    let got = send_h(
         &app,
         "POST",
         "/api/tenko/sessions/start",
         t,
+        &[("X-Device-Id", "kiosk-1")],
         Some(json!({ "schedule_id": sch, "employee_id": emp })),
     )
     .await;
     assert_eq!(got.status, 201);
     let s = got.json();
     let id = s["id"].as_str().unwrap().to_owned();
+    // 値の置き場の測定を作ってセッションから指す (started・乗務員と端末はセッションと同じ)
+    let mid: Uuid = s["measurement_id"].as_str().unwrap().parse().unwrap();
+    let m = admin()
+        .await
+        .query_one(
+            "SELECT status, employee_id, device_id FROM alc_api.measurements WHERE id = $1 AND tenant_id = $2",
+            &[&mid, &t],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            m.get::<_, String>(0),
+            m.get::<_, Uuid>(1),
+            m.get::<_, Option<String>>(2)
+        ),
+        ("started".to_owned(), emp, Some("kiosk-1".to_owned()))
+    );
     assert_eq!(
         (
             s["status"].clone(),
@@ -267,7 +286,30 @@ async fn pre_operation_auto_flow_writes_record() {
         Some(json!({ "temperature": 36.6, "systolic": 125, "diastolic": 82, "pulse": 70 })),
     )
     .await;
-    assert_eq!(med.json()["status"], "self_declaration_pending");
+    let med = med.json();
+    assert_eq!(med["status"], "self_declaration_pending");
+    // 体温・血圧は測定にも同じ値で入る
+    let v = admin()
+        .await
+        .query_one(
+            "SELECT temperature, systolic, diastolic, pulse, medical_measured_at::text, medical_manual_input \
+             FROM alc_api.measurements WHERE id = $1",
+            &[&mid],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            v.get::<_, Option<f64>>(0),
+            v.get::<_, Option<i32>>(1),
+            v.get::<_, Option<i32>>(2),
+            v.get::<_, Option<i32>>(3),
+            v.get::<_, Option<bool>>(5),
+        ),
+        (Some(36.6), Some(125), Some(82), Some(70), None)
+    );
+    assert!(v.get::<_, Option<String>>(4).is_some());
+    assert_eq!(med["measurement_id"], json!(mid));
 
     let decl = send(
         &app,

@@ -27,7 +27,7 @@ use alc_core_wasm::api_error::{bad_request, not_found, ApiError};
 use alc_core_wasm::{AuthUser, DeviceDevSlot, TenantId};
 use alc_worker_db::{PgClient, TenantTx, TxOutput};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 use super::fire::{Event, PendingFire};
 use super::record::{employee_name, record_or_log, TenkoSession, SESSION_COLUMNS};
-use crate::measurements::{DEFAULT_PAGE, DEFAULT_PER_PAGE, MAX_PER_PAGE};
+use crate::measurements::{device_id_from, DEFAULT_PAGE, DEFAULT_PER_PAGE, MAX_PER_PAGE};
 use crate::{set_device_dev, AppState};
 
 /// 型付きの文の値と型
@@ -246,12 +246,19 @@ pub mod sql {
         "UPDATE alc_api.tenko_schedules SET consumed_by_session_id = $1 \
          WHERE id = $2 AND tenant_id = $3";
 
+    /// 点呼の値の置き場の測定 (`POST /measurements/start` と同じ started の行)。$1 tenant_id / $2 employee_id /
+    /// $3 device_id → id
+    pub const START_MEASUREMENT: &str =
+        "INSERT INTO alc_api.measurements (tenant_id, employee_id, status, device_id) \
+         VALUES ($1, $2, 'started', $3) RETURNING id";
+
     /// $1 tenant_id / $2 employee_id / $3 schedule_id / $4 tenko_type / $5 tenko_method / $6 status /
-    /// $7 identity_face_photo_url / $8 location / $9 responsible_manager_name
+    /// $7 identity_face_photo_url / $8 location / $9 responsible_manager_name / $10 measurement_id
     pub const CREATE: &str = concatcp!(
         "INSERT INTO alc_api.tenko_sessions (tenant_id, employee_id, schedule_id, tenko_type, tenko_method, status, \
-             identity_verified_at, identity_face_photo_url, location, responsible_manager_name, started_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, NOW()) RETURNING ",
+             identity_verified_at, identity_face_photo_url, location, responsible_manager_name, started_at, \
+             measurement_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, NOW(), $10) RETURNING ",
         SESSION_COLUMNS
     );
 
@@ -265,6 +272,13 @@ pub mod sql {
          WHERE id = $7 AND tenant_id = $8 RETURNING ",
         SESSION_COLUMNS
     );
+
+    /// 体温・血圧の段の値を測定にも書く (セッションに入った後の値をそのまま)。$1 temperature / $2 systolic /
+    /// $3 diastolic / $4 pulse / $5 medical_measured_at / $6 medical_manual_input / $7 measurement_id / $8 tenant_id
+    pub const MEDICAL_TO_MEASUREMENT: &str =
+        "UPDATE alc_api.measurements SET temperature = $1, systolic = $2, diastolic = $3, pulse = $4, \
+             medical_measured_at = $5, medical_manual_input = $6, updated_at = NOW() \
+         WHERE id = $7 AND tenant_id = $8";
 
     /// $1 status (完了か判定待ち)。completed_at は完了のときだけ (判定待ちは判定で入る)
     pub const CONFIRM_INSTRUCTION: &str = concatcp!(
@@ -742,8 +756,10 @@ async fn start_handler(
     State(state): State<AppState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
     Extension(dev): Extension<DeviceDevSlot>,
+    headers: HeaderMap,
     Json(body): Json<StartSession>,
 ) -> Response {
+    let device_id = device_id_from(&headers, &state.log);
     let resp = run(
         state,
         tenant_id,
@@ -788,6 +804,19 @@ async fn start_handler(
                 } else {
                     "identity_verified"
                 };
+                // 点呼の値 (体温・血圧・アルコール) の置き場の測定を先に作り、セッションから指す。キオスクはこの id で
+                // アルコールを保存し、端末の生の記録にも載せる
+                let measurement_id: Uuid = tx
+                    .query_typed_one(
+                        sql::START_MEASUREMENT,
+                        &[
+                            (&tenant_id, Type::UUID),
+                            (&body.employee_id, Type::UUID),
+                            (&device_id, Type::TEXT),
+                        ],
+                    )
+                    .await?
+                    .get(0);
                 let s = one(
                     tx,
                     sql::CREATE,
@@ -801,6 +830,7 @@ async fn start_handler(
                         (&body.identity_face_photo_url, Type::TEXT),
                         (&body.location, Type::TEXT),
                         (&manager, Type::TEXT),
+                        (&measurement_id, Type::UUID),
                     ],
                 )
                 .await?;
@@ -885,6 +915,23 @@ async fn medical_handler(
                     ],
                 )
                 .await?;
+                // 値の置き場の測定にも同じ値を書く (測定を持たない古いセッションは今まで通りセッションだけ)
+                if let Some(mid) = s.measurement_id {
+                    tx.execute_typed(
+                        sql::MEDICAL_TO_MEASUREMENT,
+                        &[
+                            (&s.temperature, Type::FLOAT8),
+                            (&s.systolic, Type::INT4),
+                            (&s.diastolic, Type::INT4),
+                            (&s.pulse, Type::INT4),
+                            (&s.medical_measured_at, Type::TIMESTAMPTZ),
+                            (&s.medical_manual_input, Type::BOOL),
+                            (&mid, Type::UUID),
+                            (&tenant_id, Type::UUID),
+                        ],
+                    )
+                    .await?;
+                }
                 Ok(Flow::Session(Box::new(s), None))
             })
         },
