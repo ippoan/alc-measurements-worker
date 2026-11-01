@@ -1023,3 +1023,41 @@ pub fn cols(
         matched_by.map(str::to_string),
     )
 }
+
+/// セッションの値の列 (測定の写し) で組んだ行の列の順 (値を測定から読む前の `SESSION_COLUMNS`)。写しを書くのをやめるまでの
+/// 突き合わせ ([`assert_record_matches_copy`]) だけに使う
+const SESSION_COPY_COLUMNS: &str = "id, tenant_id, employee_id, schedule_id, tenko_type, tenko_method, status, \
+     identity_verified_at, identity_face_photo_url, measurement_id, alcohol_result, alcohol_value, \
+     alcohol_tested_at, alcohol_face_photo_url, temperature, systolic, diastolic, pulse, \
+     medical_measured_at, medical_manual_input, instruction_confirmed_at, report_vehicle_road_status, \
+     report_driver_alternation, report_no_report, report_vehicle_road_audio_url, \
+     report_driver_alternation_audio_url, report_submitted_at, location, responsible_manager_name, \
+     cancel_reason, interrupted_at, resumed_at, resume_reason, resumed_by_user_id, self_declaration, \
+     safety_judgment, daily_inspection, carrying_items_checked, started_at, completed_at, carins_cert_no, \
+     carins_vehicle_id, carins_expires_on, carins_matched_by, escalated_to_remote_at, \
+     remote_escalation_reason, manager_judgment, manager_judgment_reason, manager_judgment_by, \
+     manager_judgment_method, identity_method, created_at, updated_at";
+
+/// 値を測定から読んで書いた記録が、セッションの値の列 (写し) から組んだ記録と同じ (record_data・record_hash とも)。
+/// 記録の hash は作り方を変えられないので、読み口を測定に移しても前後で一致することをここで確かめる
+pub async fn assert_record_matches_copy(session_id: Uuid) {
+    let su = admin().await;
+    let row = su
+        .query_one(
+            &format!("SELECT {SESSION_COPY_COLUMNS} FROM alc_api.tenko_sessions WHERE id = $1"),
+            &[&session_id],
+        )
+        .await
+        .unwrap();
+    let (data, hash) =
+        measurements::tenko::record_payload(&measurements::tenko::TenkoSession::from_row(&row));
+    let rec = su
+        .query_one(
+            "SELECT record_data, record_hash FROM alc_api.tenko_records WHERE session_id = $1",
+            &[&session_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rec.get::<_, serde_json::Value>(0), data);
+    assert_eq!(rec.get::<_, String>(1), hash);
+}

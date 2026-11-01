@@ -40,7 +40,10 @@ use tokio_postgres::{Error, Row};
 use uuid::Uuid;
 
 use super::fire::{Event, PendingFire};
-use super::record::{employee_name, record_or_log, TenkoSession, SESSION_COLUMNS};
+use super::record::{
+    employee_name, record_or_log, TenkoSession, MEASUREMENT_JOIN, RETURNING_SESSION,
+    SESSION_COLUMNS,
+};
 use crate::measurements::{device_id_from, DEFAULT_PAGE, DEFAULT_PER_PAGE, MAX_PER_PAGE};
 use crate::{set_device_dev, AppState};
 
@@ -203,32 +206,40 @@ pub mod sql {
     pub const GET: &str = concatcp!(
         "SELECT ",
         SESSION_COLUMNS,
-        " FROM alc_api.tenko_sessions WHERE id = $1 AND tenant_id = $2"
+        " FROM alc_api.tenko_sessions s",
+        MEASUREMENT_JOIN,
+        " WHERE s.id = $1 AND s.tenant_id = $2"
     );
 
-    /// 段を進める前の 1 件 (同じ transaction の中で行を押さえる)
-    pub const GET_FOR_UPDATE: &str = concatcp!(GET, " FOR UPDATE");
+    /// 段を進める前の 1 件 (同じ transaction の中で行を押さえる。押さえるのはセッションだけ — 外部結合の測定の側は
+    /// `FOR UPDATE` を掛けられない)
+    pub const GET_FOR_UPDATE: &str = concatcp!(GET, " FOR UPDATE OF s");
 
     /// 一覧の絞り込み。$1 tenant_id / $2 employee_id / $3 status / $4 tenko_type / $5 tenko_method /
-    /// $6 judgment_pending (true のときだけ未判定に絞る) / $7 date_from / $8 date_to
-    pub const WHERE: &str = "tenant_id = $1 \
-         AND ($2::uuid IS NULL OR employee_id = $2) \
-         AND ($3::text IS NULL OR status = $3) \
-         AND ($4::text IS NULL OR tenko_type = $4) \
-         AND ($5::text IS NULL OR tenko_method = $5) \
-         AND ($6::bool IS NOT TRUE OR manager_judgment IS NULL) \
-         AND ($7::timestamptz IS NULL OR started_at >= $7) \
-         AND ($8::timestamptz IS NULL OR started_at <= $8)";
+    /// $6 judgment_pending (true のときだけ未判定に絞る) / $7 date_from / $8 date_to。セッションの別名は `s`
+    pub const WHERE: &str = "s.tenant_id = $1 \
+         AND ($2::uuid IS NULL OR s.employee_id = $2) \
+         AND ($3::text IS NULL OR s.status = $3) \
+         AND ($4::text IS NULL OR s.tenko_type = $4) \
+         AND ($5::text IS NULL OR s.tenko_method = $5) \
+         AND ($6::bool IS NOT TRUE OR s.manager_judgment IS NULL) \
+         AND ($7::timestamptz IS NULL OR s.started_at >= $7) \
+         AND ($8::timestamptz IS NULL OR s.started_at <= $8)";
 
-    pub const COUNT: &str = concatcp!("SELECT COUNT(*) FROM alc_api.tenko_sessions WHERE ", WHERE);
+    pub const COUNT: &str = concatcp!(
+        "SELECT COUNT(*) FROM alc_api.tenko_sessions s WHERE ",
+        WHERE
+    );
 
     /// $9 件数 / $10 飛ばす件数
     pub const LIST: &str = concatcp!(
         "SELECT ",
         SESSION_COLUMNS,
-        " FROM alc_api.tenko_sessions WHERE ",
+        " FROM alc_api.tenko_sessions s",
+        MEASUREMENT_JOIN,
+        " WHERE ",
         WHERE,
-        " ORDER BY created_at DESC LIMIT $9 OFFSET $10"
+        " ORDER BY s.created_at DESC LIMIT $9 OFFSET $10"
     );
 
     /// 未消費の予定。$1 id / $2 tenant_id → employee_id, tenko_type, responsible_manager_name
@@ -255,108 +266,114 @@ pub mod sql {
     /// $1 tenant_id / $2 employee_id / $3 schedule_id / $4 tenko_type / $5 tenko_method / $6 status /
     /// $7 identity_face_photo_url / $8 location / $9 responsible_manager_name / $10 measurement_id
     pub const CREATE: &str = concatcp!(
-        "INSERT INTO alc_api.tenko_sessions (tenant_id, employee_id, schedule_id, tenko_type, tenko_method, status, \
+        "WITH s AS (INSERT INTO alc_api.tenko_sessions (tenant_id, employee_id, schedule_id, tenko_type, tenko_method, status, \
              identity_verified_at, identity_face_photo_url, location, responsible_manager_name, started_at, \
              measurement_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, NOW(), $10) RETURNING ",
-        SESSION_COLUMNS
+         VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, NOW(), $10)",
+        RETURNING_SESSION
     );
 
     /// 以下の更新は $(最後の 2 つ) = id / tenant_id。行が無ければ 0 行 (rust は `fetch_one` で 500 だった。下の口は
     /// 直前に同じ transaction で読んでいるので起きない)
     pub const UPDATE_MEDICAL: &str = concatcp!(
-        "UPDATE alc_api.tenko_sessions SET status = 'self_declaration_pending', \
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET status = 'self_declaration_pending', \
              temperature = COALESCE($1, temperature), systolic = COALESCE($2, systolic), \
              diastolic = COALESCE($3, diastolic), pulse = COALESCE($4, pulse), \
              medical_measured_at = COALESCE($5, NOW()), medical_manual_input = $6, updated_at = NOW() \
-         WHERE id = $7 AND tenant_id = $8 RETURNING ",
-        SESSION_COLUMNS
+         WHERE id = $7 AND tenant_id = $8",
+        RETURNING_SESSION
     );
 
-    /// 体温・血圧の段の値を測定にも書く (セッションに入った後の値をそのまま)。$1 temperature / $2 systolic /
-    /// $3 diastolic / $4 pulse / $5 medical_measured_at / $6 medical_manual_input / $7 measurement_id / $8 tenant_id
+    /// 体温・血圧の段の値を値の置き場の測定に書く (セッションの [`UPDATE_MEDICAL`] と同じ規則。セッションを更新する前に流し、
+    /// セッションの応答は測定から読む)。$1 temperature / $2 systolic / $3 diastolic / $4 pulse / $5 medical_measured_at /
+    /// $6 medical_manual_input / $7 measurement_id / $8 tenant_id
     pub const MEDICAL_TO_MEASUREMENT: &str =
-        "UPDATE alc_api.measurements SET temperature = $1, systolic = $2, diastolic = $3, pulse = $4, \
-             medical_measured_at = $5, medical_manual_input = $6, updated_at = NOW() \
+        "UPDATE alc_api.measurements SET temperature = COALESCE($1, temperature), systolic = COALESCE($2, systolic), \
+             diastolic = COALESCE($3, diastolic), pulse = COALESCE($4, pulse), \
+             medical_measured_at = COALESCE($5, NOW()), medical_manual_input = $6, updated_at = NOW() \
          WHERE id = $7 AND tenant_id = $8";
+
+    /// 測定を持たないセッション (段階 2 より前に始まったもの) を測定に結ぶ。$1 measurement_id / $2 id / $3 tenant_id
+    pub const SET_MEASUREMENT: &str = "UPDATE alc_api.tenko_sessions SET measurement_id = $1 \
+         WHERE id = $2 AND tenant_id = $3 AND measurement_id IS NULL";
 
     /// $1 status (完了か判定待ち)。completed_at は完了のときだけ (判定待ちは判定で入る)
     pub const CONFIRM_INSTRUCTION: &str = concatcp!(
-        "UPDATE alc_api.tenko_sessions SET status = $1, instruction_confirmed_at = NOW(), \
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET status = $1, instruction_confirmed_at = NOW(), \
              completed_at = CASE WHEN $1 = 'completed' THEN NOW() END, updated_at = NOW() \
-         WHERE id = $2 AND tenant_id = $3 RETURNING ",
-        SESSION_COLUMNS
+         WHERE id = $2 AND tenant_id = $3",
+        RETURNING_SESSION
     );
 
     pub const UPDATE_REPORT: &str = concatcp!(
-        "UPDATE alc_api.tenko_sessions SET status = $1, report_vehicle_road_status = $2, \
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET status = $1, report_vehicle_road_status = $2, \
              report_driver_alternation = $3, report_vehicle_road_audio_url = $4, \
              report_driver_alternation_audio_url = $5, report_submitted_at = NOW(), completed_at = $6, updated_at = NOW() \
-         WHERE id = $7 AND tenant_id = $8 RETURNING ",
-        SESSION_COLUMNS
+         WHERE id = $7 AND tenant_id = $8",
+        RETURNING_SESSION
     );
 
     pub const CANCEL: &str = concatcp!(
-        "UPDATE alc_api.tenko_sessions SET status = 'cancelled', cancel_reason = $1, completed_at = NOW(), \
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET status = 'cancelled', cancel_reason = $1, completed_at = NOW(), \
              updated_at = NOW() \
-         WHERE id = $2 AND tenant_id = $3 RETURNING ",
-        SESSION_COLUMNS
+         WHERE id = $2 AND tenant_id = $3",
+        RETURNING_SESSION
     );
 
     pub const UPDATE_SELF_DECLARATION: &str = concatcp!(
-        "UPDATE alc_api.tenko_sessions SET self_declaration = $1, updated_at = NOW() \
-         WHERE id = $2 AND tenant_id = $3 RETURNING ",
-        SESSION_COLUMNS
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET self_declaration = $1, updated_at = NOW() \
+         WHERE id = $2 AND tenant_id = $3",
+        RETURNING_SESSION
     );
 
     pub const UPDATE_SAFETY_JUDGMENT: &str = concatcp!(
-        "UPDATE alc_api.tenko_sessions SET status = $1, safety_judgment = $2, \
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET status = $1, safety_judgment = $2, \
              interrupted_at = COALESCE($3, interrupted_at), updated_at = NOW() \
-         WHERE id = $4 AND tenant_id = $5 RETURNING ",
-        SESSION_COLUMNS
+         WHERE id = $4 AND tenant_id = $5",
+        RETURNING_SESSION
     );
 
     pub const UPDATE_DAILY_INSPECTION: &str = concatcp!(
-        "UPDATE alc_api.tenko_sessions SET status = $1, daily_inspection = $2, \
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET status = $1, daily_inspection = $2, \
              cancel_reason = COALESCE($3, cancel_reason), completed_at = COALESCE($4, completed_at), updated_at = NOW() \
-         WHERE id = $5 AND tenant_id = $6 RETURNING ",
-        SESSION_COLUMNS
+         WHERE id = $5 AND tenant_id = $6",
+        RETURNING_SESSION
     );
 
     pub const UPDATE_CARRYING_ITEMS: &str = concatcp!(
-        "UPDATE alc_api.tenko_sessions SET status = 'identity_verified', carrying_items_checked = $1, \
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET status = 'identity_verified', carrying_items_checked = $1, \
              updated_at = NOW() \
-         WHERE id = $2 AND tenant_id = $3 RETURNING ",
-        SESSION_COLUMNS
+         WHERE id = $2 AND tenant_id = $3",
+        RETURNING_SESSION
     );
 
     pub const INTERRUPT: &str = concatcp!(
-        "UPDATE alc_api.tenko_sessions SET status = 'interrupted', interrupted_at = NOW(), \
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET status = 'interrupted', interrupted_at = NOW(), \
              cancel_reason = COALESCE($1, cancel_reason), updated_at = NOW() \
-         WHERE id = $2 AND tenant_id = $3 RETURNING ",
-        SESSION_COLUMNS
+         WHERE id = $2 AND tenant_id = $3",
+        RETURNING_SESSION
     );
 
     pub const RESUME: &str = concatcp!(
-        "UPDATE alc_api.tenko_sessions SET status = $1, resumed_at = NOW(), resume_reason = $2, \
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET status = $1, resumed_at = NOW(), resume_reason = $2, \
              resumed_by_user_id = $3, updated_at = NOW() \
-         WHERE id = $4 AND tenant_id = $5 RETURNING ",
-        SESSION_COLUMNS
+         WHERE id = $4 AND tenant_id = $5",
+        RETURNING_SESSION
     );
 
     /// 「再開は 1 回まで」を WHERE の `resumed_at IS NULL` で担保する (2 回目は 0 行)
     pub const SELF_RESUME: &str = concatcp!(
-        "UPDATE alc_api.tenko_sessions SET resumed_at = NOW(), resume_reason = $1, resumed_by_user_id = $2, \
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET resumed_at = NOW(), resume_reason = $1, resumed_by_user_id = $2, \
              updated_at = NOW() \
-         WHERE id = $3 AND tenant_id = $4 AND resumed_at IS NULL RETURNING ",
-        SESSION_COLUMNS
+         WHERE id = $3 AND tenant_id = $4 AND resumed_at IS NULL",
+        RETURNING_SESSION
     );
 
     pub const ESCALATE: &str = concatcp!(
-        "UPDATE alc_api.tenko_sessions SET tenko_method = '遠隔点呼', escalated_to_remote_at = NOW(), \
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET tenko_method = '遠隔点呼', escalated_to_remote_at = NOW(), \
              remote_escalation_reason = $1, updated_at = NOW() \
-         WHERE id = $2 AND tenant_id = $3 RETURNING ",
-        SESSION_COLUMNS
+         WHERE id = $2 AND tenant_id = $3",
+        RETURNING_SESSION
     );
 
     /// $1 tenant_id / $2 employee_id
@@ -900,6 +917,50 @@ async fn medical_handler(
                 {
                     return Ok(Flow::Api(bad_request("bp_required", BP_REQUIRED_MESSAGE)));
                 }
+                // 値の置き場の測定に先に書く (セッションの応答はその測定から読む)。測定を持たない古いセッションは、
+                // 開始の口と同じ started の測定を作って結ぶ
+                let mid: Uuid = match cur.measurement_id {
+                    Some(mid) => mid,
+                    None => {
+                        let device: Option<String> = None;
+                        let mid: Uuid = tx
+                            .query_typed_one(
+                                sql::START_MEASUREMENT,
+                                &[
+                                    (&tenant_id, Type::UUID),
+                                    (&cur.employee_id, Type::UUID),
+                                    (&device, Type::TEXT),
+                                ],
+                            )
+                            .await?
+                            .get(0);
+                        tx.execute_typed(
+                            sql::SET_MEASUREMENT,
+                            &[
+                                (&mid, Type::UUID),
+                                (&id, Type::UUID),
+                                (&tenant_id, Type::UUID),
+                            ],
+                        )
+                        .await?;
+                        mid
+                    }
+                };
+                tx.execute_typed(
+                    sql::MEDICAL_TO_MEASUREMENT,
+                    &[
+                        (&body.temperature, Type::FLOAT8),
+                        (&body.systolic, Type::INT4),
+                        (&body.diastolic, Type::INT4),
+                        (&body.pulse, Type::INT4),
+                        (&body.medical_measured_at, Type::TIMESTAMPTZ),
+                        (&body.medical_manual_input, Type::BOOL),
+                        (&mid, Type::UUID),
+                        (&tenant_id, Type::UUID),
+                    ],
+                )
+                .await?;
+                // セッションの値の列への写し (読む側は測定に移った。写しは段階 3 の次の PR でやめる)
                 let s = one(
                     tx,
                     sql::UPDATE_MEDICAL,
@@ -915,23 +976,6 @@ async fn medical_handler(
                     ],
                 )
                 .await?;
-                // 値の置き場の測定にも同じ値を書く (測定を持たない古いセッションは今まで通りセッションだけ)
-                if let Some(mid) = s.measurement_id {
-                    tx.execute_typed(
-                        sql::MEDICAL_TO_MEASUREMENT,
-                        &[
-                            (&s.temperature, Type::FLOAT8),
-                            (&s.systolic, Type::INT4),
-                            (&s.diastolic, Type::INT4),
-                            (&s.pulse, Type::INT4),
-                            (&s.medical_measured_at, Type::TIMESTAMPTZ),
-                            (&s.medical_manual_input, Type::BOOL),
-                            (&mid, Type::UUID),
-                            (&tenant_id, Type::UUID),
-                        ],
-                    )
-                    .await?;
-                }
                 Ok(Flow::Session(Box::new(s), None))
             })
         },

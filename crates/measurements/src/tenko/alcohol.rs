@@ -20,7 +20,7 @@ use super::fire::Event;
 use super::flow::{fetch, one};
 use super::record::{
     employee_name, in_savepoint, record_or_log, status_for_result, Savepoint, TenkoSession,
-    SESSION_COLUMNS,
+    RETURNING_SESSION,
 };
 use crate::models::Measurement;
 use crate::LogSink;
@@ -41,12 +41,23 @@ pub mod sql {
     /// $1 status / $2 measurement_id / $3 alcohol_result / $4 alcohol_value / $5 alcohol_face_photo_url /
     /// $6 cancel_reason / $7 completed_at / $8 alcohol_tested_at (測定時刻) / $9 id / $10 tenant_id
     pub const UPDATE_ALCOHOL: &str = concatcp!(
-        "UPDATE alc_api.tenko_sessions SET status = $1, measurement_id = $2, alcohol_result = $3, alcohol_value = $4, \
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET status = $1, measurement_id = $2, alcohol_result = $3, alcohol_value = $4, \
              alcohol_tested_at = $8, alcohol_face_photo_url = $5, cancel_reason = $6, completed_at = $7, \
              updated_at = NOW() \
-         WHERE id = $9 AND tenant_id = $10 RETURNING ",
-        SESSION_COLUMNS
+         WHERE id = $9 AND tenant_id = $10",
+        RETURNING_SESSION
     );
+
+    /// アルコールの保存がセッションの測定とは別の測定で来たとき (測り直し・古いキオスク)、前の測定の体温・血圧を新しい測定へ
+    /// 写す (段で判定に使った値で上書き)。前の測定で体温・血圧の段を通っていなければ何もしない。
+    /// $1 新しい測定 / $2 前の測定 / $3 tenant_id
+    pub const CARRY_MEDICAL: &str = "UPDATE alc_api.measurements n SET temperature = o.temperature, \
+             systolic = o.systolic, diastolic = o.diastolic, pulse = o.pulse, \
+             medical_measured_at = o.medical_measured_at, medical_manual_input = o.medical_manual_input, \
+             updated_at = NOW() \
+         FROM alc_api.measurements o \
+         WHERE n.id = $1 AND n.tenant_id = $3 AND o.id = $2 AND o.tenant_id = $3 \
+           AND o.medical_measured_at IS NOT NULL";
 }
 
 /// アルコールの段の次 (検知なら中止。業務前は指示の確認、業務後は運行報告)。種別が業務前・業務後でなければ `None`
@@ -79,6 +90,18 @@ async fn apply(
     let cancel_reason = judged.and_then(|(_, r)| r).map(str::to_owned);
     let is_fail = next == "cancelled";
     let completed_at = is_fail.then_some(at);
+    // 値の置き場はセッションが指す測定 1 つ。付け替える前に、前の測定の体温・血圧を新しい測定へ揃える
+    if let Some(prev) = cur.measurement_id.filter(|p| *p != measurement_id) {
+        tx.execute_typed(
+            sql::CARRY_MEDICAL,
+            &[
+                (&measurement_id, Type::UUID),
+                (&prev, Type::UUID),
+                (&cur.tenant_id, Type::UUID),
+            ],
+        )
+        .await?;
+    }
     let s = one(
         tx,
         sql::UPDATE_ALCOHOL,

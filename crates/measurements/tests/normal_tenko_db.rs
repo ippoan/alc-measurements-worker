@@ -66,6 +66,7 @@ async fn test_normal_measurement_creates_tenko_session_and_record() {
         Some(rec.get::<_, Uuid>(7).to_string()),
         "record_data はセッションの JSON"
     );
+    support::assert_record_matches_copy(rec.get(7)).await;
 }
 
 #[tokio::test]
