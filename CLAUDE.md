@@ -95,6 +95,13 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
   規則 (`TenkoSession`・`SESSION_COLUMNS`・`status_for_result`・`record_payload`・`write_record`・`in_savepoint`) は `tenko/record.rs` の 1 か所。
   通常点呼・IT点呼 = `tenko/normal.rs`、自動点呼・遠隔点呼の段 = `tenko/flow.rs`、アルコールの段 = `tenko/alcohol.rs`、判定 = `tenko/judgment.rs`。
   record_data・record_hash の作り方を変えない。serde_json に `preserve_order` を付けない (record_data の key の順 = hash が変わる)。
+- 自己点検表の不足 (alc-migrations 204): 点呼セッションに `vehicle_number`・`vehicle_number_source` (carins/schedule/manual)・`resumed_by_name`・
+  `alternative_measure` (record_data にも入る)。`PUT /api/tenko/sessions/{id}/vehicle` (車検証の管理番号が car_inspection に一致すれば登録番号
+  `CarNo` = carins、無ければ入力値で予定と同じなら schedule・違えば manual、どちらも無ければ 400。`carins.rs` の `CarinsLookup.car_no` は
+  この口だけが使う)。開始は予定の `vehicle_number` を写す。測定の有効時間 (`employee_health_baselines.measurement_validity_minutes`、無ければ 30 分):
+  `PUT …/medical` は過ぎた測定を 400 `measurement_expired`、再開・自己再開・携行品(無ければ日常点検)の後のアルコールの段の直前は、アルコール未測定で
+  過ぎていれば `medical_pending` へ戻す。`self-resume` は管理者が再開済みでも受け、再開の時刻・理由・管理者を上書きしない。`resume` は
+  `resumed_by_name` 必須 (運行管理者の鍵。ログインは省略時に名前、空ならメール — kit の復元は name を空で入れる)。`cancel`・`ng` 判定は `alternative_measure`。
 - 点呼の記録は内側の区切り (`SAVEPOINT`。名前は定数) で作り、失敗しても測定の保存・段の更新は残す。例外は判定: 記録が書けなければ判定ごと 500。
 - アルコールの段は測定の保存 (`PUT /measurements/{id}` の `tenko_session_id`) で**測定の行の値から**進める。アルコールの結果を本文で受ける
   段の口 (`PUT …/alcohol`) は消した (足し直さない)。
@@ -102,6 +109,6 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
   検知 (中止) は判定を待たずに閉じて記録する。
 - 点呼の webhook は送らない: `PendingFire` を応答の extension に入れ、`src/lib.rs` が `wait_until` で alc-tenko-worker の
   `/internal/webhooks/fire` へ渡す (Service Binding `ALC_TENKO`。本番 `alc-tenko`・staging `alc-tenko-staging`)。dev の要求は渡さない。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 44・api_db 10・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 17・bp_settings_db 18・upload_db 2・tenko_flow_db 15) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 45・api_db 10・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 17・bp_settings_db 18・upload_db 2・tenko_flow_db 19) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・Hyperdrive の設定の ID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-trouble-worker と同じ rev)。

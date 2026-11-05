@@ -2,6 +2,7 @@
 //! `repository/car_inspections.rs` (`normalize_carins_numbers`) と `repo/car_inspections.rs` (`lookup_expiry`) の写し。
 //! kit (`alc-core-wasm`) に同じものが無いのでここに写す。照合の SQL を変えたら rust の `LOOKUP_SQL` も揃える
 //! (rust の kiosk の照合口が同じ SQL を使う)。
+//! 自動点呼の車両番号の口 (`PUT /tenko/sessions/{id}/vehicle`) は登録番号 (`car_no`) も読む。通常点呼の経路は `car_no` を使わない。
 
 use alc_worker_db::TenantTx;
 use chrono::NaiveDate;
@@ -38,14 +39,15 @@ pub fn normalize_carins_numbers(
     })
 }
 
-/// 電子車検証の番号で car_inspection を照合した結果 (rust の `CarinsLookup` から、kiosk の照合口だけが使う
-/// 登録番号 `car_no` を除いたもの)
+/// 電子車検証の番号で car_inspection を照合した結果 (rust の `CarinsLookup`)。`car_no` は自動点呼の車両番号の口だけが使う
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CarinsLookup {
     /// 2 次元コードの有効期限。形の崩れた値は None
     pub expires_on: Option<NaiveDate>,
     /// `cert_no` (管理番号で一致) / `car_id` (車両 ID で一致) / `none` (該当なし)
     pub matched_by: &'static str,
+    /// 一致した行の登録番号 (自動車登録番号。該当なしは None)
+    pub car_no: Option<String>,
 }
 
 /// 元号 → 西暦のオフセット表 (元号の和暦年 + オフセット = 西暦年)。rust の `ERA_OFFSETS` と同じ
@@ -53,7 +55,7 @@ pub const ERA_OFFSETS: &[(&str, i32)] = &[("令和", 2018), ("平成", 1988)];
 
 /// 管理番号か車両 ID のどちらかで一致する行のうち、期限の最も新しい 1 行を引く (rust の `LOOKUP_SQL` と同じ。
 /// 期限の決め方・並び・`matched_by` の判定は rust の doc を参照)。
-/// rust との違いは 2 つだけ: kiosk 用の `car_no` を読まないことと、RLS に加えて WHERE に `tenant_id = $5` を書くこと
+/// rust との違いは 1 つだけ: RLS に加えて WHERE に `tenant_id = $5` を書くこと
 pub const LOOKUP_SQL: &str = r#"
 WITH era_map(era, offset_year) AS (
     SELECT * FROM unnest($3::text[], $4::int[])
@@ -67,7 +69,8 @@ SELECT
             THEN to_date('20' || ci."TwodimensionCodeInfoValidPeriodExpirdate", 'YYYYMMDD')
         END,
         wareki.expires_on
-    ) AS expires_on
+    ) AS expires_on,
+    ci."CarNo" AS car_no
 FROM car_inspection ci
 LEFT JOIN LATERAL (
     -- 和暦 4 列から期限を組み立てる。to_date / make_date が例外を投げないよう、
@@ -136,10 +139,12 @@ pub async fn lookup_expiry(
             } else {
                 "car_id"
             },
+            car_no: Some(r.get(2)),
         },
         None => CarinsLookup {
             expires_on: None,
             matched_by: "none",
+            car_no: None,
         },
     })
 }

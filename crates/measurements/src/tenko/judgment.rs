@@ -25,7 +25,7 @@ use tokio_postgres::types::Type;
 use uuid::Uuid;
 
 use super::flow::{
-    beyond_prod_manager, fetch, one, prod_manager_key, run, Arg, Flow, JUDGMENT_PENDING,
+    beyond_prod_manager, clean, fetch, one, prod_manager_key, run, Arg, Flow, JUDGMENT_PENDING,
 };
 use super::normal::TENKO_METHOD_IT;
 use super::record::{write_record, TenkoSession, RETURNING_SESSION};
@@ -45,15 +45,20 @@ pub struct ManagerJudgment {
     pub judged_by_employee_id: Uuid,
     #[serde(default)]
     pub method: Option<String>,
+    /// 運行に従事できない (`ng`) とした場合の代替措置 (自己点検表 業務前 二十 タ。`ok` では保存しない)
+    #[serde(default)]
+    pub alternative_measure: Option<String>,
 }
 
 pub mod sql {
     use super::*;
 
-    /// 判定待ちを閉じる。$1 judgment / $2 reason / $3 判定した人 / $4 確認の方法 / $5 id / $6 tenant_id
+    /// 判定待ちを閉じる。$1 judgment / $2 reason / $3 判定した人 / $4 確認の方法 / $5 id / $6 tenant_id /
+    /// $7 代替措置 (無ければ既存の値を保つ)
     pub const CLOSE: &str = concatcp!(
         "WITH s AS (UPDATE alc_api.tenko_sessions SET status = 'completed', completed_at = NOW(), manager_judgment = $1, \
-             manager_judgment_reason = $2, manager_judgment_by = $3, manager_judgment_method = $4, updated_at = NOW() \
+             manager_judgment_reason = $2, manager_judgment_by = $3, manager_judgment_method = $4, \
+             alternative_measure = COALESCE($7, alternative_measure), updated_at = NOW() \
          WHERE id = $5 AND tenant_id = $6",
         RETURNING_SESSION
     );
@@ -62,7 +67,7 @@ pub mod sql {
     pub const MANAGER_JUDGMENT: &str = concatcp!(
         "WITH s AS (UPDATE alc_api.tenko_sessions SET manager_judgment = $1, manager_judgment_reason = $2, \
              manager_judgment_by = $3, manager_judgment_method = COALESCE($4, manager_judgment_method), \
-             updated_at = NOW() \
+             alternative_measure = COALESCE($7, alternative_measure), updated_at = NOW() \
          WHERE id = $5 AND tenant_id = $6",
         RETURNING_SESSION
     );
@@ -143,13 +148,20 @@ async fn judgment_handler(
                 if !judgment_method_acceptable(&cur, method) {
                     return Ok(StatusCode::BAD_REQUEST.into());
                 }
-                let args: [Arg; 6] = [
+                // 代替措置は従事できない (ng) 判定のときだけ保存する
+                let alternative_measure = if body.judgment == "ng" {
+                    clean(body.alternative_measure.as_deref())
+                } else {
+                    None
+                };
+                let args: [Arg; 7] = [
                     (&body.judgment, Type::TEXT),
                     (&body.reason, Type::TEXT),
                     (&body.judged_by_employee_id, Type::UUID),
                     (&body.method, Type::TEXT),
                     (&id, Type::UUID),
                     (&tenant_id, Type::UUID),
+                    (&alternative_measure, Type::TEXT),
                 ];
                 if cur.status == JUDGMENT_PENDING {
                     // 閉じて記録を書く (記録が書けなければ判定ごと戻す)
