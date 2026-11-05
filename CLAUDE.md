@@ -102,7 +102,13 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
   `PUT …/medical` は過ぎた測定を 400 `measurement_expired`、再開・自己再開・携行品(無ければ日常点検)の後のアルコールの段の直前は、アルコール未測定で
   過ぎていれば `medical_pending` へ戻す。`self-resume` は管理者が再開済みでも受け、再開の時刻・理由・管理者を上書きしない。`resume` は
   `resumed_by_name` 必須 (運行管理者の鍵。ログインは省略時に名前、空ならメール — kit の復元は name を空で入れる)。`cancel`・`ng` 判定は `alternative_measure`。
-- 点呼の記録は内側の区切り (`SAVEPOINT`。名前は定数) で作り、失敗しても測定の保存・段の更新は残す。例外は判定: 記録が書けなければ判定ごと 500。
+- 点呼の記録は内側の区切り (`SAVEPOINT`。名前は定数) で作る。**段を閉じる口 (指示の確認・運行報告・取り消し・安全判定の中断・
+  日常点検 NG) は記録が書けなければ閉じない** (`record::close_with_record`: 更新ごと区切りまで戻し、機器故障
+  `measurement_recording_failed` を残して 500 `record_failed`)。判定は記録が書けなければ判定ごと 500。例外はアルコール検知 (測定の保存の中):
+  測定と中止は残し、機器故障だけ足す (`record_or_log`)。
+- 業務前の指示の確認 (完了・判定待ち) は車両番号が無ければ 400 `vehicle_required` (遠隔点呼は除く。業務前 二十 ハ)。
+- `self-resume` は本文の `identity` (`employee_id` と `method` = `vein` / `face`) が要り、無ければ 400 `identity_required`、点呼の乗務員と
+  違えば 403 `identity_mismatch` (業務前 十三)。方法は `resume_identity_method` (alc-migrations 209) に残す。
 - アルコールの段は測定の保存 (`PUT /measurements/{id}` の `tenko_session_id`) で**測定の行の値から**進める。アルコールの結果を本文で受ける
   段の口 (`PUT …/alcohol`) は消した (足し直さない)。
 - 遠隔点呼 (最後の段) と IT点呼 (測定の保存・確定の口) は、完了する結果でも `judgment_pending` (alc-migrations 195) で作り、記録は判定で書く。

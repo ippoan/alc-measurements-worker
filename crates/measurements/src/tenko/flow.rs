@@ -17,8 +17,8 @@
 //! - 取り消し・中断・再開は運行管理者の鍵でも送れる (運行管理者の点呼の一覧から)。範囲は判定と同じ
 //!   ([`prod_manager_key`])。再開は管理者ログインか運行管理者の鍵だけ (キオスクの鍵は 401)
 //!
-//! 点呼が閉じた段 (完了・中止・中断) では、点呼の記録 (`tenko_records`、不変) を書く ([`record_or_log`]。失敗しても
-//! 区切りだけ戻してセッションの更新は残す)。**遠隔点呼は乗務員の側が終わっても閉じない**: 指示の確認・運行報告の
+//! 点呼が閉じた段 (完了・中止・中断) では、点呼の記録 (`tenko_records`、不変) を書く ([`close_with_record`]。書けなければ
+//! 段の更新ごと戻して閉じず、機器故障を残して 500)。**遠隔点呼は乗務員の側が終わっても閉じない**: 指示の確認・運行報告の
 //! 最後の段で判定待ち (`judgment_pending`) にし、記録は運行管理者の判定 ([`super::judgment`]) で書く (判定が記録の hash に入る)。
 //!
 //! webhook (アルコール検知・運行報告・安全判定の中断・日常点検 NG・手動の中断) は、口の中では送らずに
@@ -50,7 +50,7 @@ use uuid::Uuid;
 use super::fire::{Event, PendingFire};
 use super::normal::{TENKO_METHOD_IT, TENKO_METHOD_NORMAL};
 use super::record::{
-    employee_name, record_or_log, TenkoSession, MEASUREMENT_JOIN, RETURNING_SESSION,
+    close_with_record, employee_name, TenkoSession, MEASUREMENT_JOIN, RETURNING_SESSION,
     SESSION_COLUMNS,
 };
 use crate::carins::{lookup_expiry, CarinsLookup};
@@ -127,12 +127,25 @@ pub struct Cancel {
 }
 
 /// rust の `ResumeSession` + 再開を判断した運行管理者の氏名 (業務前 二十 ヨ。`self-resume` は読むだけで使わない)
+/// + 自己再開の本人確認 (業務前 十三。`self-resume` だけが読む)
 #[derive(Debug, Clone, Deserialize)]
 pub struct Resume {
     pub reason: String,
     #[serde(default)]
     pub resumed_by_name: Option<String>,
+    #[serde(default)]
+    pub identity: Option<ResumeIdentity>,
 }
+
+/// キオスクが自己再開の前に行った本人確認: 照合で決まった社員と方法 (`vein` / `face`)
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResumeIdentity {
+    pub employee_id: Uuid,
+    pub method: String,
+}
+
+/// 自己再開の本人確認として受ける方法 (`tenko_sessions.resume_identity_method` の CHECK と同じ。migration 209)
+pub const RESUME_IDENTITY_METHODS: [&str; 2] = ["vein", "face"];
 
 /// `PUT …/vehicle` の本文 (業務前 二十 ハ)。どちらも無ければ 400
 #[derive(Debug, Clone, Deserialize)]
@@ -395,12 +408,12 @@ pub mod sql {
     );
 
     /// 管理者が再開済みのセッションも受ける: 再開の時刻・理由・管理者は既にあれば上書きしない
-    /// (業務前 十三。本人確認はキオスクが self-resume の前に行う)
+    /// (業務前 十三)。本人確認の方法は今回のものを残す。$1 reason / $2 user_id / $3 本人確認の方法 / $4 id / $5 tenant_id
     pub const SELF_RESUME: &str = concatcp!(
         "WITH s AS (UPDATE alc_api.tenko_sessions SET resumed_at = COALESCE(resumed_at, NOW()), \
              resume_reason = COALESCE(resume_reason, $1), resumed_by_user_id = COALESCE(resumed_by_user_id, $2), \
-             updated_at = NOW() \
-         WHERE id = $3 AND tenant_id = $4",
+             resume_identity_method = $3, updated_at = NOW() \
+         WHERE id = $4 AND tenant_id = $5",
         RETURNING_SESSION
     );
 
@@ -1322,22 +1335,36 @@ async fn instruction_handler(
                 if cur.status != "instruction_pending" {
                     return Ok(StatusCode::BAD_REQUEST.into());
                 }
-                let next = finished_status(&cur.tenko_method, cur.schedule_id);
-                let s = one(
-                    tx,
-                    sql::CONFIRM_INSTRUCTION,
-                    &[
-                        (&next, Type::TEXT),
-                        (&id, Type::UUID),
-                        (&tenant_id, Type::UUID),
-                    ],
-                )
-                .await?;
-                // 判定待ちは記録を書かない (判定で書く)
-                if next == "completed" {
-                    record_or_log(tx, &s, &log).await;
+                // 業務前は車両番号が入るまで終えない (業務前 二十 ハ)。遠隔点呼は運行管理者が通話で確かめる
+                // (キオスクも車両番号の段を挟まない)
+                if cur.tenko_type == "pre_operation"
+                    && cur.tenko_method != REMOTE
+                    && clean(cur.vehicle_number.as_deref()).is_none()
+                {
+                    return Ok(Flow::Api(bad_request(
+                        "vehicle_required",
+                        "車両番号を登録してから点呼を終えてください",
+                    )));
                 }
-                Ok(Flow::Session(Box::new(s), None))
+                let next = finished_status(&cur.tenko_method, cur.schedule_id);
+                let args: [Arg<'_>; 3] = [
+                    (&next, Type::TEXT),
+                    (&id, Type::UUID),
+                    (&tenant_id, Type::UUID),
+                ];
+                // 判定待ちは記録を書かない (判定で書く)
+                if next != "completed" {
+                    let s = one(tx, sql::CONFIRM_INSTRUCTION, &args).await?;
+                    return Ok(Flow::Session(Box::new(s), None));
+                }
+                Ok(
+                    match close_with_record(tx, one(tx, sql::CONFIRM_INSTRUCTION, &args), &log)
+                        .await?
+                    {
+                        Ok(s) => Flow::Session(Box::new(s), None),
+                        Err(e) => Flow::Api(e),
+                    },
+                )
             })
         },
     )
@@ -1378,24 +1405,24 @@ async fn report_handler(
                     finished_status(&cur.tenko_method, cur.schedule_id)
                 };
                 let completed_at = (next == "completed").then_some(at);
-                let s = one(
-                    tx,
-                    sql::UPDATE_REPORT,
-                    &[
-                        (&next, Type::TEXT),
-                        (&body.vehicle_road_status, Type::TEXT),
-                        (&body.driver_alternation, Type::TEXT),
-                        (&body.vehicle_road_audio_url, Type::TEXT),
-                        (&body.driver_alternation_audio_url, Type::TEXT),
-                        (&completed_at, Type::TIMESTAMPTZ),
-                        (&id, Type::UUID),
-                        (&tenant_id, Type::UUID),
-                    ],
-                )
-                .await?;
-                if next == "completed" {
-                    record_or_log(tx, &s, &log).await;
-                }
+                let args: [Arg<'_>; 8] = [
+                    (&next, Type::TEXT),
+                    (&body.vehicle_road_status, Type::TEXT),
+                    (&body.driver_alternation, Type::TEXT),
+                    (&body.vehicle_road_audio_url, Type::TEXT),
+                    (&body.driver_alternation_audio_url, Type::TEXT),
+                    (&completed_at, Type::TIMESTAMPTZ),
+                    (&id, Type::UUID),
+                    (&tenant_id, Type::UUID),
+                ];
+                let s = if next == "completed" {
+                    match close_with_record(tx, one(tx, sql::UPDATE_REPORT, &args), &log).await? {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Flow::Api(e)),
+                    }
+                } else {
+                    one(tx, sql::UPDATE_REPORT, &args).await?
+                };
                 let payload = json!({
                     "event": "report_submitted",
                     "timestamp": at,
@@ -1452,19 +1479,18 @@ async fn cancel_handler(
                 if closed || judging {
                     return Ok(StatusCode::BAD_REQUEST.into());
                 }
-                let s = one(
-                    tx,
-                    sql::CANCEL,
-                    &[
-                        (&body.reason, Type::TEXT),
-                        (&alternative_measure, Type::TEXT),
-                        (&id, Type::UUID),
-                        (&tenant_id, Type::UUID),
-                    ],
+                let args: [Arg<'_>; 4] = [
+                    (&body.reason, Type::TEXT),
+                    (&alternative_measure, Type::TEXT),
+                    (&id, Type::UUID),
+                    (&tenant_id, Type::UUID),
+                ];
+                Ok(
+                    match close_with_record(tx, one(tx, sql::CANCEL, &args), &log).await? {
+                        Ok(s) => Flow::Session(Box::new(s), None),
+                        Err(e) => Flow::Api(e),
+                    },
                 )
-                .await?;
-                record_or_log(tx, &s, &log).await;
-                Ok(Flow::Session(Box::new(s), None))
             })
         },
     )
@@ -1531,22 +1557,24 @@ async fn self_declaration_handler(
                 };
                 let interrupted_at = (!pass).then_some(at);
                 let judgment_json = serde_json::to_value(&judgment).expect("判定は JSON にできる");
-                let s = one(
-                    tx,
-                    sql::UPDATE_SAFETY_JUDGMENT,
-                    &[
-                        (&next, Type::TEXT),
-                        (&judgment_json, Type::JSONB),
-                        (&interrupted_at, Type::TIMESTAMPTZ),
-                        (&id, Type::UUID),
-                        (&tenant_id, Type::UUID),
-                    ],
-                )
-                .await?;
+                let args: [Arg<'_>; 5] = [
+                    (&next, Type::TEXT),
+                    (&judgment_json, Type::JSONB),
+                    (&interrupted_at, Type::TIMESTAMPTZ),
+                    (&id, Type::UUID),
+                    (&tenant_id, Type::UUID),
+                ];
                 if pass {
+                    let s = one(tx, sql::UPDATE_SAFETY_JUDGMENT, &args).await?;
                     return Ok(Flow::Session(Box::new(s), None));
                 }
-                record_or_log(tx, &s, &log).await;
+                let s =
+                    match close_with_record(tx, one(tx, sql::UPDATE_SAFETY_JUDGMENT, &args), &log)
+                        .await?
+                    {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Flow::Api(e)),
+                    };
                 let name = employee_name(tx, tenant_id, s.employee_id).await?;
                 let payload = json!({
                     "event": "tenko_interrupted",
@@ -1635,20 +1663,16 @@ async fn daily_inspection_handler(
                 };
                 let cancel_reason = has_ng.then(|| "日常点検異常".to_owned());
                 let completed_at = has_ng.then_some(at);
-                let s = one(
-                    tx,
-                    sql::UPDATE_DAILY_INSPECTION,
-                    &[
-                        (&next, Type::TEXT),
-                        (&inspection, Type::JSONB),
-                        (&cancel_reason, Type::TEXT),
-                        (&completed_at, Type::TIMESTAMPTZ),
-                        (&id, Type::UUID),
-                        (&tenant_id, Type::UUID),
-                    ],
-                )
-                .await?;
+                let args: [Arg<'_>; 6] = [
+                    (&next, Type::TEXT),
+                    (&inspection, Type::JSONB),
+                    (&cancel_reason, Type::TEXT),
+                    (&completed_at, Type::TIMESTAMPTZ),
+                    (&id, Type::UUID),
+                    (&tenant_id, Type::UUID),
+                ];
                 if !has_ng {
+                    let s = one(tx, sql::UPDATE_DAILY_INSPECTION, &args).await?;
                     // 携行品の確認が無く、アルコールの段の直前 (本人確認済み) へ進んだときは測定の有効時間を見る
                     let s = if next == "identity_verified" {
                         back_to_medical_if_expired(tx, s, at).await?
@@ -1657,7 +1681,13 @@ async fn daily_inspection_handler(
                     };
                     return Ok(Flow::Session(Box::new(s), None));
                 }
-                record_or_log(tx, &s, &log).await;
+                let s =
+                    match close_with_record(tx, one(tx, sql::UPDATE_DAILY_INSPECTION, &args), &log)
+                        .await?
+                    {
+                        Ok(s) => s,
+                        Err(e) => return Ok(Flow::Api(e)),
+                    };
                 let name = employee_name(tx, tenant_id, s.employee_id).await?;
                 let payload = json!({
                     "event": "inspection_ng",
@@ -1896,6 +1926,17 @@ async fn self_resume_handler(
     if reason.is_empty() {
         return bad_request("reason_required", "再開理由は必須です").into_response();
     }
+    // 本人確認 (業務前 十三): 照合で決まった社員と方法が無ければ受けない (鍵だけでは再開させない)
+    let Some(identity) = body
+        .identity
+        .filter(|i| RESUME_IDENTITY_METHODS.contains(&i.method.as_str()))
+    else {
+        return bad_request(
+            "identity_required",
+            "本人確認 (指静脈) をしてから再開してください",
+        )
+        .into_response();
+    };
     // キオスク (端末の鍵 = AuthUser 無し) からは NULL のまま (承認した管理者の列なので埋めると嘘になる)
     let by = user.map(|Extension(u)| u.user_id);
     let at = now(&state);
@@ -1916,6 +1957,16 @@ async fn self_resume_handler(
                         "この点呼は再開できません。新しく点呼をやり直してください",
                     )));
                 }
+                // 照合で決まった人が点呼の乗務員でなければ再開させない
+                if identity.employee_id != cur.employee_id {
+                    return Ok(Flow::Api((
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": "identity_mismatch",
+                            "message": "本人確認の結果が点呼の乗務員と一致しません。本人の指を置いてください",
+                        })),
+                    )));
+                }
                 // 管理者が再開済みでも受ける (再開の時刻・理由・管理者は上書きしない)
                 let s = one(
                     tx,
@@ -1923,6 +1974,7 @@ async fn self_resume_handler(
                     &[
                         (&reason, Type::TEXT),
                         (&by, Type::UUID),
+                        (&identity.method, Type::TEXT),
                         (&id, Type::UUID),
                         (&tenant_id, Type::UUID),
                     ],

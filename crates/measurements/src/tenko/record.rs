@@ -10,9 +10,13 @@
 
 use std::future::Future;
 
+use alc_core_wasm::api_error::ApiError;
 use alc_worker_db::{kind, TenantTx, TxOutput};
+use axum::http::StatusCode;
+use axum::Json;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio_postgres::types::Type;
 use tokio_postgres::{Error, Row};
@@ -84,6 +88,8 @@ pub struct TenkoSession {
     pub resumed_by_name: Option<String>,
     /// 運行に従事できないと判断した場合の代替措置 (業務前 二十 タ)
     pub alternative_measure: Option<String>,
+    /// キオスクで自己再開したときの本人確認の方法: `vein` / `face` (業務前 十三。migration 209)
+    pub resume_identity_method: Option<String>,
 }
 
 impl TxOutput for TenkoSession {}
@@ -105,7 +111,7 @@ pub const SESSION_COLUMNS: &str = "s.id, s.tenant_id, s.employee_id, s.schedule_
      s.carins_cert_no, s.carins_vehicle_id, s.carins_expires_on, s.carins_matched_by, s.escalated_to_remote_at, \
      s.remote_escalation_reason, s.manager_judgment, s.manager_judgment_reason, s.manager_judgment_by, \
      s.manager_judgment_method, s.identity_method, s.created_at, s.updated_at, s.vehicle_number, \
-     s.vehicle_number_source, s.resumed_by_name, s.alternative_measure";
+     s.vehicle_number_source, s.resumed_by_name, s.alternative_measure, s.resume_identity_method";
 
 /// セッション `s` が指す測定 `m` (無ければ値の欄は全部 NULL)
 pub const MEASUREMENT_JOIN: &str =
@@ -180,6 +186,7 @@ impl TenkoSession {
             vehicle_number_source: r.get(54),
             resumed_by_name: r.get(55),
             alternative_measure: r.get(56),
+            resume_identity_method: r.get(57),
         }
     }
 }
@@ -360,12 +367,81 @@ pub async fn write_record(tx: &TenantTx<'_>, s: &TenkoSession) -> Result<(), Err
     Ok(())
 }
 
-/// 段が閉じたときの記録 (失敗しても止めない。rust の `let _ = create_tenko_record(..)`)。区切り [`SP_RECORD`] の中で書き、
-/// 失敗は固定の語でログに出す
-pub async fn record_or_log(tx: &TenantTx<'_>, s: &TenkoSession, log: &crate::LogSink) {
-    if let Err(stage) = in_savepoint(tx, &SP_RECORD, write_record(tx, s)).await {
-        log(&format!("measurements: tenko record failed: {stage}"));
+/// 段を閉じる更新ごと戻す区切り ([`close_with_record`] が使う。中に [`SP_RECORD`] を入れ子にする)
+pub const SP_CLOSE: Savepoint = Savepoint {
+    begin: "SAVEPOINT tenko_close",
+    release: "RELEASE SAVEPOINT tenko_close",
+    rollback: "ROLLBACK TO SAVEPOINT tenko_close",
+};
+
+/// 記録が書けなかったことを機器故障 (`measurement_recording_failed`) として残す (業務前 二十一・二十二)。
+/// $1 tenant_id / $2 session_id
+pub const INSERT_RECORD_FAILURE: &str = "INSERT INTO alc_api.equipment_failures \
+         (tenant_id, failure_type, description, detected_by, session_id) \
+     VALUES ($1, 'measurement_recording_failed', '点呼の記録を保存できませんでした', 'alc-measurements', $2)";
+
+/// 記録が書けなかったときの応答 (500。キオスクは故障を重ねて記録しない)
+pub fn record_failed() -> ApiError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": "record_failed",
+            "message": "点呼の記録を保存できませんでした。もう一度お試しください",
+        })),
+    )
+}
+
+/// 記録の失敗をログと機器故障に残す (区切りを戻した後に呼ぶ)
+async fn record_failure(
+    tx: &TenantTx<'_>,
+    s: &TenkoSession,
+    stage: &str,
+    log: &crate::LogSink,
+) -> Result<(), Error> {
+    log(&format!("measurements: tenko record failed: {stage}"));
+    tx.execute_typed(
+        INSERT_RECORD_FAILURE,
+        &[(&s.tenant_id, Type::UUID), (&s.id, Type::UUID)],
+    )
+    .await?;
+    Ok(())
+}
+
+/// 段を閉じる更新 (`update` が閉じた行を返す) と点呼の記録を 1 組で行う。**記録が書けなければ閉じない**:
+/// 更新ごと区切り [`SP_CLOSE`] まで戻し、機器故障を残して [`record_failed`] を返す (段は閉じる前のまま。押し直せる)
+pub async fn close_with_record<F>(
+    tx: &TenantTx<'_>,
+    update: F,
+    log: &crate::LogSink,
+) -> Result<Result<TenkoSession, ApiError>, Error>
+where
+    F: Future<Output = Result<TenkoSession, Error>>,
+{
+    tx.execute_typed(SP_CLOSE.begin, &[]).await?;
+    let s = update.await?;
+    match in_savepoint(tx, &SP_RECORD, write_record(tx, &s)).await {
+        Ok(()) => {
+            tx.execute_typed(SP_CLOSE.release, &[]).await?;
+            Ok(Ok(s))
+        }
+        Err(stage) => {
+            tx.execute_typed(SP_CLOSE.rollback, &[]).await?;
+            record_failure(tx, &s, &stage, log).await?;
+            Ok(Err(record_failed()))
+        }
     }
+}
+
+/// アルコール検知で閉じたときの記録 (測定の保存と段の更新は残す)。失敗は区切りだけ戻し、ログと機器故障に残す
+pub async fn record_or_log(
+    tx: &TenantTx<'_>,
+    s: &TenkoSession,
+    log: &crate::LogSink,
+) -> Result<(), Error> {
+    if let Err(stage) = in_savepoint(tx, &SP_RECORD, write_record(tx, s)).await {
+        record_failure(tx, s, &stage, log).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -391,10 +467,10 @@ mod tests {
 
     #[test]
     fn session_columns_match_the_struct() {
-        // 位置で読むので、列の数と欄の数が合っていること (from_row の最後の位置 56 + 1)
-        assert_eq!(SESSION_COLUMNS.split(',').count(), 57);
+        // 位置で読むので、列の数と欄の数が合っていること (from_row の最後の位置 57 + 1)
+        assert_eq!(SESSION_COLUMNS.split(',').count(), 58);
         let json = serde_json::to_value(sample_session()).unwrap();
-        assert_eq!(json.as_object().unwrap().len(), 57);
+        assert_eq!(json.as_object().unwrap().len(), 58);
     }
 
     pub(crate) fn sample_session() -> TenkoSession {
@@ -459,6 +535,7 @@ mod tests {
             vehicle_number_source: None,
             resumed_by_name: None,
             alternative_measure: None,
+            resume_identity_method: None,
         }
     }
 
