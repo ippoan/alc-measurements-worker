@@ -3472,7 +3472,8 @@ async fn vehicle_candidates_for_kiosk() {
     .await
     .unwrap();
     db.execute(
-        "INSERT INTO alc_api.tenko_office_carins_bases (tenant_id, office_id, use_base, user_name) VALUES ($1, $2, '＊＊＊', '一歩運輸')",
+        "INSERT INTO alc_api.tenko_office_carins_bases (tenant_id, office_id, use_base, user_name) VALUES \
+             ($1, $2, '＊＊＊', '一歩運輸'), ($1, $2, '＊＊＊', '一歩　運輸')",
         &[&t, &saga],
     )
     .await
