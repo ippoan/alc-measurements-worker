@@ -161,6 +161,19 @@ async fn schedule(t: Uuid, emp: Uuid, tenko_type: &str, instruction: Option<&str
         .get(0)
 }
 
+/// 血圧の記録を `days` 日分 (東京の日付が異なる日。今日から 1 日ずつ遡る) 作る。自動点呼 (業務前) の開始が要る 10 日分の用意
+async fn bp_history(t: Uuid, emp: Uuid, days: i32) {
+    admin()
+        .await
+        .execute(
+            "INSERT INTO alc_api.measurements (tenant_id, employee_id, status, systolic, diastolic, medical_measured_at) \
+             SELECT $1, $2, 'completed', 120, 80, NOW() - make_interval(days => d) FROM generate_series(1, $3) AS d",
+            &[&t, &emp, &days],
+        )
+        .await
+        .unwrap();
+}
+
 async fn baseline(t: Uuid, emp: Uuid) {
     admin()
         .await
@@ -225,6 +238,7 @@ async fn pre_operation_auto_flow_writes_record() {
     let t = tenant().await;
     let emp = employee(t, "点呼 一郎").await;
     baseline(t, emp).await;
+    bp_history(t, emp, 10).await;
     let sch = schedule(t, emp, "pre_operation", Some("安全運転")).await;
     let item: Uuid = admin()
         .await
@@ -2684,6 +2698,7 @@ async fn vehicle_number_sources() {
     let app = app().await;
     let t = tenant().await;
     let emp = employee(t, "車両 一郎").await;
+    bp_history(t, emp, 10).await;
 
     // 開始: 予定に車両番号があれば写して source = schedule。無ければ NULL
     let with = schedule(t, emp, "pre_operation", Some("安全運転")).await;
@@ -2879,5 +2894,200 @@ async fn vehicle_number_sources() {
     assert_eq!(
         (gone.status, gone.json()),
         (404, json!({ "error": "session_not_found" }))
+    );
+}
+
+/// 業務前の自動点呼は血圧の記録が 10 日分そろっているときだけ。足りなければ予定は消費して遠隔点呼へ切り替える
+/// (escalate-remote と同じ列)。dev 端末・業務後・予定なしは切り替えない。同じ日の複数件は 1 日
+#[tokio::test]
+async fn auto_pre_operation_needs_ten_days_of_bp() {
+    let app = app().await;
+    let t = tenant().await;
+    let start = |sch: Uuid, emp: Uuid, h: Vec<(&'static str, &'static str)>| {
+        let app = &app;
+        async move {
+            send_h(
+                app,
+                "POST",
+                "/api/tenko/sessions/start",
+                t,
+                &h,
+                Some(json!({ "schedule_id": sch, "employee_id": emp })),
+            )
+            .await
+        }
+    };
+    let consumed = |sch: Uuid| async move {
+        admin()
+            .await
+            .query_one(
+                "SELECT consumed FROM alc_api.tenko_schedules WHERE id = $1",
+                &[&sch],
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    };
+
+    // 9 日分: 201 で遠隔点呼に切り替わり、予定は消費される。状態は medical_pending のまま
+    let emp = employee(t, "血圧 九日").await;
+    bp_history(t, emp, 9).await;
+    let sch = schedule(t, emp, "pre_operation", Some("安全運転")).await;
+    let got = start(sch, emp, vec![]).await;
+    assert_eq!(got.status, 201);
+    let s = got.json();
+    assert_eq!(
+        (
+            s["tenko_method"].clone(),
+            s["status"].clone(),
+            s["remote_escalation_reason"].clone(),
+            s["escalated_to_remote_at"].is_null(),
+        ),
+        (
+            json!("遠隔点呼"),
+            json!("medical_pending"),
+            json!("血圧の記録が 10 日分に満たない (いま 9 日分)"),
+            false
+        )
+    );
+    assert!(consumed(sch).await);
+
+    // 10 日分: 自動点呼のまま
+    let emp = employee(t, "血圧 十日").await;
+    bp_history(t, emp, 10).await;
+    let sch = schedule(t, emp, "pre_operation", Some("安全運転")).await;
+    let s = start(sch, emp, vec![]).await.json();
+    assert_eq!(
+        (
+            s["tenko_method"].clone(),
+            s["remote_escalation_reason"].clone()
+        ),
+        (json!("自動点呼"), Value::Null)
+    );
+
+    // 同じ日の重複は 1 日: 9 日 + 同じ日の 5 件 = 9 日分
+    let emp = employee(t, "血圧 重複").await;
+    bp_history(t, emp, 9).await;
+    bp_history(t, emp, 1).await;
+    bp_history(t, emp, 1).await;
+    let sch = schedule(t, emp, "pre_operation", Some("安全運転")).await;
+    let s = start(sch, emp, vec![]).await.json();
+    assert_eq!(s["tenko_method"], json!("遠隔点呼"));
+    assert_eq!(
+        s["remote_escalation_reason"],
+        json!("血圧の記録が 10 日分に満たない (いま 9 日分)")
+    );
+
+    // dev 端末は 0 日分でも自動点呼のまま (予定は dev の軸に置く。本番の軸の予定は dev の接続から見えない)
+    let emp = employee(t, "血圧 開発").await;
+    let sch = schedule(t, emp, "pre_operation", Some("安全運転")).await;
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.tenko_schedules SET is_dev = TRUE WHERE id = $1",
+            &[&sch],
+        )
+        .await
+        .unwrap();
+    let got = start(sch, emp, vec![("X-Device-Dev", "1")]).await;
+    assert_eq!(got.status, 201);
+    assert_eq!(got.json()["tenko_method"], json!("自動点呼"));
+
+    // 業務後の予定 (0 日分) は自動点呼のまま、予定なし (遠隔点呼) も影響しない
+    let emp = employee(t, "血圧 業務後").await;
+    let sch = schedule(t, emp, "post_operation", None).await;
+    let s = start(sch, emp, vec![]).await.json();
+    assert_eq!(
+        (
+            s["tenko_method"].clone(),
+            s["remote_escalation_reason"].clone()
+        ),
+        (json!("自動点呼"), Value::Null)
+    );
+    let remote = send(
+        &app,
+        "POST",
+        "/api/tenko/sessions/start",
+        t,
+        Some(json!({ "employee_id": emp, "tenko_type": "pre_operation" })),
+    )
+    .await;
+    assert_eq!(remote.status, 201);
+    assert_eq!(remote.json()["remote_escalation_reason"], Value::Null);
+}
+
+/// 血圧が 9 日分で遠隔点呼へ切り替わった (予定つきの) セッションを、自動点呼と同じ段で最後まで通す:
+/// 医療 → 自己申告 → 日常点検 → 携行品 → アルコール → 指示の確認で判定待ち、運行管理者の判定 ok で完了して記録を書く
+#[tokio::test]
+async fn switched_remote_session_walks_to_judgment() {
+    let app = app().await;
+    let t = tenant().await;
+    let emp = employee(t, "切替 一郎").await;
+    baseline(t, emp).await;
+    bp_history(t, emp, 9).await;
+    let judge = manager(t, "manager").await;
+    let sch = schedule(t, emp, "pre_operation", Some("安全運転")).await;
+    let s = send(
+        &app,
+        "POST",
+        "/api/tenko/sessions/start",
+        t,
+        Some(json!({ "schedule_id": sch, "employee_id": emp })),
+    )
+    .await
+    .json();
+    assert_eq!(s["tenko_method"], "遠隔点呼");
+    assert_eq!(s["schedule_id"], json!(sch));
+    let id = s["id"].as_str().unwrap().to_owned();
+    let uri = |step: &str| format!("/api/tenko/sessions/{id}/{step}");
+
+    let med = send(
+        &app,
+        "PUT",
+        &uri("medical"),
+        t,
+        Some(json!({ "temperature": 36.6, "systolic": 125, "diastolic": 82, "pulse": 70 })),
+    )
+    .await
+    .json();
+    assert_eq!(med["status"], "self_declaration_pending");
+    let decl = send(
+        &app,
+        "PUT",
+        &uri("self-declaration"),
+        t,
+        Some(json!({ "illness": false, "fatigue": false, "sleep_deprivation": false })),
+    )
+    .await
+    .json();
+    assert_eq!(decl["status"], "daily_inspection_pending");
+    assert_eq!(decl["safety_judgment"]["status"], "pass");
+    let ok = json!({ "brakes": "ok", "tires": "ok", "lights": "ok", "steering": "ok", "wipers": "ok", "mirrors": "ok", "horn": "ok", "seatbelts": "ok" });
+    // 携行品が無いテナントなので、日常点検の後はアルコールの段へ進む
+    let insp = send(&app, "PUT", &uri("daily-inspection"), t, Some(ok)).await;
+    assert_eq!(insp.json()["status"], "identity_verified");
+    let alc = measure(&app, t, emp, &id, "normal").await;
+    assert_eq!(alc["status"], "instruction_pending");
+    let done = send(&app, "PUT", &uri("instruction-confirm"), t, None).await;
+    assert_eq!(done.json()["status"], "judgment_pending");
+    assert!(records(id.parse().unwrap()).await.is_empty());
+
+    let judged = send_h(
+        &app,
+        "POST",
+        &uri("judgment"),
+        t,
+        &admin_headers(),
+        Some(json!({ "judgment": "ok", "judged_by_employee_id": judge, "reason": "確認" })),
+    )
+    .await;
+    assert_eq!(judged.status, 200);
+    let j = judged.json();
+    assert_eq!(j["status"], "completed");
+    let recs = records(id.parse().unwrap()).await;
+    assert_eq!(recs.len(), 1);
+    assert_eq!(
+        (recs[0].0.as_str(), recs[0].1.as_str()),
+        ("completed", "遠隔点呼")
     );
 }

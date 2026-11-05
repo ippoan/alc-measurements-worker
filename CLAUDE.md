@@ -106,6 +106,7 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
 - アルコールの段は測定の保存 (`PUT /measurements/{id}` の `tenko_session_id`) で**測定の行の値から**進める。アルコールの結果を本文で受ける
   段の口 (`PUT …/alcohol`) は消した (足し直さない)。
 - 遠隔点呼 (最後の段) と IT点呼 (測定の保存・確定の口) は、完了する結果でも `judgment_pending` (alc-migrations 195) で作り、記録は判定で書く。
+- 開始 (`POST /tenko/sessions/start`) は、予定ありの業務前 (自動点呼) で乗務員の血圧の記録 (東京の日付の異なり数、`BP_HISTORY_DAYS_REQUIRED` = 10) が足りないと、予定は消費して**遠隔点呼で作る** (escalate-remote と同じ `ESCALATE` の文。`remote_escalation_reason` = 「血圧の記録が 10 日分に満たない (いま N 日分)」、状態は `medical_pending`)。dev 端末は切り替えない (キオスクが警告する)。業務後・予定なしは対象外。
   検知 (中止) は判定を待たずに閉じて記録する。
 - 点呼の webhook は送らない: `PendingFire` を応答の extension に入れ、`src/lib.rs` が `wait_until` で alc-tenko-worker の
   `/internal/webhooks/fire` へ渡す (Service Binding `ALC_TENKO`。本番 `alc-tenko`・staging `alc-tenko-staging`)。dev の要求は渡さない。
