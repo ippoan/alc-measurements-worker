@@ -46,7 +46,7 @@ use tokio_postgres::{Error, Row};
 use uuid::Uuid;
 
 use super::fire::{Event, PendingFire};
-use super::normal::TENKO_METHOD_IT;
+use super::normal::{TENKO_METHOD_IT, TENKO_METHOD_NORMAL};
 use super::record::{
     employee_name, record_or_log, TenkoSession, MEASUREMENT_JOIN, RETURNING_SESSION,
     SESSION_COLUMNS,
@@ -399,6 +399,16 @@ pub mod sql {
         RETURNING_SESSION
     );
 
+    /// 血圧の記録が足りない業務前の自動点呼を対面点呼 (`通常点呼`) へ切り替える。$1 理由 / $2 id / $3 tenant_id。
+    /// 遠隔点呼ではないので `escalated_to_remote_at` は書かない。予定 (`schedule_id`) が付いたまま `通常点呼` なのが
+    /// 切り替えの印 ([`is_in_person_switched`])。理由は `remote_escalation_reason` (理由の列はこれだけ)
+    pub const SWITCH_IN_PERSON: &str = concatcp!(
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET tenko_method = '通常点呼', \
+             remote_escalation_reason = $1, updated_at = NOW() \
+         WHERE id = $2 AND tenant_id = $3",
+        RETURNING_SESSION
+    );
+
     pub const ESCALATE: &str = concatcp!(
         "WITH s AS (UPDATE alc_api.tenko_sessions SET tenko_method = '遠隔点呼', escalated_to_remote_at = NOW(), \
              remote_escalation_reason = $1, updated_at = NOW() \
@@ -604,9 +614,16 @@ pub fn is_terminal(status: &str) -> bool {
     )
 }
 
+/// 血圧の記録が足りず、予定から始めた自動点呼が対面点呼 (`通常点呼`) へ切り替わったセッションか。
+/// 測定から作る通常点呼 ([`super::normal`]) は予定を指さない (`schedule_id` が NULL) ので、予定が付いた `通常点呼` で区別できる。
+/// 乗務員の側が終わったら判定待ちになり、運行管理者が対面で確認して判定する
+pub fn is_in_person_switched(tenko_method: &str, schedule_id: Option<Uuid>) -> bool {
+    tenko_method == TENKO_METHOD_NORMAL && schedule_id.is_some()
+}
+
 /// 乗務員の側が最後の段 (指示の確認・運行報告) を終えたときの status。遠隔点呼は運行管理者の判定を待ち、ほかは完了
-pub fn finished_status(tenko_method: &str) -> &'static str {
-    if tenko_method == REMOTE {
+pub fn finished_status(tenko_method: &str, schedule_id: Option<Uuid>) -> &'static str {
+    if tenko_method == REMOTE || is_in_person_switched(tenko_method, schedule_id) {
         JUDGMENT_PENDING
     } else {
         "completed"
@@ -631,7 +648,9 @@ pub fn prod_manager_key(slot: &DeviceDevSlot, admin: bool) -> bool {
 
 /// [`prod_manager_key`] の要求が触れない点呼か (403)
 pub fn beyond_prod_manager(prod_manager: bool, session: &TenkoSession) -> bool {
-    prod_manager && session.tenko_method != TENKO_METHOD_IT
+    prod_manager
+        && session.tenko_method != TENKO_METHOD_IT
+        && !is_in_person_switched(&session.tenko_method, session.schedule_id)
 }
 
 // --- transaction の中の部品 ---
@@ -942,7 +961,7 @@ async fn start_handler(
                             return Ok(StatusCode::BAD_REQUEST.into());
                         }
                         // 業務前の自動点呼は血圧の記録が 10 日分そろっている乗務員だけ。足りなければ予定は消費して、
-                        // escalate-remote と同じ遠隔点呼へ切り替える (dev 端末は切り替えず、キオスクが警告を出す)
+                        // 対面点呼 (通常点呼) へ切り替える (dev 端末は切り替えず、キオスクが警告を出す)
                         if row.get::<_, String>(1) == "pre_operation" && !dev_request {
                             let days: i64 = tx
                                 .query_typed_one(
@@ -956,7 +975,7 @@ async fn start_handler(
                                 .get(0);
                             if days < BP_HISTORY_DAYS_REQUIRED {
                                 switch_reason = Some(format!(
-                                    "血圧の記録が {BP_HISTORY_DAYS_REQUIRED} 日分に満たない (いま {days} 日分)"
+                                    "血圧の記録が {BP_HISTORY_DAYS_REQUIRED} 日分に満たない (いま {days} 日分) ため対面点呼"
                                 ));
                             }
                         }
@@ -1032,11 +1051,11 @@ async fn start_handler(
                     )
                     .await?;
                 }
-                // 遠隔点呼への切り替え: escalate-remote と同じ列を同じ文で書く (状態は medical_pending のまま)
+                // 対面点呼への切り替え: 方法を通常点呼にして理由を残す (状態は medical_pending のまま)
                 if let Some(reason) = switch_reason {
                     s = one(
                         tx,
-                        sql::ESCALATE,
+                        sql::SWITCH_IN_PERSON,
                         &[
                             (&reason, Type::TEXT),
                             (&s.id, Type::UUID),
@@ -1234,7 +1253,7 @@ async fn instruction_handler(
                 if cur.status != "instruction_pending" {
                     return Ok(StatusCode::BAD_REQUEST.into());
                 }
-                let next = finished_status(&cur.tenko_method);
+                let next = finished_status(&cur.tenko_method, cur.schedule_id);
                 let s = one(
                     tx,
                     sql::CONFIRM_INSTRUCTION,
@@ -1287,7 +1306,7 @@ async fn report_handler(
                 let next = if pending {
                     "instruction_pending"
                 } else {
-                    finished_status(&cur.tenko_method)
+                    finished_status(&cur.tenko_method, cur.schedule_id)
                 };
                 let completed_at = (next == "completed").then_some(at);
                 let s = one(
@@ -2001,8 +2020,12 @@ mod tests {
 
     #[test]
     fn remote_waits_for_judgment() {
-        assert_eq!(finished_status("遠隔点呼"), "judgment_pending");
-        assert_eq!(finished_status("自動点呼"), "completed");
+        let sid = Some(Uuid::nil());
+        assert_eq!(finished_status("遠隔点呼", None), "judgment_pending");
+        assert_eq!(finished_status("自動点呼", sid), "completed");
+        // 予定から切り替わった対面点呼だけ判定待ち。測定から作る通常点呼 (予定なし) は完了
+        assert_eq!(finished_status("通常点呼", sid), "judgment_pending");
+        assert_eq!(finished_status("通常点呼", None), "completed");
     }
 
     #[test]
