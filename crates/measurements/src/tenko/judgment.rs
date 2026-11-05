@@ -102,7 +102,7 @@ pub mod sql {
     /// 車両の所属営業所・判定する人の所属営業所 (どちらも `[{id, name, company_name}]` の JSON)・車両の所属の出どころ
     /// (`manual` / `carins` / NULL)。車両は手で選んだ所属 (登録番号を空白を除いて照合) を優先し、無ければ車検証の
     /// 使用の本拠の位置 + 使用者の組 (式は migration 206 と同じ) の対応。車検証はセッションの管理番号・車両 ID・登録番号の
-    /// どれかで一致する最新の 1 行。$1 tenant_id / $2 車両番号 / $3 employee_id / $4 車検証の管理番号 / $5 車検証の車両 ID
+    /// どれかで一致する最新の 1 行 (登録番号は `EntryNoCarNo`。`CarNo` は車台番号)。$1 tenant_id / $2 車両番号 / $3 employee_id / $4 車検証の管理番号 / $5 車検証の車両 ID
     pub const OFFICE_SCOPE: &str = "WITH manual AS ( \
              SELECT v.office_id FROM alc_api.maintenance_vehicles v WHERE v.tenant_id = $1 AND v.deleted_at IS NULL \
              AND v.office_id IS NOT NULL \
@@ -111,7 +111,7 @@ pub mod sql {
              SELECT btrim(c.\"UseheadqrterChar\") AS use_base, \
                  btrim(COALESCE(NULLIF(btrim(c.\"UsernameHighLevelChar\"), ''), c.\"UsernameLowLevelChar\")) AS user_name \
              FROM alc_api.car_inspection c WHERE c.tenant_id = $1 AND (c.\"ElectCertMgNo\" = $4 OR c.\"CarId\" = $5 \
-             OR regexp_replace(c.\"CarNo\", '[[:space:]　]', '', 'g') = regexp_replace($2, '[[:space:]　]', '', 'g')) \
+             OR regexp_replace(c.\"EntryNoCarNo\", '[[:space:]　]', '', 'g') = regexp_replace($2, '[[:space:]　]', '', 'g')) \
              ORDER BY c.created_at DESC LIMIT 1), \
          picked AS ( \
              SELECT office_id, 'manual' AS src FROM manual \

@@ -1,10 +1,11 @@
 //! キオスクの車両番号の候補 `GET /tenko/sessions/{id}/vehicle-candidates?q=<数字>` (自己点検表 業務前 二十 ハ の入力の補助)。
 //!
-//! テンキーで打った数字 (登録番号の数字の部分。全角の数字も同じに扱う) を含む車両を、車検証 (`car_inspection`。車両 ID ごとに
-//! 最新の 1 枚) と車両マスタ (`maintenance_vehicles`) から最大 [`MAX_CANDIDATES`] 件返す。各候補には点呼の営業所への
+//! テンキーで打った数字で一連指定番号 (登録番号のひらがなの後の数字。全角の数字・区切りの `-`・`・` は無視) が始まる車両を、
+//! 車検証 (`car_inspection` の登録番号 `EntryNoCarNo`。車両 ID ごとに最新の 1 枚。`CarNo` は車台番号なので使わない) と
+//! 車両マスタ (`maintenance_vehicles`) から最大 [`MAX_CANDIDATES`] 件返す。各候補には点呼の営業所への
 //! 紐づけ (手で選んだ所属、無ければ車検証の使用の本拠・使用者の対応。判定 [`super::judgment`] と同じ優先) を付ける。
 //! 要求した端末 (`X-Device-Id`) が営業所に所属していれば (migration 207)、その営業所の車両を先に並べる。並びの次は
-//! 打った数字で終わる車両、最後は登録番号の順。
+//! 一連指定番号が打った数字と一致する車両、最後は一連指定番号・登録番号の順。
 //!
 //! 通すのは車両番号の段 (`PUT …/vehicle`) と同じ (テナントのヘッダーがあればよい)。セッションが無ければ 404、
 //! `q` が 1〜8 桁の数字でなければ 400 `{"error": "invalid_query"}`。応答は
@@ -31,10 +32,10 @@ pub const MAX_CANDIDATES: i64 = 20;
 pub mod sql {
     /// 候補。$1 tenant_id / $2 打った数字 / $3 端末の ID (無ければ NULL) / $4 上限
     pub const CANDIDATES: &str = "WITH ci AS ( \
-             SELECT DISTINCT ON (c.\"CarId\") c.\"CarNo\" AS no, c.\"ElectCertMgNo\" AS cert, \
+             SELECT DISTINCT ON (c.\"CarId\") btrim(c.\"EntryNoCarNo\") AS no, c.\"ElectCertMgNo\" AS cert, \
                  btrim(c.\"UseheadqrterChar\") AS use_base, \
                  btrim(COALESCE(NULLIF(btrim(c.\"UsernameHighLevelChar\"), ''), c.\"UsernameLowLevelChar\")) AS user_name \
-             FROM alc_api.car_inspection c WHERE c.tenant_id = $1 AND btrim(c.\"CarNo\") <> '' \
+             FROM alc_api.car_inspection c WHERE c.tenant_id = $1 AND btrim(c.\"EntryNoCarNo\") <> '' \
              ORDER BY c.\"CarId\", c.created_at DESC), \
          mv AS ( \
              SELECT v.registration_number AS no, v.office_id FROM alc_api.maintenance_vehicles v \
@@ -49,14 +50,15 @@ pub mod sql {
              SELECT mv.no, NULL, mv.office_id FROM mv WHERE NOT EXISTS (SELECT 1 FROM ci \
                  WHERE regexp_replace(ci.no, '[[:space:]　]', '', 'g') = regexp_replace(mv.no, '[[:space:]　]', '', 'g'))), \
          digits AS ( \
-             SELECT cand.*, regexp_replace(translate(cand.no, '０１２３４５６７８９', '0123456789'), '[^0-9]', '', 'g') AS d \
+             SELECT cand.*, regexp_replace(regexp_replace(translate(cand.no, '０１２３４５６７８９', '0123456789'), \
+                 '^.*[^0-9・．.\\-－[:space:]　]', ''), '[^0-9]', '', 'g') AS d \
              FROM cand) \
          SELECT digits.no, digits.cert, o.name, o.company_name, digits.office_id IS NOT NULL, \
              COALESCE(digits.office_id IN (SELECT t.office_id FROM alc_api.tenko_office_devices t \
                  WHERE t.tenant_id = $1 AND t.device_id = $3), FALSE) AS device_office \
          FROM digits LEFT JOIN alc_api.tenko_offices o ON o.tenant_id = $1 AND o.id = digits.office_id \
-         WHERE strpos(digits.d, $2) > 0 \
-         ORDER BY device_office DESC, right(digits.d, length($2)) = $2 DESC, digits.no \
+         WHERE digits.d LIKE $2 || '%' \
+         ORDER BY device_office DESC, digits.d = $2 DESC, digits.d, digits.no \
          LIMIT $4";
 }
 

@@ -46,7 +46,8 @@ pub struct CarinsLookup {
     pub expires_on: Option<NaiveDate>,
     /// `cert_no` (管理番号で一致) / `car_id` (車両 ID で一致) / `none` (該当なし)
     pub matched_by: &'static str,
-    /// 一致した行の登録番号 (自動車登録番号。該当なしは None)
+    /// 一致した行の登録番号 (`EntryNoCarNo` = 自動車登録番号又は車両番号。`CarNo` は車台番号なので使わない。
+    /// 該当なし・登録番号が空は None)
     pub car_no: Option<String>,
 }
 
@@ -70,7 +71,7 @@ SELECT
         END,
         wareki.expires_on
     ) AS expires_on,
-    ci."CarNo" AS car_no
+    NULLIF(btrim(ci."EntryNoCarNo"), '') AS car_no
 FROM car_inspection ci
 LEFT JOIN LATERAL (
     -- 和暦 4 列から期限を組み立てる。to_date / make_date が例外を投げないよう、
@@ -139,7 +140,7 @@ pub async fn lookup_expiry(
             } else {
                 "car_id"
             },
-            car_no: Some(r.get(2)),
+            car_no: r.get(2),
         },
         None => CarinsLookup {
             expires_on: None,
