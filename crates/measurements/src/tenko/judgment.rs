@@ -13,7 +13,9 @@
 //!   書かれていて判定を含まない — 記録の CSV はセッションを join して出す)
 //!
 //! 血圧の記録が足りず対面点呼へ切り替えたセッションは、会った運行管理者の所属 ([`office_scope`]) で点呼の方法を決める。
-//! 点呼の営業所は車両で決まる (セッションの車両番号を車両マスタ `maintenance_vehicles` の登録番号と照合)。判定した人の
+//! 点呼の営業所は車両で決まる。手で選んだ所属 (セッションの車両番号を車両マスタ `maintenance_vehicles` の登録番号と照合)
+//! があればそれを、無ければ車検証 (`car_inspection` の使用の本拠の位置 + 使用者) を `tenko_office_carins_bases` で営業所に
+//! 引いたものを使う (migration 206)。判定した人の
 //! 所属営業所 (`tenko_office_managers`) に車両の営業所が入っていれば同じ営業所 = `通常点呼` のまま、どちらも所属が在って
 //! 重ならなければ別の営業所・グループ企業 = 告示 266 号 第四条 2 項により `遠隔点呼` とみなす。どちらかが未設定なら
 //! 同じ営業所として扱う (画面は `GET /tenko/sessions/{id}/in-person-scope` で判定の前に見せ、未設定を警告する)
@@ -97,18 +99,34 @@ pub mod sql {
     pub const JUDGE_ROLE: &str =
         "SELECT role FROM alc_api.employees WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL";
 
-    /// 車両の所属営業所と、判定する人の所属営業所 (どちらも `[{id, name, company_name}]` の JSON)。
-    /// $1 tenant_id / $2 車両番号 (空白を除いて登録番号と照合) / $3 employee_id
-    pub const OFFICE_SCOPE: &str = "SELECT \
-         COALESCE((SELECT jsonb_agg(jsonb_build_object('id', o.id, 'name', o.name, 'company_name', o.company_name) \
-             ORDER BY o.name, o.id) FROM alc_api.tenko_offices o WHERE o.tenant_id = $1 AND o.id IN ( \
+    /// 車両の所属営業所・判定する人の所属営業所 (どちらも `[{id, name, company_name}]` の JSON)・車両の所属の出どころ
+    /// (`manual` / `carins` / NULL)。車両は手で選んだ所属 (登録番号を空白を除いて照合) を優先し、無ければ車検証の
+    /// 使用の本拠の位置 + 使用者の組 (式は migration 206 と同じ) の対応。車検証はセッションの管理番号・車両 ID・登録番号の
+    /// どれかで一致する最新の 1 行。$1 tenant_id / $2 車両番号 / $3 employee_id / $4 車検証の管理番号 / $5 車検証の車両 ID
+    pub const OFFICE_SCOPE: &str = "WITH manual AS ( \
              SELECT v.office_id FROM alc_api.maintenance_vehicles v WHERE v.tenant_id = $1 AND v.deleted_at IS NULL \
-             AND regexp_replace(v.registration_number, '[[:space:]　]', '', 'g') = regexp_replace($2, '[[:space:]　]', '', 'g'))), \
-             '[]'::jsonb), \
+             AND v.office_id IS NOT NULL \
+             AND regexp_replace(v.registration_number, '[[:space:]　]', '', 'g') = regexp_replace($2, '[[:space:]　]', '', 'g')), \
+         ci AS ( \
+             SELECT btrim(c.\"UseheadqrterChar\") AS use_base, \
+                 btrim(COALESCE(NULLIF(btrim(c.\"UsernameHighLevelChar\"), ''), c.\"UsernameLowLevelChar\")) AS user_name \
+             FROM alc_api.car_inspection c WHERE c.tenant_id = $1 AND (c.\"ElectCertMgNo\" = $4 OR c.\"CarId\" = $5 \
+             OR regexp_replace(c.\"CarNo\", '[[:space:]　]', '', 'g') = regexp_replace($2, '[[:space:]　]', '', 'g')) \
+             ORDER BY c.created_at DESC LIMIT 1), \
+         picked AS ( \
+             SELECT office_id, 'manual' AS src FROM manual \
+             UNION ALL SELECT b.office_id, 'carins' FROM alc_api.tenko_office_carins_bases b \
+             JOIN ci ON b.use_base = ci.use_base AND b.user_name = ci.user_name \
+             WHERE b.tenant_id = $1 AND NOT EXISTS (SELECT 1 FROM manual)) \
+         SELECT \
+         COALESCE((SELECT jsonb_agg(jsonb_build_object('id', o.id, 'name', o.name, 'company_name', o.company_name) \
+             ORDER BY o.name, o.id) FROM alc_api.tenko_offices o WHERE o.tenant_id = $1 \
+             AND o.id IN (SELECT office_id FROM picked)), '[]'::jsonb), \
          COALESCE((SELECT jsonb_agg(jsonb_build_object('id', o.id, 'name', o.name, 'company_name', o.company_name) \
              ORDER BY o.name, o.id) FROM alc_api.tenko_offices o WHERE o.tenant_id = $1 AND o.id IN ( \
              SELECT m.office_id FROM alc_api.tenko_office_managers m WHERE m.tenant_id = $1 AND m.employee_id = $3)), \
-             '[]'::jsonb)";
+             '[]'::jsonb), \
+         (SELECT min(src) FROM picked)";
 }
 
 pub fn router() -> Router<AppState> {
@@ -123,6 +141,8 @@ pub struct OfficeScope {
     pub scope: &'static str,
     /// 車両の所属営業所 (`[{id, name, company_name}]`)
     pub vehicle_offices: Value,
+    /// 車両の所属の出どころ (`manual` = 手で選んだ所属 / `carins` = 車検証の対応 / None = 未設定)
+    pub vehicle_source: Option<String>,
     /// 運行管理者の所属営業所 (同じ形)
     pub judge_offices: Value,
 }
@@ -148,7 +168,7 @@ pub fn decide_scope(vehicle_offices: &Value, judge_offices: &Value) -> &'static 
 pub async fn office_scope(
     tx: &TenantTx<'_>,
     tenant_id: Uuid,
-    vehicle_number: &Option<String>,
+    session: &TenkoSession,
     judge: Uuid,
 ) -> Result<OfficeScope, tokio_postgres::Error> {
     let row = tx
@@ -156,8 +176,10 @@ pub async fn office_scope(
             sql::OFFICE_SCOPE,
             &[
                 (&tenant_id, Type::UUID),
-                (vehicle_number, Type::TEXT),
+                (&session.vehicle_number, Type::TEXT),
                 (&judge, Type::UUID),
+                (&session.carins_cert_no, Type::TEXT),
+                (&session.carins_vehicle_id, Type::TEXT),
             ],
         )
         .await?;
@@ -165,6 +187,7 @@ pub async fn office_scope(
     Ok(OfficeScope {
         scope: decide_scope(&vehicle_offices, &judge_offices),
         vehicle_offices,
+        vehicle_source: row.get(2),
         judge_offices,
     })
 }
@@ -176,7 +199,7 @@ pub struct ScopeQuery {
 }
 
 /// `GET /tenko/sessions/{id}/in-person-scope?judge=<employee_id>` — 切り替えた対面点呼で、その運行管理者が判定したときの
-/// 対面の範囲 `{"scope", "vehicle_number", "vehicle_offices", "judge_offices"}`。通すのは判定と同じ (管理者ログインか
+/// 対面の範囲 `{"scope", "vehicle_number", "vehicle_offices", "vehicle_source", "judge_offices"}`。通すのは判定と同じ (管理者ログインか
 /// 運行管理者の鍵)。切り替えた対面点呼でなければ 400、無ければ 404
 async fn scope_handler(
     State(state): State<AppState>,
@@ -204,13 +227,14 @@ async fn scope_handler(
                 if !is_in_person_switched(&cur.tenko_method, cur.schedule_id) {
                     return Ok(StatusCode::BAD_REQUEST.into());
                 }
-                let s = office_scope(tx, tenant_id, &cur.vehicle_number, q.judge).await?;
+                let s = office_scope(tx, tenant_id, &cur, q.judge).await?;
                 Ok(Flow::Api((
                     StatusCode::OK,
                     Json(json!({
                         "scope": s.scope,
                         "vehicle_number": cur.vehicle_number,
                         "vehicle_offices": s.vehicle_offices,
+                        "vehicle_source": s.vehicle_source,
                         "judge_offices": s.judge_offices,
                     })),
                 )))
@@ -291,14 +315,9 @@ async fn judgment_handler(
                 // 遠隔点呼とみなす (未設定は同じ営業所として通常点呼のまま)
                 let switched = is_in_person_switched(&cur.tenko_method, cur.schedule_id);
                 let new_method = if switched
-                    && office_scope(
-                        tx,
-                        tenant_id,
-                        &cur.vehicle_number,
-                        body.judged_by_employee_id,
-                    )
-                    .await?
-                    .scope
+                    && office_scope(tx, tenant_id, &cur, body.judged_by_employee_id)
+                        .await?
+                        .scope
                         == SCOPE_OTHER_OFFICE
                 {
                     Some(REMOTE)

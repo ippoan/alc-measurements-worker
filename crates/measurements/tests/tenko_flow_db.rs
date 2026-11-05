@@ -3113,7 +3113,7 @@ async fn switched_in_person_session_walks_to_judgment() {
     assert_eq!(scope.status, 200);
     assert_eq!(
         scope.json(),
-        json!({ "scope": "unknown", "vehicle_number": null, "vehicle_offices": [], "judge_offices": [] })
+        json!({ "scope": "unknown", "vehicle_number": null, "vehicle_offices": [], "vehicle_source": null, "judge_offices": [] })
     );
 
     let judged = send_h(
@@ -3210,6 +3210,7 @@ async fn switched_in_person_same_office_by_affiliation() {
     assert_eq!(j["scope"], "same_office");
     assert_eq!(j["vehicle_number"], "品川 100 あ　1234");
     assert_eq!(j["vehicle_offices"][0]["name"], "本社営業所");
+    assert_eq!(j["vehicle_source"], "manual");
     assert_eq!(j["judge_offices"].as_array().unwrap().len(), 2);
     // 運行管理者の鍵でも見られる。キオスクの鍵・鍵なしは 401
     let key = [("X-Device-Role", "device-tenko-manager")];
@@ -3264,6 +3265,114 @@ async fn switched_in_person_same_office_by_affiliation() {
     .await;
     assert_eq!(judged.status, 200);
     assert_eq!(judged.json()["tenko_method"], "通常点呼");
+}
+
+/// 車検証を 1 枚作り、使用の本拠の位置・使用者・登録番号を書く
+async fn car_inspection_base(
+    t: Uuid,
+    cert_no: &str,
+    car_no: &str,
+    use_base: &str,
+    user_name: &str,
+) {
+    support::car_inspection(t, cert_no, &format!("CAR-{cert_no}"), "301231", "01").await;
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.car_inspection SET \"CarNo\" = $1, \"UseheadqrterChar\" = $2, \"UsernameHighLevelChar\" = $3 \
+             WHERE tenant_id = $4 AND \"ElectCertMgNo\" = $5",
+            &[&car_no, &use_base, &user_name, &t, &cert_no],
+        )
+        .await
+        .unwrap();
+}
+
+/// 車検証の使用の本拠・使用者の組を営業所に対応づける
+async fn carins_base(t: Uuid, office: Uuid, use_base: &str, user_name: &str) {
+    admin()
+        .await
+        .execute(
+            "INSERT INTO alc_api.tenko_office_carins_bases (tenant_id, office_id, use_base, user_name) VALUES ($1, $2, $3, $4)",
+            &[&t, &office, &use_base, &user_name],
+        )
+        .await
+        .unwrap();
+}
+
+/// 手で選んだ所属が無ければ、車両の車検証 (登録番号で一致する最新の 1 枚) の使用の本拠・使用者の組から営業所を決める。
+/// 手で選んだ所属があればそちらが優先する。別のテナントの車検証・対応は見えない
+#[tokio::test]
+async fn switched_in_person_vehicle_office_from_carins() {
+    let app = app().await;
+    let t = tenant().await;
+    let judge = manager(t, "manager").await;
+    let nagasaki = office(t, "長崎営業所", None, &[], &[judge]).await;
+    let saga = office(t, "佐賀営業所", None, &[], &[]).await;
+    car_inspection_base(
+        t,
+        "CERT-CARINS-1",
+        "佐賀 100 あ 7601",
+        " 長崎県長崎市 ",
+        "一歩運輸",
+    )
+    .await;
+    carins_base(t, nagasaki, "長崎県長崎市", "一歩運輸").await;
+    // 別のテナントの同じ登録番号の車検証は見えない
+    let other = tenant().await;
+    car_inspection_base(
+        other,
+        "CERT-CARINS-2",
+        "佐賀100あ7601",
+        "佐賀県佐賀市",
+        "一歩運輸",
+    )
+    .await;
+    let id = walk_switched_to_pending(&app, t, "切替 四郎").await;
+    set_vehicle(&id, "佐賀100あ7601").await;
+    let scope_uri = format!("/api/tenko/sessions/{id}/in-person-scope?judge={judge}");
+
+    let j = send_h(&app, "GET", &scope_uri, t, &admin_headers(), None)
+        .await
+        .json();
+    assert_eq!(
+        (
+            j["scope"].clone(),
+            j["vehicle_source"].clone(),
+            j["vehicle_offices"][0]["name"].clone()
+        ),
+        (json!("same_office"), json!("carins"), json!("長崎営業所"))
+    );
+
+    // 手で別の営業所に所属させると、車検証より優先する → 別の営業所 = 遠隔点呼とみなす
+    admin()
+        .await
+        .execute(
+            "INSERT INTO alc_api.maintenance_vehicles (tenant_id, registration_number, office_id) VALUES ($1, '佐賀 100 あ 7601', $2)",
+            &[&t, &saga],
+        )
+        .await
+        .unwrap();
+    let j = send_h(&app, "GET", &scope_uri, t, &admin_headers(), None)
+        .await
+        .json();
+    assert_eq!(
+        (
+            j["scope"].clone(),
+            j["vehicle_source"].clone(),
+            j["vehicle_offices"][0]["name"].clone()
+        ),
+        (json!("other_office"), json!("manual"), json!("佐賀営業所"))
+    );
+    let judged = send_h(
+        &app,
+        "POST",
+        &format!("/api/tenko/sessions/{id}/judgment"),
+        t,
+        &admin_headers(),
+        Some(json!({ "judgment": "ok", "judged_by_employee_id": judge })),
+    )
+    .await;
+    assert_eq!(judged.json()["tenko_method"], "遠隔点呼");
 }
 
 /// 車両の営業所と運行管理者の所属営業所が違う (別の営業所・グループ企業) ときは、告示 266 号 第四条 2 項により
