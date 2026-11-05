@@ -3238,7 +3238,7 @@ async fn switched_in_person_session_walks_to_judgment() {
     .await;
     assert_eq!(it.status, 400);
 
-    // 車両も運行管理者も所属が未設定 → 決められない (同じ営業所として通常点呼で記録する)
+    // 車両 (車検証に無い番号) も運行管理者も所属が未設定 → 決められない (同じ営業所として通常点呼で記録する)
     let scope = send_h(
         &app,
         "GET",
@@ -3251,7 +3251,7 @@ async fn switched_in_person_session_walks_to_judgment() {
     assert_eq!(scope.status, 200);
     assert_eq!(
         scope.json(),
-        json!({ "scope": "unknown", "vehicle_number": null, "vehicle_offices": [], "vehicle_source": null, "judge_offices": [] })
+        json!({ "scope": "unknown", "vehicle_number": "品川 100 あ 12-34", "vehicle_offices": [], "vehicle_source": null, "judge_offices": [] })
     );
 
     let judged = send_h(
