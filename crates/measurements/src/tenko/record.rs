@@ -76,6 +76,14 @@ pub struct TenkoSession {
     pub identity_method: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// 自動車登録番号又は車両番号 (自己点検表 業務前 二十 ハ。migration 204)
+    pub vehicle_number: Option<String>,
+    /// 車両番号の取得元: `carins` (車検証の読取) / `schedule` (予定の値) / `manual` (キオスクで入力)
+    pub vehicle_number_source: Option<String>,
+    /// 再開の判断を行った運行管理者の氏名 (業務前 二十 ヨ)
+    pub resumed_by_name: Option<String>,
+    /// 運行に従事できないと判断した場合の代替措置 (業務前 二十 タ)
+    pub alternative_measure: Option<String>,
 }
 
 impl TxOutput for TenkoSession {}
@@ -96,7 +104,8 @@ pub const SESSION_COLUMNS: &str = "s.id, s.tenant_id, s.employee_id, s.schedule_
      s.safety_judgment, s.daily_inspection, s.carrying_items_checked, s.started_at, s.completed_at, \
      s.carins_cert_no, s.carins_vehicle_id, s.carins_expires_on, s.carins_matched_by, s.escalated_to_remote_at, \
      s.remote_escalation_reason, s.manager_judgment, s.manager_judgment_reason, s.manager_judgment_by, \
-     s.manager_judgment_method, s.identity_method, s.created_at, s.updated_at";
+     s.manager_judgment_method, s.identity_method, s.created_at, s.updated_at, s.vehicle_number, \
+     s.vehicle_number_source, s.resumed_by_name, s.alternative_measure";
 
 /// セッション `s` が指す測定 `m` (無ければ値の欄は全部 NULL)
 pub const MEASUREMENT_JOIN: &str =
@@ -167,6 +176,10 @@ impl TenkoSession {
             identity_method: r.get(50),
             created_at: r.get(51),
             updated_at: r.get(52),
+            vehicle_number: r.get(53),
+            vehicle_number_source: r.get(54),
+            resumed_by_name: r.get(55),
+            alternative_measure: r.get(56),
         }
     }
 }
@@ -378,10 +391,10 @@ mod tests {
 
     #[test]
     fn session_columns_match_the_struct() {
-        // 位置で読むので、列の数と欄の数が合っていること (from_row の最後の位置 52 + 1)
-        assert_eq!(SESSION_COLUMNS.split(',').count(), 53);
+        // 位置で読むので、列の数と欄の数が合っていること (from_row の最後の位置 56 + 1)
+        assert_eq!(SESSION_COLUMNS.split(',').count(), 57);
         let json = serde_json::to_value(sample_session()).unwrap();
-        assert_eq!(json.as_object().unwrap().len(), 53);
+        assert_eq!(json.as_object().unwrap().len(), 57);
     }
 
     pub(crate) fn sample_session() -> TenkoSession {
@@ -442,6 +455,10 @@ mod tests {
             identity_method: None,
             created_at: at,
             updated_at: at,
+            vehicle_number: None,
+            vehicle_number_source: None,
+            resumed_by_name: None,
+            alternative_measure: None,
         }
     }
 

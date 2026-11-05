@@ -8,6 +8,10 @@
 //! - 段: `PUT …/medical`・`…/self-declaration` (安全判定を続けて行う)・`…/daily-inspection`・`…/carrying-items`・
 //!   `…/instruction-confirm`・`…/report`・`…/escalate-remote`、`POST …/cancel`・`…/interrupt`・`…/resume`・`…/self-resume`
 //! - アルコールの段は [`super::alcohol`]、運行管理者の判定は [`super::judgment`]
+//! - 自己点検表の不足を埋める口と規則 (alc-migrations 204): `PUT …/vehicle` (車両番号。車検証の登録番号 / 予定 / 手入力)、
+//!   測定の有効時間 (社員の基準値。`PUT …/medical` は過ぎた測定を 400 `measurement_expired`、再開・自己再開・アルコールの段の
+//!   直前へ進める段は未測定のアルコールで有効時間を過ぎていれば `medical_pending` へ戻す)、`self-resume` は管理者が再開済みでも
+//!   受け (再開の時刻・理由は上書きしない)、`resume` は再開した運行管理者の氏名 (`resumed_by_name`)、`cancel` は代替措置
 //! - 取り消し・中断・再開は運行管理者の鍵でも送れる (運行管理者の点呼の一覧から)。範囲は判定と同じ
 //!   ([`prod_manager_key`])。再開は管理者ログインか運行管理者の鍵だけ (キオスクの鍵は 401)
 //!
@@ -47,6 +51,7 @@ use super::record::{
     employee_name, record_or_log, TenkoSession, MEASUREMENT_JOIN, RETURNING_SESSION,
     SESSION_COLUMNS,
 };
+use crate::carins::{lookup_expiry, CarinsLookup};
 use crate::measurements::{device_id_from, DEFAULT_PAGE, DEFAULT_PER_PAGE, MAX_PER_PAGE};
 use crate::{set_device_dev, AppState};
 
@@ -100,17 +105,37 @@ pub struct SubmitReport {
     pub driver_alternation_audio_url: Option<String>,
 }
 
-/// rust の `CancelTenkoSession`・`InterruptSession`
+/// rust の `InterruptSession`
 #[derive(Debug, Clone, Deserialize)]
 pub struct Reason {
     #[serde(default)]
     pub reason: Option<String>,
 }
 
-/// rust の `ResumeSession`
+/// rust の `CancelTenkoSession` + 代替措置 (自己点検表 業務前 二十 タ。運行に従事できない場合の措置)
+#[derive(Debug, Clone, Deserialize)]
+pub struct Cancel {
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub alternative_measure: Option<String>,
+}
+
+/// rust の `ResumeSession` + 再開を判断した運行管理者の氏名 (業務前 二十 ヨ。`self-resume` は読むだけで使わない)
 #[derive(Debug, Clone, Deserialize)]
 pub struct Resume {
     pub reason: String,
+    #[serde(default)]
+    pub resumed_by_name: Option<String>,
+}
+
+/// `PUT …/vehicle` の本文 (業務前 二十 ハ)。どちらも無ければ 400
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetVehicle {
+    #[serde(default)]
+    pub carins_cert_no: Option<String>,
+    #[serde(default)]
+    pub vehicle_number: Option<String>,
 }
 
 /// rust の `EscalateToRemote`
@@ -245,9 +270,9 @@ pub mod sql {
         " ORDER BY s.created_at DESC LIMIT $9 OFFSET $10"
     );
 
-    /// 未消費の予定。$1 id / $2 tenant_id → employee_id, tenko_type, responsible_manager_name
+    /// 未消費の予定。$1 id / $2 tenant_id → employee_id, tenko_type, responsible_manager_name, vehicle_number
     pub const SCHEDULE_UNCONSUMED: &str =
-        "SELECT employee_id, tenko_type, responsible_manager_name \
+        "SELECT employee_id, tenko_type, responsible_manager_name, vehicle_number \
          FROM alc_api.tenko_schedules WHERE id = $1 AND tenant_id = $2 AND consumed = FALSE";
 
     /// 予定の消費。$1 id / $2 tenant_id
@@ -267,12 +292,13 @@ pub mod sql {
          VALUES ($1, $2, 'started', $3) RETURNING id";
 
     /// $1 tenant_id / $2 employee_id / $3 schedule_id / $4 tenko_type / $5 tenko_method / $6 status /
-    /// $7 identity_face_photo_url / $8 location / $9 responsible_manager_name / $10 measurement_id
+    /// $7 identity_face_photo_url / $8 location / $9 responsible_manager_name / $10 measurement_id /
+    /// $11 vehicle_number (予定の値) / $12 vehicle_number_source
     pub const CREATE: &str = concatcp!(
         "WITH s AS (INSERT INTO alc_api.tenko_sessions (tenant_id, employee_id, schedule_id, tenko_type, tenko_method, status, \
              identity_verified_at, identity_face_photo_url, location, responsible_manager_name, started_at, \
-             measurement_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, NOW(), $10)",
+             measurement_id, vehicle_number, vehicle_number_source) \
+         VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, NOW(), $10, $11, $12)",
         RETURNING_SESSION
     );
 
@@ -313,10 +339,11 @@ pub mod sql {
         RETURNING_SESSION
     );
 
+    /// $1 reason / $2 alternative_measure (無ければ既存の値を保つ) / $3 id / $4 tenant_id
     pub const CANCEL: &str = concatcp!(
         "WITH s AS (UPDATE alc_api.tenko_sessions SET status = 'cancelled', cancel_reason = $1, completed_at = NOW(), \
-             updated_at = NOW() \
-         WHERE id = $2 AND tenant_id = $3",
+             alternative_measure = COALESCE($2, alternative_measure), updated_at = NOW() \
+         WHERE id = $3 AND tenant_id = $4",
         RETURNING_SESSION
     );
 
@@ -354,18 +381,21 @@ pub mod sql {
         RETURNING_SESSION
     );
 
+    /// $1 status / $2 reason / $3 再開した管理者の user_id / $4 再開した運行管理者の氏名 / $5 id / $6 tenant_id
     pub const RESUME: &str = concatcp!(
         "WITH s AS (UPDATE alc_api.tenko_sessions SET status = $1, resumed_at = NOW(), resume_reason = $2, \
-             resumed_by_user_id = $3, updated_at = NOW() \
-         WHERE id = $4 AND tenant_id = $5",
+             resumed_by_user_id = $3, resumed_by_name = $4, updated_at = NOW() \
+         WHERE id = $5 AND tenant_id = $6",
         RETURNING_SESSION
     );
 
-    /// 「再開は 1 回まで」を WHERE の `resumed_at IS NULL` で担保する (2 回目は 0 行)
+    /// 管理者が再開済みのセッションも受ける: 再開の時刻・理由・管理者は既にあれば上書きしない
+    /// (業務前 十三。本人確認はキオスクが self-resume の前に行う)
     pub const SELF_RESUME: &str = concatcp!(
-        "WITH s AS (UPDATE alc_api.tenko_sessions SET resumed_at = NOW(), resume_reason = $1, resumed_by_user_id = $2, \
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET resumed_at = COALESCE(resumed_at, NOW()), \
+             resume_reason = COALESCE(resume_reason, $1), resumed_by_user_id = COALESCE(resumed_by_user_id, $2), \
              updated_at = NOW() \
-         WHERE id = $3 AND tenant_id = $4 AND resumed_at IS NULL",
+         WHERE id = $3 AND tenant_id = $4",
         RETURNING_SESSION
     );
 
@@ -381,6 +411,32 @@ pub mod sql {
         "SELECT ",
         BASELINE_COLUMNS,
         " FROM alc_api.employee_health_baselines WHERE tenant_id = $1 AND employee_id = $2"
+    );
+
+    /// 測定の有効時間 (分。業務前 八)。$1 tenant_id / $2 employee_id。行が無ければ [`DEFAULT_VALIDITY_MINUTES`]
+    pub const VALIDITY_MINUTES: &str =
+        "SELECT measurement_validity_minutes FROM alc_api.employee_health_baselines \
+         WHERE tenant_id = $1 AND employee_id = $2";
+
+    /// 有効時間を過ぎた体温・血圧を測り直させる。$1 id / $2 tenant_id
+    pub const BACK_TO_MEDICAL: &str = concatcp!(
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET status = 'medical_pending', updated_at = NOW() \
+         WHERE id = $1 AND tenant_id = $2",
+        RETURNING_SESSION
+    );
+
+    /// 予定の車両番号。$1 schedule_id / $2 tenant_id
+    pub const SCHEDULE_VEHICLE: &str =
+        "SELECT vehicle_number FROM alc_api.tenko_schedules WHERE id = $1 AND tenant_id = $2";
+
+    /// 車両番号の記録。$1 vehicle_number / $2 source / $3 carins_cert_no / $4 carins_expires_on / $5 carins_matched_by
+    /// ($3〜$5 は車検証に一致したときだけ値を入れ、無ければ既存の値を保つ) / $6 id / $7 tenant_id
+    pub const SET_VEHICLE: &str = concatcp!(
+        "WITH s AS (UPDATE alc_api.tenko_sessions SET vehicle_number = $1, vehicle_number_source = $2, \
+             carins_cert_no = COALESCE($3, carins_cert_no), carins_expires_on = COALESCE($4, carins_expires_on), \
+             carins_matched_by = COALESCE($5, carins_matched_by), updated_at = NOW() \
+         WHERE id = $6 AND tenant_id = $7",
+        RETURNING_SESSION
     );
 
     /// 携行品のマスタの件数。$1 tenant_id
@@ -423,6 +479,25 @@ pub fn baseline(r: &Row) -> EmployeeHealthBaseline {
         diastolic_tolerance: r.get(4),
         temperature_tolerance: r.get(5),
     }
+}
+
+/// 測定の有効時間の既定 (分。基準値の行が無い社員。`employee_health_baselines.measurement_validity_minutes` の DEFAULT と同じ)
+pub const DEFAULT_VALIDITY_MINUTES: i32 = 30;
+
+/// 体温・血圧の測定が有効時間を過ぎているか
+pub fn medical_expired(
+    measured_at: DateTime<Utc>,
+    validity_minutes: i32,
+    now: DateTime<Utc>,
+) -> bool {
+    measured_at < now - chrono::Duration::minutes(i64::from(validity_minutes))
+}
+
+/// 空・空白だけの入力は無いものとして扱い、前後の空白を落とす
+pub fn clean(v: Option<&str>) -> Option<String> {
+    v.map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
 }
 
 /// ページの番号と件数 (測定の一覧と同じ: 件数の既定 50・上限 100、番号は 1 から)。返すのは (page, per_page, 飛ばす件数)
@@ -613,6 +688,50 @@ async fn instruction(
         .and_then(|r| r.get(0)))
 }
 
+/// 社員の測定の有効時間 (分)。基準値の行が無ければ [`DEFAULT_VALIDITY_MINUTES`]
+pub async fn validity_minutes(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+) -> Result<i32, Error> {
+    Ok(tx
+        .query_typed_opt(
+            sql::VALIDITY_MINUTES,
+            &[(&tenant_id, Type::UUID), (&employee_id, Type::UUID)],
+        )
+        .await?
+        .map_or(DEFAULT_VALIDITY_MINUTES, |r| r.get(0)))
+}
+
+/// アルコール未測定で、記録済みの体温・血圧の測定が有効時間を過ぎていれば、状態を `medical_pending` へ戻す
+/// (業務前 八。体温・血圧の測り直しから。自己申告と安全判定もやり直し)。再開と、アルコールの段の直前へ進める段が使う。
+/// 戻さないときは受けたセッションをそのまま返す
+pub async fn back_to_medical_if_expired(
+    tx: &TenantTx<'_>,
+    s: TenkoSession,
+    now: DateTime<Utc>,
+) -> Result<TenkoSession, Error> {
+    let Some(measured_at) = s.medical_measured_at else {
+        return Ok(s);
+    };
+    if s.alcohol_result.is_some()
+        || s.tenko_type != "pre_operation"
+        || s.status == "medical_pending"
+    {
+        return Ok(s);
+    }
+    let minutes = validity_minutes(tx, s.tenant_id, s.employee_id).await?;
+    if !medical_expired(measured_at, minutes, now) {
+        return Ok(s);
+    }
+    one(
+        tx,
+        sql::BACK_TO_MEDICAL,
+        &[(&s.id, Type::UUID), (&s.tenant_id, Type::UUID)],
+    )
+    .await
+}
+
 // --- 口 ---
 
 pub fn router() -> Router<AppState> {
@@ -621,6 +740,7 @@ pub fn router() -> Router<AppState> {
         .route("/tenko/sessions/start", post(start_handler))
         .route("/tenko/sessions/{id}", get(get_handler))
         .route("/tenko/sessions/{id}/medical", put(medical_handler))
+        .route("/tenko/sessions/{id}/vehicle", put(vehicle_handler))
         .route(
             "/tenko/sessions/{id}/escalate-remote",
             put(escalate_handler),
@@ -798,7 +918,7 @@ async fn start_handler(
         move |tx| {
             Box::pin(async move {
                 // 予定あり (自動点呼) / なし (遠隔点呼)
-                let (tenko_type, method, manager) = match body.schedule_id {
+                let (tenko_type, method, manager, vehicle) = match body.schedule_id {
                     Some(sid) => {
                         let row = tx
                             .query_typed_opt(
@@ -817,7 +937,12 @@ async fn start_handler(
                             &[(&sid, Type::UUID), (&tenant_id, Type::UUID)],
                         )
                         .await?;
-                        (row.get::<_, String>(1), AUTO, Some(row.get::<_, String>(2)))
+                        (
+                            row.get::<_, String>(1),
+                            AUTO,
+                            Some(row.get::<_, String>(2)),
+                            clean(row.get::<_, Option<String>>(3).as_deref()),
+                        )
                     }
                     None => (
                         body.tenko_type
@@ -825,8 +950,11 @@ async fn start_handler(
                             .unwrap_or_else(|| "pre_operation".to_owned()),
                         REMOTE,
                         None,
+                        None,
                     ),
                 };
+                // 予定に車両番号があればセッションへ写す (取得元は schedule)
+                let vehicle_source = vehicle.as_ref().map(|_| "schedule");
                 // 業務前は体温・血圧から始める
                 let status = if tenko_type == "pre_operation" {
                     "medical_pending"
@@ -860,6 +988,8 @@ async fn start_handler(
                         (&body.location, Type::TEXT),
                         (&manager, Type::TEXT),
                         (&measurement_id, Type::UUID),
+                        (&vehicle, Type::TEXT),
+                        (&vehicle_source, Type::TEXT),
                     ],
                 )
                 .await?;
@@ -895,6 +1025,7 @@ async fn medical_handler(
     Path(id): Path<Uuid>,
     Json(body): Json<SubmitMedical>,
 ) -> Response {
+    let at = now(&state);
     run(
         state,
         tenant_id,
@@ -928,6 +1059,18 @@ async fn medical_handler(
                 if cur.tenko_method == AUTO && (body.systolic.is_none() || body.diastolic.is_none())
                 {
                     return Ok(Flow::Api(bad_request("bp_required", BP_REQUIRED_MESSAGE)));
+                }
+                // 測定から有効時間 (社員の基準値。無ければ 30 分) を過ぎた値は受けない (業務前 八)
+                if let Some(measured_at) = body.medical_measured_at {
+                    let minutes = validity_minutes(tx, tenant_id, cur.employee_id).await?;
+                    if medical_expired(measured_at, minutes, at) {
+                        return Ok(Flow::Api(bad_request(
+                            "measurement_expired",
+                            &format!(
+                                "測定から有効時間 ({minutes} 分) を過ぎています。もう一度測定してください"
+                            ),
+                        )));
+                    }
                 }
                 // 値の置き場の測定に先に書く (セッションの応答はその測定から読む)。測定を持たない古いセッションは、
                 // 開始の口と同じ started の測定を作って結ぶ
@@ -1156,10 +1299,11 @@ async fn cancel_handler(
     Extension(dev): Extension<DeviceDevSlot>,
     user: Option<Extension<AuthUser>>,
     Path(id): Path<Uuid>,
-    Json(body): Json<Reason>,
+    Json(body): Json<Cancel>,
 ) -> Response {
     let log = state.log.clone();
     let prod_manager = prod_manager_key(&dev, user.is_some());
+    let alternative_measure = clean(body.alternative_measure.as_deref());
     run(
         state,
         tenant_id,
@@ -1187,6 +1331,7 @@ async fn cancel_handler(
                     sql::CANCEL,
                     &[
                         (&body.reason, Type::TEXT),
+                        (&alternative_measure, Type::TEXT),
                         (&id, Type::UUID),
                         (&tenant_id, Type::UUID),
                     ],
@@ -1378,6 +1523,12 @@ async fn daily_inspection_handler(
                 )
                 .await?;
                 if !has_ng {
+                    // 携行品の確認が無く、アルコールの段の直前 (本人確認済み) へ進んだときは測定の有効時間を見る
+                    let s = if next == "identity_verified" {
+                        back_to_medical_if_expired(tx, s, at).await?
+                    } else {
+                        s
+                    };
                     return Ok(Flow::Session(Box::new(s), None));
                 }
                 record_or_log(tx, &s, &log).await;
@@ -1465,6 +1616,8 @@ async fn carrying_items_handler(
                     ],
                 )
                 .await?;
+                // アルコールの段の直前: 体温・血圧の測定が有効時間を過ぎていれば測り直しへ戻す
+                let s = back_to_medical_if_expired(tx, s, at).await?;
                 Ok(Flow::Session(Box::new(s), None))
             })
         },
@@ -1550,7 +1703,21 @@ async fn resume_handler(
     }
     let prod_manager = prod_manager_key(&dev, user.is_some());
     // 運行管理者の鍵からは NULL のまま (承認した管理者の列なので、ログインの無い席で埋めると嘘になる)
-    let by = user.map(|Extension(u)| u.user_id);
+    let by = user.as_ref().map(|Extension(u)| u.user_id);
+    // 再開を判断した運行管理者の氏名 (業務前 二十 ヨ)。ログインの利用者は省略時にその名前 (空ならメール)、運行管理者の鍵は必須
+    let by_name = clean(body.resumed_by_name.as_deref()).or_else(|| {
+        // kit の復元は name を空で入れるため (ヘッダーに名前が無い)、空ならメールで代える
+        user.as_ref()
+            .and_then(|Extension(u)| clean(Some(&u.name)).or_else(|| clean(Some(&u.email))))
+    });
+    let Some(by_name) = by_name else {
+        return bad_request(
+            "resumed_by_name_required",
+            "再開した運行管理者の氏名は必須です",
+        )
+        .into_response();
+    };
+    let at = now(&state);
     run(
         state,
         tenant_id,
@@ -1576,11 +1743,14 @@ async fn resume_handler(
                         (&to, Type::TEXT),
                         (&body.reason, Type::TEXT),
                         (&by, Type::UUID),
+                        (&by_name, Type::TEXT),
                         (&id, Type::UUID),
                         (&tenant_id, Type::UUID),
                     ],
                 )
                 .await?;
+                // 再開先がアルコールの段の前で、測定が有効時間を過ぎていれば体温・血圧の測り直しから
+                let s = back_to_medical_if_expired(tx, s, at).await?;
                 Ok(Flow::Session(Box::new(s), None))
             })
         },
@@ -1602,6 +1772,7 @@ async fn self_resume_handler(
     }
     // キオスク (端末の鍵 = AuthUser 無し) からは NULL のまま (承認した管理者の列なので埋めると嘘になる)
     let by = user.map(|Extension(u)| u.user_id);
+    let at = now(&state);
     run(
         state,
         tenant_id,
@@ -1619,24 +1790,120 @@ async fn self_resume_handler(
                         "この点呼は再開できません。新しく点呼をやり直してください",
                     )));
                 }
-                let row = tx
-                    .query_typed_opt(
-                        sql::SELF_RESUME,
-                        &[
-                            (&reason, Type::TEXT),
-                            (&by, Type::UUID),
-                            (&id, Type::UUID),
-                            (&tenant_id, Type::UUID),
-                        ],
-                    )
-                    .await?;
-                Ok(match row {
-                    Some(r) => Flow::Session(Box::new(TenkoSession::from_row(&r)), None),
-                    None => Flow::Api(bad_request(
-                        "already_resumed",
-                        "この点呼は既に再開済みです。新しく点呼をやり直してください",
-                    )),
-                })
+                // 管理者が再開済みでも受ける (再開の時刻・理由・管理者は上書きしない)
+                let s = one(
+                    tx,
+                    sql::SELF_RESUME,
+                    &[
+                        (&reason, Type::TEXT),
+                        (&by, Type::UUID),
+                        (&id, Type::UUID),
+                        (&tenant_id, Type::UUID),
+                    ],
+                )
+                .await?;
+                // 測定が有効時間を過ぎていれば体温・血圧の測り直しから
+                let s = back_to_medical_if_expired(tx, s, at).await?;
+                Ok(Flow::Session(Box::new(s), None))
+            })
+        },
+    )
+    .await
+}
+
+/// 車両番号 `PUT /tenko/sessions/{id}/vehicle` (自己点検表 業務前 二十 ハ)。終わっていないセッションだけ。
+/// 車検証の管理番号が car_inspection に一致すればその登録番号 (取得元 `carins`)、
+/// 一致しない・無ければ入力の車両番号 (予定の値と同じなら `schedule`、違えば `manual`)。どちらも無ければ 400
+async fn vehicle_handler(
+    State(state): State<AppState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Extension(dev): Extension<DeviceDevSlot>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetVehicle>,
+) -> Response {
+    let cert_no = clean(body.carins_cert_no.as_deref());
+    let typed = clean(body.vehicle_number.as_deref());
+    if cert_no.is_none() && typed.is_none() {
+        return bad_request(
+            "vehicle_required",
+            "車検証の番号か車両番号を入力してください",
+        )
+        .into_response();
+    }
+    run(
+        state,
+        tenant_id,
+        dev.get(),
+        "session vehicle",
+        true,
+        move |tx| {
+            Box::pin(async move {
+                let Some(cur) = fetch(tx, tenant_id, id).await? else {
+                    return Ok(Flow::Api(not_found("session_not_found")));
+                };
+                if is_terminal(&cur.status) {
+                    return Ok(Flow::Api(bad_request(
+                        "session_not_editable",
+                        "この点呼は終了しているため車両番号を変更できません",
+                    )));
+                }
+                let found = match cert_no.as_deref() {
+                    Some(c) => lookup_expiry(tx, tenant_id, Some(c), None).await?,
+                    None => CarinsLookup {
+                        expires_on: None,
+                        matched_by: "none",
+                        car_no: None,
+                    },
+                };
+                // 車検証に一致したときだけ carins の列も埋める (一致しなければ既存の値を保つ)
+                let matched = found.car_no.is_some();
+                let carins_cert: Option<&str> = cert_no.as_deref().filter(|_| matched);
+                let carins_expires: Option<chrono::NaiveDate> =
+                    found.expires_on.filter(|_| matched);
+                let carins_matched: Option<&str> = matched.then_some(found.matched_by);
+                let (vehicle, source) = match found.car_no {
+                    Some(car_no) => (car_no, "carins"),
+                    None => {
+                        let Some(typed) = typed else {
+                            return Ok(Flow::Api(bad_request(
+                                "vehicle_required",
+                                "車検証が見つかりません。車両番号を入力してください",
+                            )));
+                        };
+                        let scheduled: Option<String> = match cur.schedule_id {
+                            Some(sid) => tx
+                                .query_typed_opt(
+                                    sql::SCHEDULE_VEHICLE,
+                                    &[(&sid, Type::UUID), (&tenant_id, Type::UUID)],
+                                )
+                                .await?
+                                .and_then(|r| r.get(0)),
+                            None => None,
+                        };
+                        let source = if scheduled.as_deref().map(str::trim) == Some(typed.as_str())
+                        {
+                            "schedule"
+                        } else {
+                            "manual"
+                        };
+                        (typed, source)
+                    }
+                };
+                let s = one(
+                    tx,
+                    sql::SET_VEHICLE,
+                    &[
+                        (&vehicle, Type::TEXT),
+                        (&source, Type::TEXT),
+                        (&carins_cert, Type::TEXT),
+                        (&carins_expires, Type::DATE),
+                        (&carins_matched, Type::TEXT),
+                        (&id, Type::UUID),
+                        (&tenant_id, Type::UUID),
+                    ],
+                )
+                .await?;
+                Ok(Flow::Session(Box::new(s), None))
             })
         },
     )
@@ -1698,6 +1965,18 @@ mod tests {
     fn remote_waits_for_judgment() {
         assert_eq!(finished_status("遠隔点呼"), "judgment_pending");
         assert_eq!(finished_status("自動点呼"), "completed");
+    }
+
+    #[test]
+    fn medical_expiry_and_clean() {
+        let now: DateTime<Utc> = "2026-10-22T22:00:00Z".parse().unwrap();
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        // ちょうど有効時間は有効、1 秒過ぎたら過ぎている
+        assert!(!medical_expired(at("2026-10-22T21:30:00Z"), 30, now));
+        assert!(medical_expired(at("2026-10-22T21:29:59Z"), 30, now));
+        assert_eq!(clean(Some("  品川 ")), Some("品川".to_owned()));
+        assert_eq!(clean(Some("  ")), None);
+        assert_eq!(clean(None), None);
     }
 
     #[test]

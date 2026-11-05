@@ -101,9 +101,17 @@ async fn sess(
         extra.push(("started_at", "NOW()"));
     }
     // 値 (体温・血圧) は値の置き場の測定に入れ、セッションはそれを指す (セッションの値の列は読まれない)
-    let (values, mut extra): (Vec<_>, Vec<_>) = extra
-        .into_iter()
-        .partition(|(c, _)| ["temperature", "systolic", "diastolic", "pulse"].contains(c));
+    let (values, mut extra): (Vec<_>, Vec<_>) = extra.into_iter().partition(|(c, _)| {
+        [
+            "temperature",
+            "systolic",
+            "diastolic",
+            "pulse",
+            "medical_measured_at",
+            "result",
+        ]
+        .contains(c)
+    });
     if !values.is_empty() {
         let cols: String = values.iter().map(|(c, _)| format!(", {c}")).collect();
         let vals: String = values.iter().map(|(_, v)| format!(", {v}")).collect();
@@ -1140,12 +1148,10 @@ async fn self_resume_rules() {
         ),
         (json!("電池切れ"), Value::Null, json!("medical_pending"))
     );
-    assert_eq!(
-        send(&app, "POST", &uri, t, Some(json!({ "reason": "x" })))
-            .await
-            .json()["error"],
-        "already_resumed"
-    );
+    // 2 回目も受ける (再開の時刻・理由は最初の値のまま。管理者が再開済みのセッションも受けるため)
+    let again = send(&app, "POST", &uri, t, Some(json!({ "reason": "x" }))).await;
+    assert_eq!(again.status, 200);
+    assert_eq!(again.json()["resume_reason"], "電池切れ");
     let s2 = sess(t, emp, "pre_operation", "自動点呼", "medical_pending", &[]).await;
     let by = send_h(
         &app,
@@ -2257,7 +2263,7 @@ async fn manager_key_cancel_interrupt_resume_scope() {
         ("X-Device-Dev", "1"),
     ];
     let u = |id: Uuid, step: &str| format!("/api/tenko/sessions/{id}/{step}");
-    let reason = || Some(json!({ "reason": "席から" }));
+    let reason = || Some(json!({ "reason": "席から", "resumed_by_name": "席 管理者" }));
 
     // 本番の席の鍵: IT点呼 でない点呼には触れない (403。行は変わらない)
     let remote = sess(t, emp, "pre_operation", "遠隔点呼", "medical_pending", &[]).await;
@@ -2290,8 +2296,16 @@ async fn manager_key_cancel_interrupt_resume_scope() {
         .await
         .json();
     assert_eq!(
-        (r["status"].clone(), r["resumed_by_user_id"].clone()),
-        (json!("daily_inspection_pending"), Value::Null)
+        (
+            r["status"].clone(),
+            r["resumed_by_user_id"].clone(),
+            r["resumed_by_name"].clone()
+        ),
+        (
+            json!("daily_inspection_pending"),
+            Value::Null,
+            json!("席 管理者")
+        )
     );
     let c = send_h(&app, "POST", &u(it, "cancel"), t, &key, reason())
         .await
@@ -2314,4 +2328,566 @@ async fn manager_key_cancel_interrupt_resume_scope() {
         .await
         .json();
     assert_eq!(r["status"], "daily_inspection_pending");
+}
+
+/// 業務前 八: 体温・血圧の測定の有効時間 (社員の基準値。無ければ 30 分)。過ぎた値は受けず、再開・自己再開・
+/// アルコールの段の直前へ進める段は、アルコール未測定で過ぎていれば体温・血圧の測り直しへ戻す
+#[tokio::test]
+async fn medical_validity_window() {
+    let app = app().await;
+    let t = tenant().await;
+    let emp = employee(t, "有効 一郎").await;
+    // 要求の今は 2026-10-22T22:00:00Z。30 分前より古い値は過ぎている
+    let old = "'2026-10-22T21:00:00Z'";
+    let fresh = "'2026-10-22T21:50:00Z'";
+    let medical = |at: &str| json!({ "temperature": 36.5, "systolic": 120, "diastolic": 80, "medical_measured_at": at });
+
+    // PUT …/medical: 既定の 30 分
+    let m = sess(t, emp, "pre_operation", "自動点呼", "medical_pending", &[]).await;
+    let uri = format!("/api/tenko/sessions/{m}/medical");
+    let got = send(&app, "PUT", &uri, t, Some(medical("2026-10-22T21:00:00Z"))).await;
+    assert_eq!(got.status, 400);
+    assert_eq!(
+        got.json(),
+        json!({ "error": "measurement_expired", "message": "測定から有効時間 (30 分) を過ぎています。もう一度測定してください" })
+    );
+    assert_eq!(session_status(m).await, "medical_pending");
+    let ok = send(&app, "PUT", &uri, t, Some(medical("2026-10-22T21:40:00Z"))).await;
+    assert_eq!(
+        (ok.status, ok.json()["status"].clone()),
+        (200, json!("self_declaration_pending"))
+    );
+
+    // 社員の基準値の有効時間 (90 分) が使われる
+    let emp90 = employee(t, "有効 二郎").await;
+    baseline(t, emp90).await;
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.employee_health_baselines SET measurement_validity_minutes = 90 WHERE employee_id = $1",
+            &[&emp90],
+        )
+        .await
+        .unwrap();
+    let m90 = sess(
+        t,
+        emp90,
+        "pre_operation",
+        "自動点呼",
+        "medical_pending",
+        &[],
+    )
+    .await;
+    let uri90 = format!("/api/tenko/sessions/{m90}/medical");
+    let got = send(
+        &app,
+        "PUT",
+        &uri90,
+        t,
+        Some(medical("2026-10-22T20:00:00Z")),
+    )
+    .await;
+    assert_eq!(got.status, 400);
+    assert!(got.json()["message"].as_str().unwrap().contains("(90 分)"));
+    assert_eq!(
+        send(
+            &app,
+            "PUT",
+            &uri90,
+            t,
+            Some(medical("2026-10-22T21:00:00Z"))
+        )
+        .await
+        .status,
+        200
+    );
+
+    // 管理者の再開: 未測定で過ぎていれば測り直し。新しければ従来の再開先。アルコール測定済みなら戻さない
+    let resume = |id: Uuid| format!("/api/tenko/sessions/{id}/resume");
+    let body = Some(json!({ "reason": "確認済み" }));
+    for (extra, want) in [
+        (("medical_measured_at", old), "medical_pending"),
+        (("medical_measured_at", fresh), "daily_inspection_pending"),
+    ] {
+        let id = sess(t, emp, "pre_operation", "自動点呼", "interrupted", &[extra]).await;
+        let r = send_h(&app, "POST", &resume(id), t, &admin_headers(), body.clone()).await;
+        assert_eq!(r.json()["status"], want);
+        assert_eq!(session_status(id).await, want);
+    }
+    let measured = sess(
+        t,
+        emp,
+        "pre_operation",
+        "自動点呼",
+        "interrupted",
+        &[("medical_measured_at", old), ("result", "'pass'")],
+    )
+    .await;
+    let r = send_h(&app, "POST", &resume(measured), t, &admin_headers(), body).await;
+    assert_eq!(r.json()["status"], "daily_inspection_pending");
+
+    // キオスクの自己再開: 状態はそのまま、ただし過ぎていれば測り直し (測り直し中の再送は何もしない)
+    let selfr = |id: Uuid| format!("/api/tenko/sessions/{id}/self-resume");
+    let body = Some(json!({ "reason": "電池切れ" }));
+    for (status, extra, want) in [
+        (
+            "daily_inspection_pending",
+            ("medical_measured_at", old),
+            "medical_pending",
+        ),
+        (
+            "medical_pending",
+            ("medical_measured_at", old),
+            "medical_pending",
+        ),
+        (
+            "daily_inspection_pending",
+            ("medical_measured_at", fresh),
+            "daily_inspection_pending",
+        ),
+    ] {
+        let id = sess(t, emp, "pre_operation", "自動点呼", status, &[extra]).await;
+        let r = send(&app, "POST", &selfr(id), t, body.clone()).await;
+        assert_eq!(r.json()["status"], want);
+    }
+
+    // 携行品の確認の後 (アルコールの段の直前)
+    let carry = |id: Uuid| format!("/api/tenko/sessions/{id}/carrying-items");
+    for (extra, want) in [
+        (("medical_measured_at", old), "medical_pending"),
+        (("medical_measured_at", fresh), "identity_verified"),
+    ] {
+        let id = sess(
+            t,
+            emp,
+            "pre_operation",
+            "自動点呼",
+            "carrying_items_pending",
+            &[extra],
+        )
+        .await;
+        let r = send(&app, "PUT", &carry(id), t, Some(json!({ "checks": [] }))).await;
+        assert_eq!(r.json()["status"], want);
+    }
+
+    // 携行品が無いテナントでは日常点検の後が直前。携行品の確認が残るときはまだ見ない
+    let none = tenant().await;
+    let e2 = employee(none, "有効 三郎").await;
+    let all_ok = json!({ "brakes": "ok", "tires": "ok", "lights": "ok", "steering": "ok", "wipers": "ok", "mirrors": "ok", "horn": "ok", "seatbelts": "ok" });
+    for (extra, want) in [
+        (("medical_measured_at", old), "medical_pending"),
+        (("medical_measured_at", fresh), "identity_verified"),
+    ] {
+        let id = sess(
+            none,
+            e2,
+            "pre_operation",
+            "自動点呼",
+            "daily_inspection_pending",
+            &[extra],
+        )
+        .await;
+        let r = send(
+            &app,
+            "PUT",
+            &format!("/api/tenko/sessions/{id}/daily-inspection"),
+            none,
+            Some(all_ok.clone()),
+        )
+        .await;
+        assert_eq!(r.json()["status"], want);
+    }
+    admin()
+        .await
+        .execute(
+            "INSERT INTO alc_api.carrying_items (tenant_id, item_name) VALUES ($1, '免許証')",
+            &[&none],
+        )
+        .await
+        .unwrap();
+    let id = sess(
+        none,
+        e2,
+        "pre_operation",
+        "自動点呼",
+        "daily_inspection_pending",
+        &[("medical_measured_at", old)],
+    )
+    .await;
+    let r = send(
+        &app,
+        "PUT",
+        &format!("/api/tenko/sessions/{id}/daily-inspection"),
+        none,
+        Some(all_ok),
+    )
+    .await;
+    assert_eq!(r.json()["status"], "carrying_items_pending");
+}
+
+/// 業務前 二十 ヨ・タ と 十三: 再開した運行管理者の氏名、代替措置、管理者が再開済みのセッションの自己再開
+#[tokio::test]
+async fn resume_name_alternative_measure_and_self_resume_after_manager() {
+    let app = app().await;
+    let t = tenant().await;
+    let emp = employee(t, "再開 一郎").await;
+    let key = [("X-Device-Role", "device-tenko-manager")];
+    let resume = |id: Uuid| format!("/api/tenko/sessions/{id}/resume");
+
+    // 運行管理者の鍵からは氏名が必須 (空白だけも 400)。ログインの利用者は省略時にその利用者の表示 (名前が無ければメール)
+    let id = sess(t, emp, "pre_operation", "IT点呼", "interrupted", &[]).await;
+    for b in [
+        json!({ "reason": "確認" }),
+        json!({ "reason": "確認", "resumed_by_name": "  " }),
+    ] {
+        let r = send_h(&app, "POST", &resume(id), t, &key, Some(b)).await;
+        assert_eq!(
+            (r.status, r.json()["error"].clone()),
+            (400, json!("resumed_by_name_required"))
+        );
+    }
+    assert_eq!(session_status(id).await, "interrupted");
+    let r = send_h(
+        &app,
+        "POST",
+        &resume(id),
+        t,
+        &admin_headers(),
+        Some(json!({ "reason": "確認" })),
+    )
+    .await
+    .json();
+    assert_eq!(r["resumed_by_name"], "admin@example.invalid");
+    let id2 = sess(t, emp, "pre_operation", "IT点呼", "interrupted", &[]).await;
+    let r = send_h(
+        &app,
+        "POST",
+        &resume(id2),
+        t,
+        &admin_headers(),
+        Some(json!({ "reason": "確認", "resumed_by_name": " 運行 太郎 " })),
+    )
+    .await
+    .json();
+    assert_eq!(r["resumed_by_name"], "運行 太郎");
+
+    // キオスクの自己再開は管理者が再開済みでも受け、再開の時刻・理由・管理者を上書きしない
+    let before = admin()
+        .await
+        .query_one(
+            "SELECT resumed_at::text, resume_reason, resumed_by_user_id FROM alc_api.tenko_sessions WHERE id = $1",
+            &[&id2],
+        )
+        .await
+        .unwrap();
+    let got = send(
+        &app,
+        "POST",
+        &format!("/api/tenko/sessions/{id2}/self-resume"),
+        t,
+        Some(json!({ "reason": "キオスクから" })),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    let j = got.json();
+    assert_eq!(
+        (
+            j["resume_reason"].clone(),
+            j["resumed_by_user_id"].clone(),
+            j["resumed_by_name"].clone(),
+            j["status"].clone()
+        ),
+        (
+            json!("確認"),
+            json!(before.get::<_, Option<Uuid>>(2).map(|u| u.to_string())),
+            json!("運行 太郎"),
+            json!("daily_inspection_pending")
+        )
+    );
+    let after = admin()
+        .await
+        .query_one(
+            "SELECT resumed_at::text FROM alc_api.tenko_sessions WHERE id = $1",
+            &[&id2],
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.get::<_, String>(0), before.get::<_, String>(0));
+
+    // 代替措置: 取り消しの本文に付き、記録 (record_data) にも入る。無ければ NULL
+    let c1 = sess(t, emp, "pre_operation", "自動点呼", "medical_pending", &[]).await;
+    let c = send(
+        &app,
+        "POST",
+        &format!("/api/tenko/sessions/{c1}/cancel"),
+        t,
+        Some(json!({ "reason": "体調不良", "alternative_measure": " 別の乗務員に交代 " })),
+    )
+    .await
+    .json();
+    assert_eq!(c["alternative_measure"], "別の乗務員に交代");
+    assert_eq!(
+        records(c1).await[0].2["alternative_measure"],
+        "別の乗務員に交代"
+    );
+    let c2 = sess(t, emp, "pre_operation", "自動点呼", "medical_pending", &[]).await;
+    let c = send(
+        &app,
+        "POST",
+        &format!("/api/tenko/sessions/{c2}/cancel"),
+        t,
+        Some(json!({ "reason": "体調不良" })),
+    )
+    .await
+    .json();
+    assert_eq!(c["alternative_measure"], Value::Null);
+
+    // 判定: 従事できない (ng) 判定の代替措置は判定待ちを閉じるときにも、記録済みへの押し直しにも入る。ok では保存しない
+    let judge = manager(t, "manager").await;
+    let j = |id: Uuid| format!("/api/tenko/sessions/{id}/judgment");
+    let jb = |v: &str, alt: Option<&str>| json!({ "judgment": v, "judged_by_employee_id": judge, "reason": "確認", "alternative_measure": alt });
+    let pending = sess(t, emp, "pre_operation", "遠隔点呼", "judgment_pending", &[]).await;
+    let r = send_h(
+        &app,
+        "POST",
+        &j(pending),
+        t,
+        &admin_headers(),
+        Some(jb("ng", Some("運行を見合わせる"))),
+    )
+    .await
+    .json();
+    assert_eq!(r["alternative_measure"], "運行を見合わせる");
+    assert_eq!(
+        records(pending).await[0].2["alternative_measure"],
+        "運行を見合わせる"
+    );
+    let ok_pending = sess(t, emp, "pre_operation", "遠隔点呼", "judgment_pending", &[]).await;
+    let r = send_h(
+        &app,
+        "POST",
+        &j(ok_pending),
+        t,
+        &admin_headers(),
+        Some(jb("ok", Some("不要"))),
+    )
+    .await
+    .json();
+    assert_eq!(r["alternative_measure"], Value::Null);
+    let done = sess(t, emp, "pre_operation", "自動点呼", "completed", &[]).await;
+    let r = send_h(
+        &app,
+        "POST",
+        &j(done),
+        t,
+        &admin_headers(),
+        Some(jb("ng", Some("交代"))),
+    )
+    .await
+    .json();
+    assert_eq!(r["alternative_measure"], "交代");
+}
+
+/// 業務前 二十 ハ: 車両番号。開始で予定の値を写し、`PUT …/vehicle` は車検証の登録番号 > 予定の値 > 手入力
+#[tokio::test]
+async fn vehicle_number_sources() {
+    let app = app().await;
+    let t = tenant().await;
+    let emp = employee(t, "車両 一郎").await;
+
+    // 開始: 予定に車両番号があれば写して source = schedule。無ければ NULL
+    let with = schedule(t, emp, "pre_operation", None).await;
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.tenko_schedules SET vehicle_number = ' 品川 100 あ 12-34 ' WHERE id = $1",
+            &[&with],
+        )
+        .await
+        .unwrap();
+    let started = send(
+        &app,
+        "POST",
+        "/api/tenko/sessions/start",
+        t,
+        Some(json!({ "schedule_id": with, "employee_id": emp })),
+    )
+    .await
+    .json();
+    assert_eq!(
+        (
+            started["vehicle_number"].clone(),
+            started["vehicle_number_source"].clone()
+        ),
+        (json!("品川 100 あ 12-34"), json!("schedule"))
+    );
+    let without = schedule(t, emp, "pre_operation", None).await;
+    let plain = send(
+        &app,
+        "POST",
+        "/api/tenko/sessions/start",
+        t,
+        Some(json!({ "schedule_id": without, "employee_id": emp })),
+    )
+    .await
+    .json();
+    assert_eq!(plain["vehicle_number"], Value::Null);
+    let sid = started["id"].as_str().unwrap().to_owned();
+    let uri = format!("/api/tenko/sessions/{sid}/vehicle");
+
+    // どちらも無い / 空白だけ → 400
+    for b in [
+        json!({}),
+        json!({ "carins_cert_no": " ", "vehicle_number": "" }),
+    ] {
+        let r = send(&app, "PUT", &uri, t, Some(b)).await;
+        assert_eq!(
+            (r.status, r.json()["error"].clone()),
+            (400, json!("vehicle_required"))
+        );
+    }
+    // 車検証に一致しない番号だけ → 400 (入力の車両番号が無い)
+    let r = send(
+        &app,
+        "PUT",
+        &uri,
+        t,
+        Some(json!({ "carins_cert_no": "999999999999" })),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (400, json!("vehicle_required"))
+    );
+    // 予定と同じ値 → schedule、違う値 → manual
+    let j = send(
+        &app,
+        "PUT",
+        &uri,
+        t,
+        Some(json!({ "vehicle_number": "品川 100 あ 12-34" })),
+    )
+    .await
+    .json();
+    assert_eq!(j["vehicle_number_source"], "schedule");
+    let j = send(
+        &app,
+        "PUT",
+        &uri,
+        t,
+        Some(json!({ "vehicle_number": "横浜 200 い 56-78" })),
+    )
+    .await
+    .json();
+    assert_eq!(
+        (
+            j["vehicle_number"].clone(),
+            j["vehicle_number_source"].clone()
+        ),
+        (json!("横浜 200 い 56-78"), json!("manual"))
+    );
+    // 予定の無い点呼の手入力は manual
+    let remote = sess(t, emp, "pre_operation", "遠隔点呼", "medical_pending", &[]).await;
+    let ruri = format!("/api/tenko/sessions/{remote}/vehicle");
+    let j = send(
+        &app,
+        "PUT",
+        &ruri,
+        t,
+        Some(json!({ "vehicle_number": "札幌 300 う 90-12" })),
+    )
+    .await
+    .json();
+    assert_eq!(j["vehicle_number_source"], "manual");
+
+    // 車検証に一致 → 登録番号 (CarNo)・carins の列も埋める。入力の車両番号があっても車検証が優先
+    support::car_inspection(t, "000000000077", "TESTCARID00077", "301231", "01").await;
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.car_inspection SET \"CarNo\" = '品川 500 え 11-11' WHERE tenant_id = $1 AND \"ElectCertMgNo\" = '000000000077'",
+            &[&t],
+        )
+        .await
+        .unwrap();
+    let j = send(
+        &app,
+        "PUT",
+        &uri,
+        t,
+        Some(json!({ "carins_cert_no": "000000000077", "vehicle_number": "無視される" })),
+    )
+    .await
+    .json();
+    assert_eq!(
+        (
+            j["vehicle_number"].clone(),
+            j["vehicle_number_source"].clone(),
+            j["carins_cert_no"].clone(),
+            j["carins_matched_by"].clone(),
+            j["carins_expires_on"].clone()
+        ),
+        (
+            json!("品川 500 え 11-11"),
+            json!("carins"),
+            json!("000000000077"),
+            json!("cert_no"),
+            json!("2030-12-31")
+        )
+    );
+    // 別のテナントの車検証は一致しない (入力の車両番号に落ちる)
+    let other = tenant().await;
+    let oe = employee(other, "車両 二郎").await;
+    let os = sess(
+        other,
+        oe,
+        "pre_operation",
+        "自動点呼",
+        "medical_pending",
+        &[],
+    )
+    .await;
+    let j = send(
+        &app,
+        "PUT",
+        &format!("/api/tenko/sessions/{os}/vehicle"),
+        other,
+        Some(json!({ "carins_cert_no": "000000000077", "vehicle_number": "手入力" })),
+    )
+    .await
+    .json();
+    assert_eq!(
+        (
+            j["vehicle_number_source"].clone(),
+            j["carins_cert_no"].clone()
+        ),
+        (json!("manual"), Value::Null)
+    );
+
+    // 終わった点呼・無い点呼
+    let done = sess(t, emp, "pre_operation", "自動点呼", "completed", &[]).await;
+    let r = send(
+        &app,
+        "PUT",
+        &format!("/api/tenko/sessions/{done}/vehicle"),
+        t,
+        Some(json!({ "vehicle_number": "x" })),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (400, json!("session_not_editable"))
+    );
+    let gone = send(
+        &app,
+        "PUT",
+        &format!("/api/tenko/sessions/{}/vehicle", Uuid::new_v4()),
+        t,
+        Some(json!({ "vehicle_number": "x" })),
+    )
+    .await;
+    assert_eq!(
+        (gone.status, gone.json()),
+        (404, json!({ "error": "session_not_found" }))
+    );
 }
