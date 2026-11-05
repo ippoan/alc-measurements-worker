@@ -12,6 +12,8 @@
 //!   測定の有効時間 (社員の基準値。`PUT …/medical` は過ぎた測定を 400 `measurement_expired`、再開・自己再開・アルコールの段の
 //!   直前へ進める段は未測定のアルコールで有効時間を過ぎていれば `medical_pending` へ戻す)、`self-resume` は管理者が再開済みでも
 //!   受け (再開の時刻・理由は上書きしない)、`resume` は再開した運行管理者の氏名 (`resumed_by_name`)、`cancel` は代替措置
+//! - 血圧は測定台で測る: `PUT …/medical` は本文に血圧が無ければ、有効時間内の最新の血圧を点呼の測定に写す。無ければ
+//!   自動点呼は遠隔点呼として続ける (dev 端末は切り替えない)
 //! - 取り消し・中断・再開は運行管理者の鍵でも送れる (運行管理者の点呼の一覧から)。範囲は判定と同じ
 //!   ([`prod_manager_key`])。再開は管理者ログインか運行管理者の鍵だけ (キオスクの鍵は 401)
 //!
@@ -67,6 +69,9 @@ pub const JUDGMENT_PENDING: &str = "judgment_pending";
 /// 点呼の方法 (予定ありは自動点呼、予定なしで始めると遠隔点呼)
 pub const AUTO: &str = "自動点呼";
 pub const REMOTE: &str = "遠隔点呼";
+
+/// 有効な測定台の血圧が無い自動点呼を遠隔点呼へ切り替えた理由 (`remote_escalation_reason`)
+pub const STAND_BP_MISSING_REASON: &str = "測定台の血圧が無い (または有効時間を過ぎた)";
 
 /// 業務前の自動点呼に必要な血圧の記録の日数 (東京の日付の異なり数)。満たないと遠隔点呼へ切り替える
 pub const BP_HISTORY_DAYS_REQUIRED: i64 = 10;
@@ -422,6 +427,13 @@ pub mod sql {
          AT TIME ZONE 'Asia/Tokyo')::date)) FROM alc_api.measurements m \
          WHERE m.tenant_id = $1 AND m.employee_id = $2 AND m.systolic IS NOT NULL AND m.diastolic IS NOT NULL";
 
+    /// 乗務員の最新の血圧 (測定台で測った測定。点呼の測定に写した値も同じ値と時刻なので区別しない)。
+    /// $1 tenant_id / $2 employee_id → systolic / diastolic / pulse / 測定の時刻
+    pub const LATEST_BP: &str = "SELECT m.systolic, m.diastolic, m.pulse, \
+             COALESCE(m.medical_measured_at, m.measured_at) AS at FROM alc_api.measurements m \
+         WHERE m.tenant_id = $1 AND m.employee_id = $2 AND m.systolic IS NOT NULL AND m.diastolic IS NOT NULL \
+         ORDER BY at DESC LIMIT 1";
+
     /// $1 tenant_id / $2 employee_id
     pub const BASELINE: &str = concatcp!(
         "SELECT ",
@@ -499,6 +511,23 @@ pub fn baseline(r: &Row) -> EmployeeHealthBaseline {
 
 /// 測定の有効時間の既定 (分。基準値の行が無い社員。`employee_health_baselines.measurement_validity_minutes` の DEFAULT と同じ)
 pub const DEFAULT_VALIDITY_MINUTES: i32 = 30;
+
+/// 測定台の血圧 ([`sql::LATEST_BP`] の行)
+pub struct StandBp {
+    pub systolic: i32,
+    pub diastolic: i32,
+    pub pulse: Option<i32>,
+    pub measured_at: DateTime<Utc>,
+}
+
+pub fn stand_bp(r: &Row) -> StandBp {
+    StandBp {
+        systolic: r.get(0),
+        diastolic: r.get(1),
+        pulse: r.get(2),
+        measured_at: r.get(3),
+    }
+}
 
 /// 体温・血圧の測定が有効時間を過ぎているか
 pub fn medical_expired(
@@ -1086,10 +1115,11 @@ async fn medical_handler(
     Json(body): Json<SubmitMedical>,
 ) -> Response {
     let at = now(&state);
+    let dev_axis = dev.get();
     run(
         state,
         tenant_id,
-        dev.get(),
+        dev_axis,
         "session medical",
         true,
         move |tx| {
@@ -1115,11 +1145,9 @@ async fn medical_handler(
                         ),
                     )));
                 }
-                // 血圧は必須にしない (自動点呼でも)。血圧は点呼のキオスクではなく測定台で測る運用 (オーナー決定 2026-11-05)。
-                // 来た値だけを測定に書き、無い値は安全判定でも比べない
                 // 測定から有効時間 (社員の基準値。無ければ 30 分) を過ぎた値は受けない (業務前 八)
+                let minutes = validity_minutes(tx, tenant_id, cur.employee_id).await?;
                 if let Some(measured_at) = body.medical_measured_at {
-                    let minutes = validity_minutes(tx, tenant_id, cur.employee_id).await?;
                     if medical_expired(measured_at, minutes, at) {
                         return Ok(Flow::Api(bad_request(
                             "measurement_expired",
@@ -1129,6 +1157,33 @@ async fn medical_handler(
                         )));
                     }
                 }
+                // 血圧は点呼のキオスクではなく測定台で測る (オーナー決定 2026-11-05)。本文に血圧が無ければ、有効時間内の
+                // 最新の測定台の血圧を点呼の測定に写し、基準値との差と安全判定に使う (業務前 七・八・十)。測定の時刻は
+                // 体温と血圧の早い方にする (再開のときの有効時間の見直しが古い方で効く)
+                let mut bp = (body.systolic, body.diastolic, body.pulse);
+                let mut measured_at = body.medical_measured_at;
+                let mut stand_missing = false;
+                if body.systolic.is_none() || body.diastolic.is_none() {
+                    let stand = tx
+                        .query_typed_opt(
+                            sql::LATEST_BP,
+                            &[(&tenant_id, Type::UUID), (&cur.employee_id, Type::UUID)],
+                        )
+                        .await?
+                        .map(|r| stand_bp(&r))
+                        .filter(|b| !medical_expired(b.measured_at, minutes, at));
+                    match stand {
+                        Some(b) => {
+                            bp = (Some(b.systolic), Some(b.diastolic), body.pulse.or(b.pulse));
+                            let temp_at = body.medical_measured_at.unwrap_or(at);
+                            measured_at = Some(temp_at.min(b.measured_at));
+                        }
+                        None => stand_missing = true,
+                    }
+                }
+                // 有効な測定台の血圧が無い自動点呼は、そのまま遠隔点呼として続ける (運行管理者が通話で確かめる。
+                // オーナー決定 2026-11-05)。dev 端末は切り替えない (10 日分のルールと同じ。キオスクが警告する)
+                let escalate = stand_missing && cur.tenko_method == AUTO && !dev_axis;
                 // 値の置き場の測定に先に書く (セッションの応答はその測定から読む)。測定を持たない古いセッションは、
                 // 開始の口と同じ started の測定を作って結ぶ
                 let mid: Uuid = match cur.measurement_id {
@@ -1162,10 +1217,10 @@ async fn medical_handler(
                     sql::MEDICAL_TO_MEASUREMENT,
                     &[
                         (&body.temperature, Type::FLOAT8),
-                        (&body.systolic, Type::INT4),
-                        (&body.diastolic, Type::INT4),
-                        (&body.pulse, Type::INT4),
-                        (&body.medical_measured_at, Type::TIMESTAMPTZ),
+                        (&bp.0, Type::INT4),
+                        (&bp.1, Type::INT4),
+                        (&bp.2, Type::INT4),
+                        (&measured_at, Type::TIMESTAMPTZ),
                         (&body.medical_manual_input, Type::BOOL),
                         (&mid, Type::UUID),
                         (&tenant_id, Type::UUID),
@@ -1177,6 +1232,20 @@ async fn medical_handler(
                     tx,
                     sql::UPDATE_MEDICAL,
                     &[(&id, Type::UUID), (&tenant_id, Type::UUID)],
+                )
+                .await?;
+                if !escalate {
+                    return Ok(Flow::Session(Box::new(s), None));
+                }
+                let reason = STAND_BP_MISSING_REASON.to_owned();
+                let s = one(
+                    tx,
+                    sql::ESCALATE,
+                    &[
+                        (&reason, Type::TEXT),
+                        (&id, Type::UUID),
+                        (&tenant_id, Type::UUID),
+                    ],
                 )
                 .await?;
                 Ok(Flow::Session(Box::new(s), None))
