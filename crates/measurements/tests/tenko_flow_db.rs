@@ -1213,23 +1213,6 @@ async fn manager_judgment_rules() {
     let body = |j: &str, by: Uuid, m: Option<&str>| json!({ "judgment": j, "judged_by_employee_id": by, "reason": "確認", "method": m });
     let u = |id: Uuid| format!("/api/tenko/sessions/{id}/judgment");
 
-    // 対面の範囲 (in_person_scope) は切り替えた対面点呼にだけ付けられる
-    let mut with_scope = body("ok", judge, None);
-    with_scope["in_person_scope"] = json!("same_office");
-    assert_eq!(
-        send_h(
-            &app,
-            "POST",
-            &u(auto),
-            t,
-            &admin_headers(),
-            Some(with_scope)
-        )
-        .await
-        .status,
-        400
-    );
-
     // 管理者ログインでも運行管理者の鍵でもない → 401。判定の値・判定した人の検査
     assert_eq!(
         send(&app, "POST", &u(auto), t, Some(body("ok", judge, None)))
@@ -3106,17 +3089,32 @@ async fn switched_in_person_session_walks_to_judgment() {
     )
     .await;
     assert_eq!(cancel.status, 400);
-    for bad in [
-        json!({ "method": "it" }),
-        json!({ "in_person_scope": "elsewhere" }),
-    ] {
-        let mut b = json!({ "judgment": "ok", "judged_by_employee_id": judge });
-        b.as_object_mut()
-            .unwrap()
-            .extend(bad.as_object().unwrap().clone());
-        let r = send_h(&app, "POST", &uri("judgment"), t, &admin_headers(), Some(b)).await;
-        assert_eq!(r.status, 400);
-    }
+    let it = send_h(
+        &app,
+        "POST",
+        &uri("judgment"),
+        t,
+        &admin_headers(),
+        Some(json!({ "judgment": "ok", "judged_by_employee_id": judge, "method": "it" })),
+    )
+    .await;
+    assert_eq!(it.status, 400);
+
+    // 車両も運行管理者も所属が未設定 → 決められない (同じ営業所として通常点呼で記録する)
+    let scope = send_h(
+        &app,
+        "GET",
+        &format!("{}?judge={judge}", uri("in-person-scope")),
+        t,
+        &admin_headers(),
+        None,
+    )
+    .await;
+    assert_eq!(scope.status, 200);
+    assert_eq!(
+        scope.json(),
+        json!({ "scope": "unknown", "vehicle_number": null, "vehicle_offices": [], "judge_offices": [] })
+    );
 
     let judged = send_h(
         &app,
@@ -3145,14 +3143,152 @@ async fn switched_in_person_session_walks_to_judgment() {
     );
 }
 
-/// 別の営業所・グループ企業の運行管理者が対面で確認した (`in_person_scope: other_office`) ときは、
-/// 告示 266 号 第四条 2 項により遠隔点呼とみなし、判定で点呼方法を遠隔点呼に書き換えて記録する
+/// 点呼の営業所を 1 つ作り、車両 (登録番号) と運行管理者を所属させる
+async fn office(
+    t: Uuid,
+    name: &str,
+    company: Option<&str>,
+    vehicles: &[&str],
+    managers: &[Uuid],
+) -> Uuid {
+    let db = admin().await;
+    let id: Uuid = db
+        .query_one(
+            "INSERT INTO alc_api.tenko_offices (tenant_id, name, company_name) VALUES ($1, $2, $3) RETURNING id",
+            &[&t, &name, &company],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    for v in vehicles {
+        db.execute(
+            "INSERT INTO alc_api.maintenance_vehicles (tenant_id, registration_number, office_id) VALUES ($1, $2, $3)",
+            &[&t, v, &id],
+        )
+        .await
+        .unwrap();
+    }
+    for m in managers {
+        db.execute(
+            "INSERT INTO alc_api.tenko_office_managers (tenant_id, office_id, employee_id) VALUES ($1, $2, $3)",
+            &[&t, &id, m],
+        )
+        .await
+        .unwrap();
+    }
+    id
+}
+
+/// セッションの車両番号を書く (`PUT …/vehicle` の代わり)
+async fn set_vehicle(id: &str, number: &str) {
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.tenko_sessions SET vehicle_number = $1 WHERE id = $2",
+            &[&number, &id.parse::<Uuid>().unwrap()],
+        )
+        .await
+        .unwrap();
+}
+
+/// 車両と同じ営業所の運行管理者 (兼務を含む) が判定したら通常点呼のまま。車両番号の空白の違いは照合で無視する。
+/// 判定の前に見せる口 (`in-person-scope`) の権限・切り替えていないセッション・無いセッション
+#[tokio::test]
+async fn switched_in_person_same_office_by_affiliation() {
+    let app = app().await;
+    let t = tenant().await;
+    let judge = manager(t, "manager").await;
+    office(t, "本社営業所", None, &["品川100あ1234"], &[judge]).await;
+    office(t, "別の営業所", None, &[], &[judge]).await;
+    let id = walk_switched_to_pending(&app, t, "切替 三郎").await;
+    set_vehicle(&id, "品川 100 あ　1234").await;
+    let scope_uri = |s: &str| format!("/api/tenko/sessions/{s}/in-person-scope?judge={judge}");
+
+    let scope = send_h(&app, "GET", &scope_uri(&id), t, &admin_headers(), None).await;
+    assert_eq!(scope.status, 200);
+    let j = scope.json();
+    assert_eq!(j["scope"], "same_office");
+    assert_eq!(j["vehicle_number"], "品川 100 あ　1234");
+    assert_eq!(j["vehicle_offices"][0]["name"], "本社営業所");
+    assert_eq!(j["judge_offices"].as_array().unwrap().len(), 2);
+    // 運行管理者の鍵でも見られる。キオスクの鍵・鍵なしは 401
+    let key = [("X-Device-Role", "device-tenko-manager")];
+    assert_eq!(
+        send_h(&app, "GET", &scope_uri(&id), t, &key, None)
+            .await
+            .status,
+        200
+    );
+    assert_eq!(
+        send(&app, "GET", &scope_uri(&id), t, None).await.status,
+        401
+    );
+    // 無いセッションは 404、切り替えていないセッションは 400
+    assert_eq!(
+        send_h(
+            &app,
+            "GET",
+            &scope_uri(&Uuid::new_v4().to_string()),
+            t,
+            &admin_headers(),
+            None
+        )
+        .await
+        .status,
+        404
+    );
+    let emp = employee(t, "切替 なし").await;
+    let plain = sess(t, emp, "pre_operation", "自動点呼", "completed", &[]).await;
+    assert_eq!(
+        send_h(
+            &app,
+            "GET",
+            &scope_uri(&plain.to_string()),
+            t,
+            &admin_headers(),
+            None
+        )
+        .await
+        .status,
+        400
+    );
+
+    let judged = send_h(
+        &app,
+        "POST",
+        &format!("/api/tenko/sessions/{id}/judgment"),
+        t,
+        &admin_headers(),
+        Some(json!({ "judgment": "ok", "judged_by_employee_id": judge })),
+    )
+    .await;
+    assert_eq!(judged.status, 200);
+    assert_eq!(judged.json()["tenko_method"], "通常点呼");
+}
+
+/// 車両の営業所と運行管理者の所属営業所が違う (別の営業所・グループ企業) ときは、告示 266 号 第四条 2 項により
+/// 遠隔点呼とみなし、判定で点呼方法を遠隔点呼に書き換えて記録する。画面が送る古い `in_person_scope` は見ない
 #[tokio::test]
 async fn switched_in_person_other_office_is_recorded_as_remote() {
     let app = app().await;
     let t = tenant().await;
     let judge = manager(t, "manager").await;
+    office(t, "帯広営業所", None, &["帯広100か5678"], &[]).await;
+    office(t, "グループ営業所", Some("グループ運輸"), &[], &[judge]).await;
     let id = walk_switched_to_pending(&app, t, "切替 二郎").await;
+    set_vehicle(&id, "帯広100か5678").await;
+    let scope = send_h(
+        &app,
+        "GET",
+        &format!("/api/tenko/sessions/{id}/in-person-scope?judge={judge}"),
+        t,
+        &admin_headers(),
+        None,
+    )
+    .await
+    .json();
+    assert_eq!(scope["scope"], "other_office");
+    assert_eq!(scope["judge_offices"][0]["company_name"], "グループ運輸");
     let judged = send_h(
         &app,
         "POST",
@@ -3163,7 +3299,7 @@ async fn switched_in_person_other_office_is_recorded_as_remote() {
             "judgment": "ok",
             "judged_by_employee_id": judge,
             "method": "in_person",
-            "in_person_scope": "other_office"
+            "in_person_scope": "same_office"
         })),
     )
     .await;

@@ -11,16 +11,23 @@
 //! - **判定が記録に入ったセッション**: 409 `already_recorded` (記録は UPDATE できないので押し直せない)
 //! - **それ以外** (判定待ちを足す前に閉じた IT点呼の記録など): 今までどおり判定の列だけ書く (押し直し可。記録は先に
 //!   書かれていて判定を含まない — 記録の CSV はセッションを join して出す)
+//!
+//! 血圧の記録が足りず対面点呼へ切り替えたセッションは、会った運行管理者の所属 ([`office_scope`]) で点呼の方法を決める。
+//! 点呼の営業所は車両で決まる (セッションの車両番号を車両マスタ `maintenance_vehicles` の登録番号と照合)。判定した人の
+//! 所属営業所 (`tenko_office_managers`) に車両の営業所が入っていれば同じ営業所 = `通常点呼` のまま、どちらも所属が在って
+//! 重ならなければ別の営業所・グループ企業 = 告示 266 号 第四条 2 項により `遠隔点呼` とみなす。どちらかが未設定なら
+//! 同じ営業所として扱う (画面は `GET /tenko/sessions/{id}/in-person-scope` で判定の前に見せ、未設定を警告する)
 
 use alc_core_wasm::{AuthUser, DeviceDevSlot, TenantId};
-use axum::extract::{Path, State};
+use alc_worker_db::TenantTx;
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use const_format::concatcp;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio_postgres::types::Type;
 use uuid::Uuid;
 
@@ -37,11 +44,13 @@ pub const JUDGMENT_METHOD_IT: &str = "it";
 /// 確認の方法: 本人が来て対面で確認した
 pub const JUDGMENT_METHOD_IN_PERSON: &str = "in_person";
 
-/// 対面の範囲: 運転者と同じ営業所の運行管理者が対面で確認した (点呼方法は `通常点呼` のまま)
+/// 対面の範囲: 車両と同じ営業所の運行管理者が対面で確認した (点呼方法は `通常点呼` のまま)
 pub const SCOPE_SAME_OFFICE: &str = "same_office";
 /// 対面の範囲: 別の営業所・グループ企業の運行管理者が遠隔点呼の設備を使って対面で確認した。
 /// 告示 266 号 第四条 2 項により遠隔点呼とみなすので、判定のとき点呼方法を `遠隔点呼` に書き換えて記録する
 pub const SCOPE_OTHER_OFFICE: &str = "other_office";
+/// 対面の範囲: 車両か運行管理者の所属が未設定で決められない (同じ営業所として `通常点呼` で記録する)
+pub const SCOPE_UNKNOWN: &str = "unknown";
 
 /// rust の `RecordManagerJudgment`
 #[derive(Debug, Clone, Deserialize)]
@@ -53,10 +62,6 @@ pub struct ManagerJudgment {
     #[serde(default)]
     pub method: Option<String>,
     /// 運行に従事できない (`ng`) とした場合の代替措置 (自己点検表 業務前 二十 タ。`ok` では保存しない)
-    /// 血圧の記録が足りず対面点呼へ切り替えたセッション ([`is_in_person_switched`]) の判定にだけ付く対面の範囲
-    /// (`same_office` / `other_office`。無ければ `same_office`)。ほかのセッションに付けると 400
-    #[serde(default)]
-    pub in_person_scope: Option<String>,
     #[serde(default)]
     pub alternative_measure: Option<String>,
 }
@@ -91,10 +96,128 @@ pub mod sql {
     /// 在籍の社員の役割 (判定した運行管理者の検査)。$1 tenant_id / $2 employee_id
     pub const JUDGE_ROLE: &str =
         "SELECT role FROM alc_api.employees WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL";
+
+    /// 車両の所属営業所と、判定する人の所属営業所 (どちらも `[{id, name, company_name}]` の JSON)。
+    /// $1 tenant_id / $2 車両番号 (空白を除いて登録番号と照合) / $3 employee_id
+    pub const OFFICE_SCOPE: &str = "SELECT \
+         COALESCE((SELECT jsonb_agg(jsonb_build_object('id', o.id, 'name', o.name, 'company_name', o.company_name) \
+             ORDER BY o.name, o.id) FROM alc_api.tenko_offices o WHERE o.tenant_id = $1 AND o.id IN ( \
+             SELECT v.office_id FROM alc_api.maintenance_vehicles v WHERE v.tenant_id = $1 AND v.deleted_at IS NULL \
+             AND regexp_replace(v.registration_number, '[[:space:]　]', '', 'g') = regexp_replace($2, '[[:space:]　]', '', 'g'))), \
+             '[]'::jsonb), \
+         COALESCE((SELECT jsonb_agg(jsonb_build_object('id', o.id, 'name', o.name, 'company_name', o.company_name) \
+             ORDER BY o.name, o.id) FROM alc_api.tenko_offices o WHERE o.tenant_id = $1 AND o.id IN ( \
+             SELECT m.office_id FROM alc_api.tenko_office_managers m WHERE m.tenant_id = $1 AND m.employee_id = $3)), \
+             '[]'::jsonb)";
 }
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/tenko/sessions/{id}/judgment", post(judgment_handler))
+    Router::new()
+        .route("/tenko/sessions/{id}/judgment", post(judgment_handler))
+        .route("/tenko/sessions/{id}/in-person-scope", get(scope_handler))
+}
+
+/// 会った運行管理者の所属の照合 ([`office_scope`] の結果)
+pub struct OfficeScope {
+    /// [`SCOPE_SAME_OFFICE`] / [`SCOPE_OTHER_OFFICE`] / [`SCOPE_UNKNOWN`]
+    pub scope: &'static str,
+    /// 車両の所属営業所 (`[{id, name, company_name}]`)
+    pub vehicle_offices: Value,
+    /// 運行管理者の所属営業所 (同じ形)
+    pub judge_offices: Value,
+}
+
+/// 2 つの所属から対面の範囲を決める。重なれば同じ営業所、どちらも在って重ならなければ別の営業所、ほかは未設定
+pub fn decide_scope(vehicle_offices: &Value, judge_offices: &Value) -> &'static str {
+    let ids = |v: &Value| -> Vec<Value> {
+        v.as_array()
+            .map(|a| a.iter().map(|o| o["id"].clone()).collect())
+            .unwrap_or_default()
+    };
+    let (vehicle, judge) = (ids(vehicle_offices), ids(judge_offices));
+    if vehicle.iter().any(|v| judge.contains(v)) {
+        SCOPE_SAME_OFFICE
+    } else if !vehicle.is_empty() && !judge.is_empty() {
+        SCOPE_OTHER_OFFICE
+    } else {
+        SCOPE_UNKNOWN
+    }
+}
+
+/// セッションの車両と判定する人の所属営業所を引いて照合する
+pub async fn office_scope(
+    tx: &TenantTx<'_>,
+    tenant_id: Uuid,
+    vehicle_number: &Option<String>,
+    judge: Uuid,
+) -> Result<OfficeScope, tokio_postgres::Error> {
+    let row = tx
+        .query_typed_one(
+            sql::OFFICE_SCOPE,
+            &[
+                (&tenant_id, Type::UUID),
+                (vehicle_number, Type::TEXT),
+                (&judge, Type::UUID),
+            ],
+        )
+        .await?;
+    let (vehicle_offices, judge_offices): (Value, Value) = (row.get(0), row.get(1));
+    Ok(OfficeScope {
+        scope: decide_scope(&vehicle_offices, &judge_offices),
+        vehicle_offices,
+        judge_offices,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ScopeQuery {
+    /// 判定する運行管理者 (`judged_by_employee_id` に送る人)
+    pub judge: Uuid,
+}
+
+/// `GET /tenko/sessions/{id}/in-person-scope?judge=<employee_id>` — 切り替えた対面点呼で、その運行管理者が判定したときの
+/// 対面の範囲 `{"scope", "vehicle_number", "vehicle_offices", "judge_offices"}`。通すのは判定と同じ (管理者ログインか
+/// 運行管理者の鍵)。切り替えた対面点呼でなければ 400、無ければ 404
+async fn scope_handler(
+    State(state): State<AppState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Extension(slot): Extension<DeviceDevSlot>,
+    user: Option<Extension<AuthUser>>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<ScopeQuery>,
+) -> Response {
+    if user.is_none() && !slot.is_tenko_manager() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let dev = slot.get();
+    run(
+        state,
+        tenant_id,
+        dev,
+        "session in-person scope",
+        false,
+        move |tx| {
+            Box::pin(async move {
+                let Some(cur) = fetch(tx, tenant_id, id).await? else {
+                    return Ok(StatusCode::NOT_FOUND.into());
+                };
+                if !is_in_person_switched(&cur.tenko_method, cur.schedule_id) {
+                    return Ok(StatusCode::BAD_REQUEST.into());
+                }
+                let s = office_scope(tx, tenant_id, &cur.vehicle_number, q.judge).await?;
+                Ok(Flow::Api((
+                    StatusCode::OK,
+                    Json(json!({
+                        "scope": s.scope,
+                        "vehicle_number": cur.vehicle_number,
+                        "vehicle_offices": s.vehicle_offices,
+                        "judge_offices": s.judge_offices,
+                    })),
+                )))
+            })
+        },
+    )
+    .await
 }
 
 /// 判定の確認の方法を、そのセッションで受けてよいか (rust の `judgment_method_acceptable`)
@@ -164,13 +287,23 @@ async fn judgment_handler(
                 if !judgment_method_acceptable(&cur, method) {
                     return Ok(StatusCode::BAD_REQUEST.into());
                 }
-                // 切り替えた対面点呼: 確認の方法は対面に決まり、別営業所・グループ企業の運行管理者なら遠隔点呼とみなす
+                // 切り替えた対面点呼: 確認の方法は対面に決まり、車両と運行管理者の所属が別の営業所・グループ企業なら
+                // 遠隔点呼とみなす (未設定は同じ営業所として通常点呼のまま)
                 let switched = is_in_person_switched(&cur.tenko_method, cur.schedule_id);
-                let new_method = match body.in_person_scope.as_deref() {
-                    None => None,
-                    Some(SCOPE_SAME_OFFICE) if switched => None,
-                    Some(SCOPE_OTHER_OFFICE) if switched => Some(REMOTE),
-                    Some(_) => return Ok(StatusCode::BAD_REQUEST.into()),
+                let new_method = if switched
+                    && office_scope(
+                        tx,
+                        tenant_id,
+                        &cur.vehicle_number,
+                        body.judged_by_employee_id,
+                    )
+                    .await?
+                    .scope
+                        == SCOPE_OTHER_OFFICE
+                {
+                    Some(REMOTE)
+                } else {
+                    None
                 };
                 let recorded_method = if switched {
                     Some(JUDGMENT_METHOD_IN_PERSON)
