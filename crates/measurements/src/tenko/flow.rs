@@ -68,6 +68,9 @@ pub const JUDGMENT_PENDING: &str = "judgment_pending";
 pub const AUTO: &str = "自動点呼";
 pub const REMOTE: &str = "遠隔点呼";
 
+/// 業務前の自動点呼に必要な血圧の記録の日数 (東京の日付の異なり数)。満たないと遠隔点呼へ切り替える
+pub const BP_HISTORY_DAYS_REQUIRED: i64 = 10;
+
 // --- 行と本文 (rust の alc_tenko::models の写し。JSON の形は同じ) ---
 
 /// rust の `StartTenkoSession`
@@ -402,6 +405,12 @@ pub mod sql {
          WHERE id = $2 AND tenant_id = $3",
         RETURNING_SESSION
     );
+
+    /// 血圧の記録がある日数 (東京の日付で数え、同じ日の複数件は 1 日)。$1 tenant_id / $2 employee_id → 日数。
+    /// dev 軸は RLS が他の問い合わせと同じく効かせる
+    pub const BP_HISTORY_DAYS: &str = "SELECT COUNT(DISTINCT ((COALESCE(m.medical_measured_at, m.measured_at) \
+         AT TIME ZONE 'Asia/Tokyo')::date)) FROM alc_api.measurements m \
+         WHERE m.tenant_id = $1 AND m.employee_id = $2 AND m.systolic IS NOT NULL AND m.diastolic IS NOT NULL";
 
     /// $1 tenant_id / $2 employee_id
     pub const BASELINE: &str = concatcp!(
@@ -906,15 +915,18 @@ async fn start_handler(
     Json(body): Json<StartSession>,
 ) -> Response {
     let device_id = device_id_from(&headers, &state.log);
+    let dev_request = dev.get();
     let resp = run(
         state,
         tenant_id,
-        dev.get(),
+        dev_request,
         "session start",
         false,
         move |tx| {
             Box::pin(async move {
                 // 予定あり (自動点呼) / なし (遠隔点呼)
+                // 血圧の記録が足りず遠隔点呼へ切り替えた理由 (切り替えないときは None)
+                let mut switch_reason: Option<String> = None;
                 let (tenko_type, method, manager, vehicle) = match body.schedule_id {
                     Some(sid) => {
                         let row = tx
@@ -928,6 +940,25 @@ async fn start_handler(
                         };
                         if row.get::<_, Uuid>(0) != body.employee_id {
                             return Ok(StatusCode::BAD_REQUEST.into());
+                        }
+                        // 業務前の自動点呼は血圧の記録が 10 日分そろっている乗務員だけ。足りなければ予定は消費して、
+                        // escalate-remote と同じ遠隔点呼へ切り替える (dev 端末は切り替えず、キオスクが警告を出す)
+                        if row.get::<_, String>(1) == "pre_operation" && !dev_request {
+                            let days: i64 = tx
+                                .query_typed_one(
+                                    sql::BP_HISTORY_DAYS,
+                                    &[
+                                        (&tenant_id, Type::UUID),
+                                        (&body.employee_id, Type::UUID),
+                                    ],
+                                )
+                                .await?
+                                .get(0);
+                            if days < BP_HISTORY_DAYS_REQUIRED {
+                                switch_reason = Some(format!(
+                                    "血圧の記録が {BP_HISTORY_DAYS_REQUIRED} 日分に満たない (いま {days} 日分)"
+                                ));
+                            }
                         }
                         tx.execute_typed(
                             sql::CONSUME_SCHEDULE,
@@ -971,7 +1002,7 @@ async fn start_handler(
                     )
                     .await?
                     .get(0);
-                let s = one(
+                let mut s = one(
                     tx,
                     sql::CREATE,
                     &[
@@ -996,6 +1027,19 @@ async fn start_handler(
                         &[
                             (&s.id, Type::UUID),
                             (&sid, Type::UUID),
+                            (&tenant_id, Type::UUID),
+                        ],
+                    )
+                    .await?;
+                }
+                // 遠隔点呼への切り替え: escalate-remote と同じ列を同じ文で書く (状態は medical_pending のまま)
+                if let Some(reason) = switch_reason {
+                    s = one(
+                        tx,
+                        sql::ESCALATE,
+                        &[
+                            (&reason, Type::TEXT),
+                            (&s.id, Type::UUID),
                             (&tenant_id, Type::UUID),
                         ],
                     )
