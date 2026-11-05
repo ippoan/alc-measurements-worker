@@ -1213,6 +1213,23 @@ async fn manager_judgment_rules() {
     let body = |j: &str, by: Uuid, m: Option<&str>| json!({ "judgment": j, "judged_by_employee_id": by, "reason": "確認", "method": m });
     let u = |id: Uuid| format!("/api/tenko/sessions/{id}/judgment");
 
+    // 対面の範囲 (in_person_scope) は切り替えた対面点呼にだけ付けられる
+    let mut with_scope = body("ok", judge, None);
+    with_scope["in_person_scope"] = json!("same_office");
+    assert_eq!(
+        send_h(
+            &app,
+            "POST",
+            &u(auto),
+            t,
+            &admin_headers(),
+            Some(with_scope)
+        )
+        .await
+        .status,
+        400
+    );
+
     // 管理者ログインでも運行管理者の鍵でもない → 401。判定の値・判定した人の検査
     assert_eq!(
         send(&app, "POST", &u(auto), t, Some(body("ok", judge, None)))
@@ -2929,7 +2946,7 @@ async fn auto_pre_operation_needs_ten_days_of_bp() {
             .get::<_, bool>(0)
     };
 
-    // 9 日分: 201 で遠隔点呼に切り替わり、予定は消費される。状態は medical_pending のまま
+    // 9 日分: 201 で対面点呼 (通常点呼。遠隔点呼にはしないので escalated_to_remote_at は空) に切り替わり、予定は消費される。状態は medical_pending のまま
     let emp = employee(t, "血圧 九日").await;
     bp_history(t, emp, 9).await;
     let sch = schedule(t, emp, "pre_operation", Some("安全運転")).await;
@@ -2944,10 +2961,10 @@ async fn auto_pre_operation_needs_ten_days_of_bp() {
             s["escalated_to_remote_at"].is_null(),
         ),
         (
-            json!("遠隔点呼"),
+            json!("通常点呼"),
             json!("medical_pending"),
-            json!("血圧の記録が 10 日分に満たない (いま 9 日分)"),
-            false
+            json!("血圧の記録が 10 日分に満たない (いま 9 日分) ため対面点呼"),
+            true
         )
     );
     assert!(consumed(sch).await);
@@ -2972,10 +2989,10 @@ async fn auto_pre_operation_needs_ten_days_of_bp() {
     bp_history(t, emp, 1).await;
     let sch = schedule(t, emp, "pre_operation", Some("安全運転")).await;
     let s = start(sch, emp, vec![]).await.json();
-    assert_eq!(s["tenko_method"], json!("遠隔点呼"));
+    assert_eq!(s["tenko_method"], json!("通常点呼"));
     assert_eq!(
         s["remote_escalation_reason"],
-        json!("血圧の記録が 10 日分に満たない (いま 9 日分)")
+        json!("血圧の記録が 10 日分に満たない (いま 9 日分) ため対面点呼")
     );
 
     // dev 端末は 0 日分でも自動点呼のまま (予定は dev の軸に置く。本番の軸の予定は dev の接続から見えない)
@@ -3016,19 +3033,15 @@ async fn auto_pre_operation_needs_ten_days_of_bp() {
     assert_eq!(remote.json()["remote_escalation_reason"], Value::Null);
 }
 
-/// 血圧が 9 日分で遠隔点呼へ切り替わった (予定つきの) セッションを、自動点呼と同じ段で最後まで通す:
-/// 医療 → 自己申告 → 日常点検 → 携行品 → アルコール → 指示の確認で判定待ち、運行管理者の判定 ok で完了して記録を書く
-#[tokio::test]
-async fn switched_remote_session_walks_to_judgment() {
-    let app = app().await;
-    let t = tenant().await;
-    let emp = employee(t, "切替 一郎").await;
+/// 血圧が 9 日分で対面点呼へ切り替わった (予定つきの) セッションを、自動点呼と同じ段で判定待ちまで通す。
+/// 医療 → 自己申告 → 日常点検 → (携行品なし) → アルコール → 指示の確認で判定待ち。(セッション id, 判定の本文の部品) を返す
+async fn walk_switched_to_pending(app: &App, t: Uuid, name: &str) -> String {
+    let emp = employee(t, name).await;
     baseline(t, emp).await;
     bp_history(t, emp, 9).await;
-    let judge = manager(t, "manager").await;
     let sch = schedule(t, emp, "pre_operation", Some("安全運転")).await;
     let s = send(
-        &app,
+        app,
         "POST",
         "/api/tenko/sessions/start",
         t,
@@ -3036,13 +3049,13 @@ async fn switched_remote_session_walks_to_judgment() {
     )
     .await
     .json();
-    assert_eq!(s["tenko_method"], "遠隔点呼");
+    assert_eq!(s["tenko_method"], "通常点呼");
     assert_eq!(s["schedule_id"], json!(sch));
     let id = s["id"].as_str().unwrap().to_owned();
     let uri = |step: &str| format!("/api/tenko/sessions/{id}/{step}");
 
     let med = send(
-        &app,
+        app,
         "PUT",
         &uri("medical"),
         t,
@@ -3052,7 +3065,7 @@ async fn switched_remote_session_walks_to_judgment() {
     .json();
     assert_eq!(med["status"], "self_declaration_pending");
     let decl = send(
-        &app,
+        app,
         "PUT",
         &uri("self-declaration"),
         t,
@@ -3064,13 +3077,46 @@ async fn switched_remote_session_walks_to_judgment() {
     assert_eq!(decl["safety_judgment"]["status"], "pass");
     let ok = json!({ "brakes": "ok", "tires": "ok", "lights": "ok", "steering": "ok", "wipers": "ok", "mirrors": "ok", "horn": "ok", "seatbelts": "ok" });
     // 携行品が無いテナントなので、日常点検の後はアルコールの段へ進む
-    let insp = send(&app, "PUT", &uri("daily-inspection"), t, Some(ok)).await;
+    let insp = send(app, "PUT", &uri("daily-inspection"), t, Some(ok)).await;
     assert_eq!(insp.json()["status"], "identity_verified");
-    let alc = measure(&app, t, emp, &id, "normal").await;
+    let alc = measure(app, t, emp, &id, "normal").await;
     assert_eq!(alc["status"], "instruction_pending");
-    let done = send(&app, "PUT", &uri("instruction-confirm"), t, None).await;
+    let done = send(app, "PUT", &uri("instruction-confirm"), t, None).await;
     assert_eq!(done.json()["status"], "judgment_pending");
     assert!(records(id.parse().unwrap()).await.is_empty());
+    id
+}
+
+/// 切り替えた対面点呼の判定: 同じ営業所 (既定) の運行管理者なら通常点呼のまま完了して記録を書く。
+/// 確認の方法は対面に決まり (`it` や不明な範囲は 400)、乗務員は判定待ちを取り消せない
+#[tokio::test]
+async fn switched_in_person_session_walks_to_judgment() {
+    let app = app().await;
+    let t = tenant().await;
+    let judge = manager(t, "manager").await;
+    let id = walk_switched_to_pending(&app, t, "切替 一郎").await;
+    let uri = |step: &str| format!("/api/tenko/sessions/{id}/{step}");
+
+    let cancel = send(
+        &app,
+        "POST",
+        &uri("cancel"),
+        t,
+        Some(json!({ "reason": "やめる" })),
+    )
+    .await;
+    assert_eq!(cancel.status, 400);
+    for bad in [
+        json!({ "method": "it" }),
+        json!({ "in_person_scope": "elsewhere" }),
+    ] {
+        let mut b = json!({ "judgment": "ok", "judged_by_employee_id": judge });
+        b.as_object_mut()
+            .unwrap()
+            .extend(bad.as_object().unwrap().clone());
+        let r = send_h(&app, "POST", &uri("judgment"), t, &admin_headers(), Some(b)).await;
+        assert_eq!(r.status, 400);
+    }
 
     let judged = send_h(
         &app,
@@ -3083,7 +3129,54 @@ async fn switched_remote_session_walks_to_judgment() {
     .await;
     assert_eq!(judged.status, 200);
     let j = judged.json();
-    assert_eq!(j["status"], "completed");
+    assert_eq!(
+        (
+            j["status"].clone(),
+            j["tenko_method"].clone(),
+            j["manager_judgment_method"].clone()
+        ),
+        (json!("completed"), json!("通常点呼"), json!("in_person"))
+    );
+    let recs = records(id.parse().unwrap()).await;
+    assert_eq!(recs.len(), 1);
+    assert_eq!(
+        (recs[0].0.as_str(), recs[0].1.as_str()),
+        ("completed", "通常点呼")
+    );
+}
+
+/// 別の営業所・グループ企業の運行管理者が対面で確認した (`in_person_scope: other_office`) ときは、
+/// 告示 266 号 第四条 2 項により遠隔点呼とみなし、判定で点呼方法を遠隔点呼に書き換えて記録する
+#[tokio::test]
+async fn switched_in_person_other_office_is_recorded_as_remote() {
+    let app = app().await;
+    let t = tenant().await;
+    let judge = manager(t, "manager").await;
+    let id = walk_switched_to_pending(&app, t, "切替 二郎").await;
+    let judged = send_h(
+        &app,
+        "POST",
+        &format!("/api/tenko/sessions/{id}/judgment"),
+        t,
+        &admin_headers(),
+        Some(json!({
+            "judgment": "ok",
+            "judged_by_employee_id": judge,
+            "method": "in_person",
+            "in_person_scope": "other_office"
+        })),
+    )
+    .await;
+    assert_eq!(judged.status, 200);
+    let j = judged.json();
+    assert_eq!(
+        (
+            j["status"].clone(),
+            j["tenko_method"].clone(),
+            j["manager_judgment_method"].clone()
+        ),
+        (json!("completed"), json!("遠隔点呼"), json!("in_person"))
+    );
     let recs = records(id.parse().unwrap()).await;
     assert_eq!(recs.len(), 1);
     assert_eq!(
