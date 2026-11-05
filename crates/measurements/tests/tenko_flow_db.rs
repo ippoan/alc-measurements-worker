@@ -1682,6 +1682,49 @@ async fn record_failure_does_not_close() {
     assert_eq!(session_status(id).await, "instruction_pending");
     assert_eq!(failures(id).await, want_failure);
 
+    // 運行報告 (業務後の完了)・安全判定の中断・日常点検 NG も同じ
+    let ng = json!({ "brakes": "ng", "tires": "ok", "lights": "ok", "steering": "ok", "wipers": "ok", "mirrors": "ok", "horn": "ok", "seatbelts": "ok" });
+    for (tenko_type, status, step, method, body) in [
+        (
+            "post_operation",
+            "report_pending",
+            "report",
+            "PUT",
+            json!({ "vehicle_road_status": "a", "driver_alternation": "b" }),
+        ),
+        (
+            "pre_operation",
+            "self_declaration_pending",
+            "self-declaration",
+            "PUT",
+            json!({ "illness": true, "fatigue": false, "sleep_deprivation": false }),
+        ),
+        (
+            "pre_operation",
+            "daily_inspection_pending",
+            "daily-inspection",
+            "PUT",
+            ng.clone(),
+        ),
+    ] {
+        let id = sess(t, emp, tenko_type, "自動点呼", status, &[reject]).await;
+        let got = send(
+            &app,
+            method,
+            &format!("/api/tenko/sessions/{id}/{step}"),
+            t,
+            Some(body),
+        )
+        .await;
+        assert_eq!(
+            (got.status, got.json()),
+            (500, record_failed.clone()),
+            "{step}"
+        );
+        assert_eq!(session_status(id).await, status, "{step}");
+        assert_eq!(failures(id).await, want_failure, "{step}");
+    }
+
     // アルコール検知: 中止は残し、機器故障を足す
     let id = sess(
         t,
