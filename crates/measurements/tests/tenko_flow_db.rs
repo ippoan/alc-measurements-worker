@@ -398,6 +398,23 @@ async fn pre_operation_auto_flow_writes_record() {
     assert_eq!(alc["status"], "instruction_pending");
     assert!(records(id.parse().unwrap()).await.is_empty());
 
+    // 業務前は車両番号が入るまで終えない (業務前 二十 ハ)
+    let no_vehicle = send(&app, "PUT", &uri("instruction-confirm"), t, None).await;
+    assert_eq!(
+        (no_vehicle.status, no_vehicle.json()["error"].clone()),
+        (400, json!("vehicle_required"))
+    );
+    assert!(records(id.parse().unwrap()).await.is_empty());
+    let v = send(
+        &app,
+        "PUT",
+        &uri("vehicle"),
+        t,
+        Some(json!({ "vehicle_number": "品川 100 あ 12-34" })),
+    )
+    .await;
+    assert_eq!(v.status, 200);
+
     let done = send(&app, "PUT", &uri("instruction-confirm"), t, None).await;
     let done_json = done.json();
     assert_eq!(done_json["status"], "completed");
@@ -1130,17 +1147,58 @@ async fn self_resume_rules() {
     let id = sess(t, emp, "pre_operation", "自動点呼", "medical_pending", &[]).await;
     let uri = format!("/api/tenko/sessions/{id}/self-resume");
     assert_eq!(
-        send(&app, "POST", &uri, t, Some(json!({ "reason": " " })))
-            .await
-            .json()["error"],
+        send(
+            &app,
+            "POST",
+            &uri,
+            t,
+            Some(json!({ "reason": " ", "identity": { "employee_id": emp, "method": "vein" } }))
+        )
+        .await
+        .json()["error"],
         "reason_required"
     );
+    // 本人確認 (業務前 十三): 照合した社員と方法が無い・方法が違うと 400、別の人なら 403 (鍵だけでは再開させない)
+    for body in [
+        json!({ "reason": "x" }),
+        json!({ "reason": "x", "identity": { "employee_id": emp, "method": "card" } }),
+    ] {
+        let got = send(&app, "POST", &uri, t, Some(body)).await;
+        assert_eq!(
+            (got.status, got.json()["error"].clone()),
+            (400, json!("identity_required"))
+        );
+    }
+    let other = employee(t, "点呼 別人").await;
+    let got = send(
+        &app,
+        "POST",
+        &uri,
+        t,
+        Some(json!({ "reason": "x", "identity": { "employee_id": other, "method": "vein" } })),
+    )
+    .await;
+    assert_eq!(
+        (got.status, got.json()["error"].clone()),
+        (403, json!("identity_mismatch"))
+    );
+    assert!(admin()
+        .await
+        .query_one(
+            "SELECT resumed_at IS NULL FROM alc_api.tenko_sessions WHERE id = $1",
+            &[&id]
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0));
     let r = send(
         &app,
         "POST",
         &uri,
         t,
-        Some(json!({ "reason": " 電池切れ " })),
+        Some(
+            json!({ "reason": " 電池切れ ", "identity": { "employee_id": emp, "method": "vein" } }),
+        ),
     )
     .await
     .json();
@@ -1152,8 +1210,16 @@ async fn self_resume_rules() {
         ),
         (json!("電池切れ"), Value::Null, json!("medical_pending"))
     );
+    assert_eq!(r["resume_identity_method"], "vein");
     // 2 回目も受ける (再開の時刻・理由は最初の値のまま。管理者が再開済みのセッションも受けるため)
-    let again = send(&app, "POST", &uri, t, Some(json!({ "reason": "x" }))).await;
+    let again = send(
+        &app,
+        "POST",
+        &uri,
+        t,
+        Some(json!({ "reason": "x", "identity": { "employee_id": emp, "method": "vein" } })),
+    )
+    .await;
     assert_eq!(again.status, 200);
     assert_eq!(again.json()["resume_reason"], "電池切れ");
     let s2 = sess(t, emp, "pre_operation", "自動点呼", "medical_pending", &[]).await;
@@ -1163,7 +1229,7 @@ async fn self_resume_rules() {
         &format!("/api/tenko/sessions/{s2}/self-resume"),
         t,
         &admin_headers(),
-        Some(json!({ "reason": "x" })),
+        Some(json!({ "reason": "x", "identity": { "employee_id": emp, "method": "vein" } })),
     )
     .await
     .json();
@@ -1175,7 +1241,7 @@ async fn self_resume_rules() {
             "POST",
             &format!("/api/tenko/sessions/{done}/self-resume"),
             t,
-            Some(json!({ "reason": "x" }))
+            Some(json!({ "reason": "x", "identity": { "employee_id": emp, "method": "vein" } }))
         )
         .await
         .json()["error"],
@@ -1186,7 +1252,7 @@ async fn self_resume_rules() {
         "POST",
         &format!("/api/tenko/sessions/{}/self-resume", Uuid::new_v4()),
         t,
-        Some(json!({ "reason": "x" })),
+        Some(json!({ "reason": "x", "identity": { "employee_id": emp, "method": "vein" } })),
     )
     .await;
     assert_eq!(
@@ -1543,20 +1609,42 @@ async fn list_filters_and_paging() {
     );
 }
 
-/// 記録の書き込みが失敗しても区切りだけ戻し、セッションの更新は残す (rust の `let _ = create_tenko_record(..)`)
+/// 記録が書けなければ点呼を閉じない (段の更新ごと戻して 500 `record_failed`)。機器故障 `measurement_recording_failed` を残す。
+/// アルコール検知は測定の保存と中止を残し、機器故障だけ足す
 #[tokio::test]
-async fn record_failure_keeps_session_update() {
+async fn record_failure_does_not_close() {
     reject_triggers().await;
     let app = app().await;
     let t = tenant().await;
     let emp = employee(t, "記録 失敗").await;
+    let reject = ("location", "'TEST-REJECT-RECORD'");
+    let failures = |id: Uuid| async move {
+        admin()
+            .await
+            .query(
+                "SELECT failure_type, description FROM alc_api.equipment_failures WHERE session_id = $1",
+                &[&id],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+            .collect::<Vec<_>>()
+    };
+    let want_failure = vec![(
+        "measurement_recording_failed".to_owned(),
+        "点呼の記録を保存できませんでした".to_owned(),
+    )];
+    let record_failed = json!({ "error": "record_failed", "message": "点呼の記録を保存できませんでした。もう一度お試しください" });
+
+    // 取り消し
     let id = sess(
         t,
         emp,
         "pre_operation",
         "自動点呼",
         "medical_pending",
-        &[("location", "'TEST-REJECT-RECORD'")],
+        &[reject],
     )
     .await;
     let c = send(
@@ -1567,11 +1655,91 @@ async fn record_failure_keeps_session_update() {
         Some(json!({})),
     )
     .await;
-    assert_eq!(
-        (c.status, c.json()["status"].clone()),
-        (200, json!("cancelled"))
-    );
+    assert_eq!((c.status, c.json()), (500, record_failed.clone()));
+    assert_eq!(session_status(id).await, "medical_pending");
     assert!(records(id).await.is_empty());
+    assert_eq!(failures(id).await, want_failure);
+
+    // 指示の確認 (完了)
+    let id = sess(
+        t,
+        emp,
+        "pre_operation",
+        "自動点呼",
+        "instruction_pending",
+        &[reject, ("vehicle_number", "'品川 100 あ 12-34'")],
+    )
+    .await;
+    let d = send(
+        &app,
+        "PUT",
+        &format!("/api/tenko/sessions/{id}/instruction-confirm"),
+        t,
+        None,
+    )
+    .await;
+    assert_eq!((d.status, d.json()), (500, record_failed.clone()));
+    assert_eq!(session_status(id).await, "instruction_pending");
+    assert_eq!(failures(id).await, want_failure);
+
+    // 運行報告 (業務後の完了)・安全判定の中断・日常点検 NG も同じ
+    let ng = json!({ "brakes": "ng", "tires": "ok", "lights": "ok", "steering": "ok", "wipers": "ok", "mirrors": "ok", "horn": "ok", "seatbelts": "ok" });
+    for (tenko_type, status, step, method, body) in [
+        (
+            "post_operation",
+            "report_pending",
+            "report",
+            "PUT",
+            json!({ "vehicle_road_status": "a", "driver_alternation": "b" }),
+        ),
+        (
+            "pre_operation",
+            "self_declaration_pending",
+            "self-declaration",
+            "PUT",
+            json!({ "illness": true, "fatigue": false, "sleep_deprivation": false }),
+        ),
+        (
+            "pre_operation",
+            "daily_inspection_pending",
+            "daily-inspection",
+            "PUT",
+            ng.clone(),
+        ),
+    ] {
+        let id = sess(t, emp, tenko_type, "自動点呼", status, &[reject]).await;
+        let got = send(
+            &app,
+            method,
+            &format!("/api/tenko/sessions/{id}/{step}"),
+            t,
+            Some(body),
+        )
+        .await;
+        assert_eq!(
+            (got.status, got.json()),
+            (500, record_failed.clone()),
+            "{step}"
+        );
+        assert_eq!(session_status(id).await, status, "{step}");
+        assert_eq!(failures(id).await, want_failure, "{step}");
+    }
+
+    // アルコール検知: 中止は残し、機器故障を足す
+    let id = sess(
+        t,
+        emp,
+        "pre_operation",
+        "自動点呼",
+        "identity_verified",
+        &[reject],
+    )
+    .await;
+    let alc = measure(&app, t, emp, &id.to_string(), "over").await;
+    assert_eq!(alc["status"], "cancelled");
+    assert!(records(id).await.is_empty());
+    assert_eq!(failures(id).await, want_failure);
+
     assert!(app
         .logs()
         .iter()
@@ -1668,7 +1836,10 @@ async fn db_failures_are_500() {
     assert_eq!(j.status, 500);
     for (uri, body) in [
         (s("medical"), json!({})),
-        (s("self-resume"), json!({ "reason": "x" })),
+        (
+            s("self-resume"),
+            json!({ "reason": "x", "identity": { "employee_id": id, "method": "vein" } }),
+        ),
     ] {
         let got = call_with(
             &app,
@@ -1784,7 +1955,7 @@ async fn judgment_closes_pending_and_writes_record() {
         "POST",
         &format!("/api/tenko/sessions/{pre}/self-resume"),
         t,
-        Some(json!({ "reason": "再開" })),
+        Some(json!({ "reason": "再開", "identity": { "employee_id": emp, "method": "vein" } })),
     )
     .await;
     assert_eq!(
@@ -2432,7 +2603,8 @@ async fn medical_validity_window() {
 
     // キオスクの自己再開: 状態はそのまま、ただし過ぎていれば測り直し (測り直し中の再送は何もしない)
     let selfr = |id: Uuid| format!("/api/tenko/sessions/{id}/self-resume");
-    let body = Some(json!({ "reason": "電池切れ" }));
+    let body =
+        Some(json!({ "reason": "電池切れ", "identity": { "employee_id": emp, "method": "vein" } }));
     for (status, extra, want) in [
         (
             "daily_inspection_pending",
@@ -2589,7 +2761,7 @@ async fn resume_name_alternative_measure_and_self_resume_after_manager() {
         "POST",
         &format!("/api/tenko/sessions/{id2}/self-resume"),
         t,
-        Some(json!({ "reason": "キオスクから" })),
+        Some(json!({ "reason": "キオスクから", "identity": { "employee_id": emp, "method": "vein" } })),
     )
     .await;
     assert_eq!(got.status, 200);
@@ -3064,6 +3236,15 @@ async fn walk_switched_to_pending(app: &App, t: Uuid, name: &str) -> String {
     assert_eq!(insp.json()["status"], "identity_verified");
     let alc = measure(app, t, emp, &id, "normal").await;
     assert_eq!(alc["status"], "instruction_pending");
+    let v = send(
+        app,
+        "PUT",
+        &uri("vehicle"),
+        t,
+        Some(json!({ "vehicle_number": "品川 100 あ 12-34" })),
+    )
+    .await;
+    assert_eq!(v.status, 200);
     let done = send(app, "PUT", &uri("instruction-confirm"), t, None).await;
     assert_eq!(done.json()["status"], "judgment_pending");
     assert!(records(id.parse().unwrap()).await.is_empty());
@@ -3100,7 +3281,7 @@ async fn switched_in_person_session_walks_to_judgment() {
     .await;
     assert_eq!(it.status, 400);
 
-    // 車両も運行管理者も所属が未設定 → 決められない (同じ営業所として通常点呼で記録する)
+    // 車両 (車検証に無い番号) も運行管理者も所属が未設定 → 決められない (同じ営業所として通常点呼で記録する)
     let scope = send_h(
         &app,
         "GET",
@@ -3113,7 +3294,7 @@ async fn switched_in_person_session_walks_to_judgment() {
     assert_eq!(scope.status, 200);
     assert_eq!(
         scope.json(),
-        json!({ "scope": "unknown", "vehicle_number": null, "vehicle_offices": [], "vehicle_source": null, "judge_offices": [] })
+        json!({ "scope": "unknown", "vehicle_number": "品川 100 あ 12-34", "vehicle_offices": [], "vehicle_source": null, "judge_offices": [] })
     );
 
     let judged = send_h(

@@ -115,7 +115,7 @@ async fn apply(
     if !is_fail {
         return Ok((s, None));
     }
-    record_or_log(tx, &s, log).await;
+    record_or_log(tx, &s, log).await?;
     let name = employee_name(tx, s.tenant_id, s.employee_id).await?;
     let payload = json!({
         "event": "alcohol_detected",
