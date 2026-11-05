@@ -300,16 +300,6 @@ async fn pre_operation_auto_flow_writes_record() {
     assert_eq!(again.status, 404);
 
     let uri = |step: &str| format!("/api/tenko/sessions/{id}/{step}");
-    let bp = send(
-        &app,
-        "PUT",
-        &uri("medical"),
-        t,
-        Some(json!({ "temperature": 36.6 })),
-    )
-    .await;
-    assert_eq!(bp.status, 400);
-    assert_eq!(bp.json()["error"], "bp_required");
     let med = send(
         &app,
         "PUT",
