@@ -2696,7 +2696,7 @@ async fn vehicle_number_sources() {
     let emp = employee(t, "車両 一郎").await;
 
     // 開始: 予定に車両番号があれば写して source = schedule。無ければ NULL
-    let with = schedule(t, emp, "pre_operation", None).await;
+    let with = schedule(t, emp, "pre_operation", Some("安全運転")).await;
     admin()
         .await
         .execute(
@@ -2721,7 +2721,7 @@ async fn vehicle_number_sources() {
         ),
         (json!("品川 100 あ 12-34"), json!("schedule"))
     );
-    let without = schedule(t, emp, "pre_operation", None).await;
+    let without = schedule(t, emp, "pre_operation", Some("安全運転")).await;
     let plain = send(
         &app,
         "POST",
