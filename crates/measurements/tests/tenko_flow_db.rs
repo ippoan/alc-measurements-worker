@@ -2978,9 +2978,17 @@ async fn auto_pre_operation_needs_ten_days_of_bp() {
         json!("血圧の記録が 10 日分に満たない (いま 9 日分)")
     );
 
-    // dev 端末は 0 日分でも自動点呼のまま
+    // dev 端末は 0 日分でも自動点呼のまま (予定は dev の軸に置く。本番の軸の予定は dev の接続から見えない)
     let emp = employee(t, "血圧 開発").await;
     let sch = schedule(t, emp, "pre_operation", Some("安全運転")).await;
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.tenko_schedules SET is_dev = TRUE WHERE id = $1",
+            &[&sch],
+        )
+        .await
+        .unwrap();
     let got = start(sch, emp, vec![("X-Device-Dev", "1")]).await;
     assert_eq!(got.status, 201);
     assert_eq!(got.json()["tenko_method"], json!("自動点呼"));
