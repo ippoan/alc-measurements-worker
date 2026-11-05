@@ -3438,7 +3438,15 @@ async fn vehicle_candidates_for_kiosk() {
     let app = app().await;
     let t = tenant().await;
     let emp = employee(t, "候補 一郎").await;
-    let id = sess(t, emp, "pre_operation", "自動点呼", "identity_verified", &[]).await;
+    let id = sess(
+        t,
+        emp,
+        "pre_operation",
+        "自動点呼",
+        "identity_verified",
+        &[],
+    )
+    .await;
     let db = admin().await;
     let office = |name: &'static str| {
         let db = &db;
