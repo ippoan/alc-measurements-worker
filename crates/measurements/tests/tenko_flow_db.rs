@@ -3299,7 +3299,8 @@ async fn carins_base(t: Uuid, office: Uuid, use_base: &str, user_name: &str) {
         .unwrap();
 }
 
-/// 手で選んだ所属が無ければ、車両の車検証 (登録番号で一致する最新の 1 枚) の使用の本拠・使用者の組から営業所を決める。
+/// 手で選んだ所属が無ければ、車両の車検証 (登録番号で一致する最新の 1 枚) の使用の本拠・使用者の組から営業所を決める
+/// (半角・全角の空白の違いは無視する)。
 /// 手で選んだ所属があればそちらが優先する。別のテナントの車検証・対応は見えない
 #[tokio::test]
 async fn switched_in_person_vehicle_office_from_carins() {
@@ -3312,8 +3313,8 @@ async fn switched_in_person_vehicle_office_from_carins() {
         t,
         "CERT-CARINS-1",
         "佐賀 100 あ 7601",
-        " 長崎県長崎市 ",
-        "一歩運輸",
+        " 長崎県 長崎市 ",
+        "一歩　運輸",
     )
     .await;
     carins_base(t, nagasaki, "長崎県長崎市", "一歩運輸").await;

@@ -101,7 +101,7 @@ pub mod sql {
 
     /// 車両の所属営業所・判定する人の所属営業所 (どちらも `[{id, name, company_name}]` の JSON)・車両の所属の出どころ
     /// (`manual` / `carins` / NULL)。車両は手で選んだ所属 (登録番号を空白を除いて照合) を優先し、無ければ車検証の
-    /// 使用の本拠の位置 + 使用者の組 (式は migration 206 と同じ) の対応。車検証はセッションの管理番号・車両 ID・登録番号の
+    /// 使用の本拠の位置 + 使用者の組 (式は migration 206 と同じ。半角・全角の空白は無視して比べる。alc-tenko-worker の一覧と同じ) の対応。車検証はセッションの管理番号・車両 ID・登録番号の
     /// どれかで一致する最新の 1 行 (登録番号は `EntryNoCarNo`。`CarNo` は車台番号)。$1 tenant_id / $2 車両番号 / $3 employee_id / $4 車検証の管理番号 / $5 車検証の車両 ID
     pub const OFFICE_SCOPE: &str = "WITH manual AS ( \
              SELECT v.office_id FROM alc_api.maintenance_vehicles v WHERE v.tenant_id = $1 AND v.deleted_at IS NULL \
@@ -116,7 +116,7 @@ pub mod sql {
          picked AS ( \
              SELECT office_id, 'manual' AS src FROM manual \
              UNION ALL SELECT b.office_id, 'carins' FROM alc_api.tenko_office_carins_bases b \
-             JOIN ci ON b.use_base = ci.use_base AND b.user_name = ci.user_name \
+             JOIN ci ON regexp_replace(b.use_base, '[[:space:]　]', '', 'g') = regexp_replace(ci.use_base, '[[:space:]　]', '', 'g') AND regexp_replace(b.user_name, '[[:space:]　]', '', 'g') = regexp_replace(ci.user_name, '[[:space:]　]', '', 'g') \
              WHERE b.tenant_id = $1 AND NOT EXISTS (SELECT 1 FROM manual)) \
          SELECT \
          COALESCE((SELECT jsonb_agg(jsonb_build_object('id', o.id, 'name', o.name, 'company_name', o.company_name) \
