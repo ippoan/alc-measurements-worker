@@ -2955,7 +2955,7 @@ async fn auto_pre_operation_needs_ten_days_of_bp() {
     // 10 日分: 自動点呼のまま
     let emp = employee(t, "血圧 十日").await;
     bp_history(t, emp, 10).await;
-    let sch = schedule(t, emp, "pre_operation", None).await;
+    let sch = schedule(t, emp, "pre_operation", Some("安全運転")).await;
     let s = start(sch, emp, vec![]).await.json();
     assert_eq!(
         (
@@ -2970,7 +2970,7 @@ async fn auto_pre_operation_needs_ten_days_of_bp() {
     bp_history(t, emp, 9).await;
     bp_history(t, emp, 1).await;
     bp_history(t, emp, 1).await;
-    let sch = schedule(t, emp, "pre_operation", None).await;
+    let sch = schedule(t, emp, "pre_operation", Some("安全運転")).await;
     let s = start(sch, emp, vec![]).await.json();
     assert_eq!(s["tenko_method"], json!("遠隔点呼"));
     assert_eq!(
@@ -2980,7 +2980,7 @@ async fn auto_pre_operation_needs_ten_days_of_bp() {
 
     // dev 端末は 0 日分でも自動点呼のまま
     let emp = employee(t, "血圧 開発").await;
-    let sch = schedule(t, emp, "pre_operation", None).await;
+    let sch = schedule(t, emp, "pre_operation", Some("安全運転")).await;
     let got = start(sch, emp, vec![("X-Device-Dev", "1")]).await;
     assert_eq!(got.status, 201);
     assert_eq!(got.json()["tenko_method"], json!("自動点呼"));
@@ -3055,17 +3055,9 @@ async fn switched_remote_session_walks_to_judgment() {
     assert_eq!(decl["status"], "daily_inspection_pending");
     assert_eq!(decl["safety_judgment"]["status"], "pass");
     let ok = json!({ "brakes": "ok", "tires": "ok", "lights": "ok", "steering": "ok", "wipers": "ok", "mirrors": "ok", "horn": "ok", "seatbelts": "ok" });
+    // 携行品が無いテナントなので、日常点検の後はアルコールの段へ進む
     let insp = send(&app, "PUT", &uri("daily-inspection"), t, Some(ok)).await;
-    assert_eq!(insp.json()["status"], "carrying_items_pending");
-    let carry = send(
-        &app,
-        "PUT",
-        &uri("carrying-items"),
-        t,
-        Some(json!({ "checks": [] })),
-    )
-    .await;
-    assert_eq!(carry.json()["status"], "identity_verified");
+    assert_eq!(insp.json()["status"], "identity_verified");
     let alc = measure(&app, t, emp, &id, "normal").await;
     assert_eq!(alc["status"], "instruction_pending");
     let done = send(&app, "PUT", &uri("instruction-confirm"), t, None).await;
