@@ -46,6 +46,7 @@ POST は点呼方法・本人確認の方法を受けない (通常点呼・記�
 | `/api/tenko/sessions/{id}/{medical,self-declaration,daily-inspection,carrying-items,instruction-confirm,report,escalate-remote}` | PUT | 段 |
 | `/api/tenko/sessions/{id}/{cancel,interrupt,resume,self-resume}` | POST | 中止・中断・再開 (管理者)・自己再開 |
 | `/api/tenko/sessions/{id}/judgment` | POST | 運行管理者の判定 |
+| `/api/tenko/sessions/{id}/in-person-scope` | GET | 切り替えた対面点呼で、運行管理者 (`judge`) の所属と車両の営業所を照合した対面の範囲 (`same_office` / `other_office` / `unknown`) |
 
 - **アルコールの段は測定の保存で進める**: 完了の `PUT /api/measurements/{id}` に `tenko_session_id` を付けると、同じ transaction で
   本人確認済みのセッションを **測定の行の** 結果・アルコール値・顔写真・測定時刻から進める (検知なら中止で閉じて記録)。
