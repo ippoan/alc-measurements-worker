@@ -2805,12 +2805,12 @@ async fn vehicle_number_sources() {
     .json();
     assert_eq!(j["vehicle_number_source"], "manual");
 
-    // 車検証に一致 → 登録番号 (CarNo)・carins の列も埋める。入力の車両番号があっても車検証が優先
+    // 車検証に一致 → 登録番号 (EntryNoCarNo。CarNo は車台番号)・carins の列も埋める。入力の車両番号があっても車検証が優先
     support::car_inspection(t, "000000000077", "TESTCARID00077", "301231", "01").await;
     admin()
         .await
         .execute(
-            "UPDATE alc_api.car_inspection SET \"CarNo\" = '品川 500 え 11-11' WHERE tenant_id = $1 AND \"ElectCertMgNo\" = '000000000077'",
+            "UPDATE alc_api.car_inspection SET \"EntryNoCarNo\" = '品川 500 え 11-11', \"CarNo\" = 'ABC12-345678' WHERE tenant_id = $1 AND \"ElectCertMgNo\" = '000000000077'",
             &[&t],
         )
         .await
@@ -3279,7 +3279,7 @@ async fn car_inspection_base(
     admin()
         .await
         .execute(
-            "UPDATE alc_api.car_inspection SET \"CarNo\" = $1, \"UseheadqrterChar\" = $2, \"UsernameHighLevelChar\" = $3 \
+            "UPDATE alc_api.car_inspection SET \"EntryNoCarNo\" = $1, \"UseheadqrterChar\" = $2, \"UsernameHighLevelChar\" = $3 \
              WHERE tenant_id = $4 AND \"ElectCertMgNo\" = $5",
             &[&car_no, &use_base, &user_name, &t, &cert_no],
         )
@@ -3430,7 +3430,7 @@ async fn switched_in_person_other_office_is_recorded_as_remote() {
     );
 }
 
-/// キオスクの車両番号の候補: 打った数字を含む車両を、車検証 (車両 ID ごとに最新の 1 枚) と車両マスタから引き、
+/// キオスクの車両番号の候補 (登録番号の一連指定番号の先頭で照合。車台番号 CarNo では出さない): 打った数字で始まる車両を、車検証 (車両 ID ごとに最新の 1 枚) と車両マスタから引き、
 /// 営業所への紐づけ (手の所属、無ければ車検証の使用の本拠・使用者の対応) を付ける。端末の営業所の車両が先、
 /// 次に打った数字で終わる車両。全角の数字・空白の違いは無視する。別のテナントの車両は出ない
 #[tokio::test]
@@ -3464,7 +3464,7 @@ async fn vehicle_candidates_for_kiosk() {
     let nagasaki = office("長崎営業所").await;
     support::car_inspection(t, "CERT-CAND-1", "CAR-CAND-1", "301231", "01").await;
     db.execute(
-        "UPDATE alc_api.car_inspection SET \"CarNo\" = '佐賀　１００　あ　７６０１', \"UseheadqrterChar\" = '＊＊＊', \
+        "UPDATE alc_api.car_inspection SET \"EntryNoCarNo\" = '佐賀　１００　あ　７６０１', \"CarNo\" = 'BKR66E7601001', \"UseheadqrterChar\" = '＊＊＊', \
              \"UsernameHighLevelChar\" = '一歩運輸' WHERE tenant_id = $1 AND \"ElectCertMgNo\" = 'CERT-CAND-1'",
         &[&t],
     )
@@ -3536,19 +3536,27 @@ async fn vehicle_candidates_for_kiosk() {
     let j = send(&app, "GET", &uri("76"), t, None).await.json();
     let mut got = numbers(&j);
     got.sort();
-    let mut want = vec![
-        "佐賀　１００　あ　７６０１",
-        "福岡 100 さ 1760",
-        "長崎 100 か 7601",
-    ];
+    let mut want = vec!["佐賀　１００　あ　７６０１", "長崎 100 か 7601"];
     want.sort();
     assert_eq!(got, want);
     assert!(j["candidates"]
         .as_array()
         .unwrap()
         .iter()
-        .all(|c| c["device_office"] == false
-            && c["linked"] == (c["vehicle_number"] != "福岡 100 さ 1760")));
+        .all(|c| c["device_office"] == false && c["linked"] == true));
+    // 一連指定番号の先頭で照合する (分類番号の 100 や途中の数字では出さない)。紐づいていない車両は linked が false
+    let j = send(&app, "GET", &uri("17"), t, None).await.json();
+    assert_eq!(numbers(&j), ["福岡 100 さ 1760"]);
+    assert_eq!(j["candidates"][0]["linked"], false);
+    assert_eq!(
+        send(&app, "GET", &uri("100"), t, None).await.json(),
+        json!({ "candidates": [] })
+    );
+    // 車台番号 (CarNo) の数字では出さない
+    assert_eq!(
+        send(&app, "GET", &uri("66"), t, None).await.json(),
+        json!({ "candidates": [] })
+    );
     // 当たらなければ空、数字でなければ 400、無いセッションは 404
     assert_eq!(
         send(&app, "GET", &uri("999"), t, None).await.json(),
