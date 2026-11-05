@@ -8,6 +8,7 @@
 //! - [`alcohol`] — アルコールの段。測定の保存 (`PUT /measurements/{id}` の `tenko_session_id`) で、**測定の行の値から**進める
 //!   (アルコールの結果を本文で受ける段の口は無い)
 //! - [`judgment`] — 運行管理者の判定 (`POST /tenko/sessions/{id}/judgment`)。判定待ち (`judgment_pending`) を閉じて記録を書く
+//! - [`vehicles`] — キオスクの車両番号の候補 (`GET /tenko/sessions/{id}/vehicle-candidates`。テンキーで打った数字から)
 //! - [`fire`] — 点呼の節目の webhook を、応答の後に ippoan/alc-tenko-worker の内部の口へ渡す (送信はあちらの 1 か所)
 
 pub mod alcohol;
@@ -16,6 +17,7 @@ pub mod flow;
 pub mod judgment;
 pub mod normal;
 pub mod record;
+pub mod vehicles;
 
 pub use normal::*;
 pub use record::{
@@ -28,5 +30,7 @@ use crate::AppState;
 
 /// 点呼のセッションの口 (`/tenko/sessions*`)
 pub fn router() -> Router<AppState> {
-    flow::router().merge(judgment::router())
+    flow::router()
+        .merge(judgment::router())
+        .merge(vehicles::router())
 }

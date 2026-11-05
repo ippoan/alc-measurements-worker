@@ -3429,3 +3429,147 @@ async fn switched_in_person_other_office_is_recorded_as_remote() {
         ("completed", "遠隔点呼")
     );
 }
+
+/// キオスクの車両番号の候補: 打った数字を含む車両を、車検証 (車両 ID ごとに最新の 1 枚) と車両マスタから引き、
+/// 営業所への紐づけ (手の所属、無ければ車検証の使用の本拠・使用者の対応) を付ける。端末の営業所の車両が先、
+/// 次に打った数字で終わる車両。全角の数字・空白の違いは無視する。別のテナントの車両は出ない
+#[tokio::test]
+async fn vehicle_candidates_for_kiosk() {
+    let app = app().await;
+    let t = tenant().await;
+    let emp = employee(t, "候補 一郎").await;
+    let id = sess(
+        t,
+        emp,
+        "pre_operation",
+        "自動点呼",
+        "identity_verified",
+        &[],
+    )
+    .await;
+    let db = admin().await;
+    let office = |name: &'static str| {
+        let db = &db;
+        async move {
+            db.query_one(
+                "INSERT INTO alc_api.tenko_offices (tenant_id, name) VALUES ($1, $2) RETURNING id",
+                &[&t, &name],
+            )
+            .await
+            .unwrap()
+            .get::<_, Uuid>(0)
+        }
+    };
+    let saga = office("佐賀営業所").await;
+    let nagasaki = office("長崎営業所").await;
+    support::car_inspection(t, "CERT-CAND-1", "CAR-CAND-1", "301231", "01").await;
+    db.execute(
+        "UPDATE alc_api.car_inspection SET \"CarNo\" = '佐賀　１００　あ　７６０１', \"UseheadqrterChar\" = '＊＊＊', \
+             \"UsernameHighLevelChar\" = '一歩運輸' WHERE tenant_id = $1 AND \"ElectCertMgNo\" = 'CERT-CAND-1'",
+        &[&t],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO alc_api.tenko_office_carins_bases (tenant_id, office_id, use_base, user_name) VALUES ($1, $2, '＊＊＊', '一歩運輸')",
+        &[&t, &saga],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO alc_api.maintenance_vehicles (tenant_id, registration_number, office_id) VALUES \
+             ($1, '長崎 100 か 7601', $2), ($1, '福岡 100 さ 1760', NULL), ($1, '熊本 100 た 1234', NULL)",
+        &[&t, &nagasaki],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO alc_api.tenko_office_devices (tenant_id, device_id, office_id) VALUES ($1, 'kiosk-nagasaki', $2)",
+        &[&t, &nagasaki],
+    )
+    .await
+    .unwrap();
+    let other = tenant().await;
+    db.execute(
+        "INSERT INTO alc_api.maintenance_vehicles (tenant_id, registration_number) VALUES ($1, '他社 100 あ 7601')",
+        &[&other],
+    )
+    .await
+    .unwrap();
+    let uri = |q: &str| format!("/api/tenko/sessions/{id}/vehicle-candidates?q={q}");
+    let numbers = |v: &Value| -> Vec<String> {
+        v["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["vehicle_number"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // 端末の営業所 (長崎) の車両が先。次に 7601 で終わる車両、最後に途中に含む車両
+    let device = [("X-Device-Id", "kiosk-nagasaki")];
+    let j = send_h(&app, "GET", &uri("7601"), t, &device, None)
+        .await
+        .json();
+    assert_eq!(
+        numbers(&j),
+        ["長崎 100 か 7601", "佐賀　１００　あ　７６０１"]
+    );
+    assert_eq!(
+        (
+            j["candidates"][0]["office_name"].clone(),
+            j["candidates"][0]["linked"].clone(),
+            j["candidates"][0]["device_office"].clone(),
+            j["candidates"][0]["carins_cert_no"].clone()
+        ),
+        (json!("長崎営業所"), json!(true), json!(true), json!(null))
+    );
+    assert_eq!(
+        (
+            j["candidates"][1]["office_name"].clone(),
+            j["candidates"][1]["device_office"].clone(),
+            j["candidates"][1]["carins_cert_no"].clone()
+        ),
+        (json!("佐賀営業所"), json!(false), json!("CERT-CAND-1"))
+    );
+    // 端末の名乗りが無ければ営業所で並べない。紐づいていない車両は linked が false
+    let j = send(&app, "GET", &uri("76"), t, None).await.json();
+    let mut got = numbers(&j);
+    got.sort();
+    let mut want = vec![
+        "佐賀　１００　あ　７６０１",
+        "福岡 100 さ 1760",
+        "長崎 100 か 7601",
+    ];
+    want.sort();
+    assert_eq!(got, want);
+    assert!(j["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|c| c["device_office"] == false
+            && c["linked"] == (c["vehicle_number"] != "福岡 100 さ 1760")));
+    // 当たらなければ空、数字でなければ 400、無いセッションは 404
+    assert_eq!(
+        send(&app, "GET", &uri("999"), t, None).await.json(),
+        json!({ "candidates": [] })
+    );
+    for bad in ["", "7a", "123456789"] {
+        assert_eq!(send(&app, "GET", &uri(bad), t, None).await.status, 400);
+    }
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!(
+                "/api/tenko/sessions/{}/vehicle-candidates?q=1",
+                Uuid::new_v4()
+            ),
+            t,
+            None
+        )
+        .await
+        .status,
+        404
+    );
+}
