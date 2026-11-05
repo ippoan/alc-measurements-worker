@@ -108,8 +108,11 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
 - 遠隔点呼 (最後の段) と IT点呼 (測定の保存・確定の口) は、完了する結果でも `judgment_pending` (alc-migrations 195) で作り、記録は判定で書く。
 - 開始 (`POST /tenko/sessions/start`) は、予定ありの業務前 (自動点呼) で乗務員の血圧の記録 (東京の日付の異なり数、`BP_HISTORY_DAYS_REQUIRED` = 10) が足りないと、予定は消費して**遠隔点呼で作る** (escalate-remote と同じ `ESCALATE` の文。`remote_escalation_reason` = 「血圧の記録が 10 日分に満たない (いま N 日分)」、状態は `medical_pending`)。dev 端末は切り替えない (キオスクが警告する)。業務後・予定なしは対象外。
   検知 (中止) は判定を待たずに閉じて記録する。
+- 血圧は点呼のキオスクで測らず測定台で測る (業務前 七・八・十)。`PUT …/medical` は本文に血圧が無ければ、乗務員の最新の血圧
+  (`sql::LATEST_BP`。測定台の測定) が有効時間内なら点呼の測定に写し (測定の時刻は体温と血圧の早い方)、差と安全判定に使う。
+  無い・過ぎた自動点呼は `ESCALATE` で遠隔点呼として続ける (`STAND_BP_MISSING_REASON`)。dev 端末と自動点呼でない点呼は切り替えない。
 - 点呼の webhook は送らない: `PendingFire` を応答の extension に入れ、`src/lib.rs` が `wait_until` で alc-tenko-worker の
   `/internal/webhooks/fire` へ渡す (Service Binding `ALC_TENKO`。本番 `alc-tenko`・staging `alc-tenko-staging`)。dev の要求は渡さない。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 46・api_db 10・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 17・bp_settings_db 18・upload_db 2・tenko_flow_db 25) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 46・api_db 10・files_db 14・normal_tenko_db 26・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 17・bp_settings_db 18・upload_db 2・tenko_flow_db 26) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・Hyperdrive の設定の ID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-trouble-worker と同じ rev)。

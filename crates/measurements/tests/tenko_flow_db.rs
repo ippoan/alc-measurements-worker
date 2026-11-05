@@ -3583,3 +3583,155 @@ async fn vehicle_candidates_for_kiosk() {
         404
     );
 }
+
+/// 測定台で測った血圧を点呼に結ぶ (業務前 七・八・十)。本文に血圧が無ければ、有効時間内の最新の血圧を点呼の測定に写し、
+/// 基準値との差と安全判定に使う。測定の時刻は体温と血圧の早い方。有効な血圧が無い自動点呼は遠隔点呼として続ける
+/// (dev 端末・自動点呼でない点呼は切り替えない)
+#[tokio::test]
+async fn stand_bp_ties_to_tenko() {
+    let app = app().await;
+    let t = tenant().await;
+    let stand = |emp: Uuid, at: &'static str| async move {
+        admin()
+            .await
+            .execute(
+                &format!(
+                    "INSERT INTO alc_api.measurements (tenant_id, employee_id, status, systolic, diastolic, pulse, medical_measured_at) \
+                     VALUES ($1, $2, 'completed', 150, 90, 72, '{at}')"
+                ),
+                &[&t, &emp],
+            )
+            .await
+            .unwrap();
+    };
+    let medical =
+        Some(json!({ "temperature": 36.5, "medical_measured_at": "2026-10-22T21:55:00Z" }));
+    let uri = |id: Uuid, step: &str| format!("/api/tenko/sessions/{id}/{step}");
+
+    // 有効時間内 (要求の今 22:00 の 30 分以内) の測定台の血圧を写す。古い方 (20:00) は使わない
+    let emp = employee(t, "測定台 一郎").await;
+    baseline(t, emp).await;
+    stand(emp, "2026-10-22T20:00:00Z").await;
+    stand(emp, "2026-10-22T21:45:00Z").await;
+    let id = sess(t, emp, "pre_operation", "自動点呼", "medical_pending", &[]).await;
+    let m = send(&app, "PUT", &uri(id, "medical"), t, medical.clone())
+        .await
+        .json();
+    assert_eq!(
+        (
+            m["status"].clone(),
+            m["tenko_method"].clone(),
+            m["systolic"].clone(),
+            m["diastolic"].clone(),
+            m["pulse"].clone(),
+            m["temperature"].clone(),
+        ),
+        (
+            json!("self_declaration_pending"),
+            json!("自動点呼"),
+            json!(150),
+            json!(90),
+            json!(72),
+            json!(36.5)
+        )
+    );
+    assert!(m["medical_measured_at"]
+        .as_str()
+        .unwrap()
+        .starts_with("2026-10-22T21:45:00"));
+    // 差と安全判定に血圧が入る (基準 120/80 ±10)
+    let decl = send(
+        &app,
+        "PUT",
+        &uri(id, "self-declaration"),
+        t,
+        Some(json!({ "illness": false, "fatigue": false, "sleep_deprivation": false })),
+    )
+    .await
+    .json();
+    let j = &decl["safety_judgment"];
+    assert_eq!(
+        (
+            j["status"].clone(),
+            j["failed_items"].clone(),
+            j["medical_diffs"]["systolic_diff"].clone(),
+            j["medical_diffs"]["diastolic_diff"].clone(),
+        ),
+        (json!("fail"), json!(["systolic"]), json!(30), json!(10))
+    );
+
+    // 有効な血圧が無い自動点呼は遠隔点呼として続ける
+    let none = employee(t, "測定台 二郎").await;
+    stand(none, "2026-10-22T21:00:00Z").await;
+    let id = sess(t, none, "pre_operation", "自動点呼", "medical_pending", &[]).await;
+    let m = send(&app, "PUT", &uri(id, "medical"), t, medical.clone())
+        .await
+        .json();
+    assert_eq!(
+        (
+            m["status"].clone(),
+            m["tenko_method"].clone(),
+            m["remote_escalation_reason"].clone(),
+            m["systolic"].clone(),
+        ),
+        (
+            json!("self_declaration_pending"),
+            json!("遠隔点呼"),
+            json!("測定台の血圧が無い (または有効時間を過ぎた)"),
+            Value::Null
+        )
+    );
+    assert!(m["escalated_to_remote_at"].is_string());
+
+    // 自動点呼でない点呼 (対面点呼に切り替えたもの) は切り替えず、血圧なしで進む
+    let id = sess(t, none, "pre_operation", "通常点呼", "medical_pending", &[]).await;
+    let m = send(&app, "PUT", &uri(id, "medical"), t, medical.clone())
+        .await
+        .json();
+    assert_eq!(
+        (m["tenko_method"].clone(), m["systolic"].clone()),
+        (json!("通常点呼"), Value::Null)
+    );
+
+    // dev 端末は切り替えない (キオスクが警告する)
+    let dev = [("is_dev", "true")];
+    let id = sess(
+        t,
+        none,
+        "pre_operation",
+        "自動点呼",
+        "medical_pending",
+        &dev,
+    )
+    .await;
+    let m = send_h(
+        &app,
+        "PUT",
+        &uri(id, "medical"),
+        t,
+        &[("X-Device-Dev", "1")],
+        medical.clone(),
+    )
+    .await
+    .json();
+    assert_eq!(
+        (m["status"].clone(), m["tenko_method"].clone()),
+        (json!("self_declaration_pending"), json!("自動点呼"))
+    );
+
+    // 本文の血圧 (デモの手入力) はそのまま使う
+    let id = sess(t, none, "pre_operation", "自動点呼", "medical_pending", &[]).await;
+    let m = send(
+        &app,
+        "PUT",
+        &uri(id, "medical"),
+        t,
+        Some(json!({ "temperature": 36.5, "systolic": 118, "diastolic": 78, "medical_manual_input": true })),
+    )
+    .await
+    .json();
+    assert_eq!(
+        (m["tenko_method"].clone(), m["systolic"].clone()),
+        (json!("自動点呼"), json!(118))
+    );
+}
