@@ -3,7 +3,8 @@
 //! テンキーで打った数字で一連指定番号 (登録番号のひらがなの後の数字。全角の数字・区切りの `-`・`・` は無視) が始まる車両を、
 //! 車検証 (`car_inspection` の登録番号 `EntryNoCarNo`。車両 ID ごとに最新の 1 枚。`CarNo` は車台番号なので使わない) と
 //! 車両マスタ (`maintenance_vehicles`) から最大 [`MAX_CANDIDATES`] 件返す。各候補には点呼の営業所への
-//! 紐づけ (手で選んだ所属、無ければ車検証の使用の本拠・使用者の対応。空白は無視して比べる。判定 [`super::judgment`] と同じ) を付ける。
+//! 紐づけ (手で選んだ所属、無ければ車検証の使用の本拠・使用者の対応。空白は無視して比べ、空白だけ違う対応の行が複数あっても
+//! 車両は 1 件で、営業所は office_id の最小の 1 つ (alc-tenko-worker の一覧と同じ規則)。判定 [`super::judgment`] と同じ優先) を付ける。
 //! 要求した端末 (`X-Device-Id`) が営業所に所属していれば (migration 207)、その営業所の車両を先に並べる。並びの次は
 //! 一連指定番号が打った数字と一致する車両、最後は一連指定番号・登録番号の順。
 //!
@@ -43,9 +44,12 @@ pub mod sql {
          cand AS ( \
              SELECT ci.no, ci.cert, COALESCE((SELECT mv.office_id FROM mv WHERE mv.office_id IS NOT NULL \
                  AND regexp_replace(mv.no, '[[:space:]　]', '', 'g') = regexp_replace(ci.no, '[[:space:]　]', '', 'g') \
-                 LIMIT 1), b.office_id) AS office_id \
-             FROM ci LEFT JOIN alc_api.tenko_office_carins_bases b \
-                 ON b.tenant_id = $1 AND regexp_replace(b.use_base, '[[:space:]　]', '', 'g') = regexp_replace(ci.use_base, '[[:space:]　]', '', 'g') AND regexp_replace(b.user_name, '[[:space:]　]', '', 'g') = regexp_replace(ci.user_name, '[[:space:]　]', '', 'g') \
+                 LIMIT 1), (SELECT b.office_id FROM alc_api.tenko_office_carins_bases b \
+                 WHERE b.tenant_id = $1 \
+                 AND regexp_replace(b.use_base, '[[:space:]　]', '', 'g') = regexp_replace(ci.use_base, '[[:space:]　]', '', 'g') \
+                 AND regexp_replace(b.user_name, '[[:space:]　]', '', 'g') = regexp_replace(ci.user_name, '[[:space:]　]', '', 'g') \
+                 ORDER BY b.office_id LIMIT 1)) AS office_id \
+             FROM ci \
              UNION ALL \
              SELECT mv.no, NULL, mv.office_id FROM mv WHERE NOT EXISTS (SELECT 1 FROM ci \
                  WHERE regexp_replace(ci.no, '[[:space:]　]', '', 'g') = regexp_replace(mv.no, '[[:space:]　]', '', 'g'))), \
