@@ -61,9 +61,6 @@ pub type Arg<'a> = (&'a (dyn ToSql + Sync), Type);
 /// escalate-remote の理由の上限 (rust と同じ。超えたら切り詰めずに 400)
 pub const MAX_ESCALATE_REASON_LEN: usize = 200;
 
-/// 自動点呼の業務前で血圧が無い提出を弾くときの 400 の文言 (rust と同じ)
-pub const BP_REQUIRED_MESSAGE: &str = "systolic and diastolic blood pressure are required (自動点呼では血圧の測定が必須です。血圧計のある端末で測定するか、遠隔点呼に切り替えてください)";
-
 /// 判定待ち (遠隔点呼・IT点呼の乗務員の側が終わった状態。alc-migrations 195)
 pub const JUDGMENT_PENDING: &str = "judgment_pending";
 
@@ -1055,11 +1052,8 @@ async fn medical_handler(
                         ),
                     )));
                 }
-                // 自動点呼は血圧 (最高・最低) が必須 (端末の状態による免除は無い)
-                if cur.tenko_method == AUTO && (body.systolic.is_none() || body.diastolic.is_none())
-                {
-                    return Ok(Flow::Api(bad_request("bp_required", BP_REQUIRED_MESSAGE)));
-                }
+                // 血圧は必須にしない (自動点呼でも)。血圧は点呼のキオスクではなく測定台で測る運用 (オーナー決定 2026-11-05)。
+                // 来た値だけを測定に書き、無い値は安全判定でも比べない
                 // 測定から有効時間 (社員の基準値。無ければ 30 分) を過ぎた値は受けない (業務前 八)
                 if let Some(measured_at) = body.medical_measured_at {
                     let minutes = validity_minutes(tx, tenant_id, cur.employee_id).await?;
