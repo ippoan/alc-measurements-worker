@@ -192,6 +192,28 @@ impl TenkoSession {
 }
 
 pub mod sql {
+    /// 点呼を受けた場所 (location) の既定: 端末が所属する営業所 (`tenko_office_devices` → `tenko_offices`) の
+    /// 「名称 (所在地)」(所在地が無ければ名称) を名称順 (C 照合) に「、」でつないだ値を引く部分式 (括弧付き)。
+    /// 引数はテナントと端末の ID の placeholder (`"$1"` など)。端末が NULL か所属が無ければ NULL。
+    /// 自動点呼の開始 ([`super::super::flow`]) と通常点呼・IT点呼 ([`super::super::normal`]) の 1 か所 (Refs ippoan/alc-app#676)
+    macro_rules! device_office_location {
+        ($tenant:literal, $device:literal) => {
+            concat!(
+                "( \
+                 SELECT string_agg(CASE WHEN btrim(o.address) <> '' THEN o.name || ' (' || btrim(o.address) || ')' \
+                     ELSE o.name END, '、' ORDER BY o.name COLLATE \"C\", o.id) \
+                 FROM alc_api.tenko_office_devices d \
+                 JOIN alc_api.tenko_offices o ON o.tenant_id = d.tenant_id AND o.id = d.office_id \
+                 WHERE d.tenant_id = ",
+                $tenant,
+                " AND d.device_id = ",
+                $device,
+                ")"
+            )
+        };
+    }
+    pub(crate) use device_office_location;
+
     /// 乗務員の名前 (記録・webhook。同じ transaction の中で引く)。$1 employee_id / $2 tenant_id。rust と同じく退職は見ない
     pub const EMPLOYEE_NAME: &str = "SELECT name FROM employees WHERE id = $1 AND tenant_id = $2";
 
