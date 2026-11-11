@@ -311,12 +311,22 @@ pub mod sql {
 
     /// $1 tenant_id / $2 employee_id / $3 schedule_id / $4 tenko_type / $5 tenko_method / $6 status /
     /// $7 identity_face_photo_url / $8 location / $9 responsible_manager_name / $10 measurement_id /
-    /// $11 vehicle_number (予定の値) / $12 vehicle_number_source
+    /// $11 vehicle_number (予定の値) / $12 vehicle_number_source / $13 device_id (`X-Device-Id`)。
+    /// 点呼を受けた場所 (location): 端末が送ってきた値 (GPS など。空白だけは無いとみなす) を優先し、無ければ端末が
+    /// 所属する営業所 (`tenko_office_devices` → `tenko_offices`) の「名称 (所在地)」(所在地が無ければ名称) を
+    /// 名称順 (C 照合) に「、」でつなぐ。所属が無ければ NULL
     pub const CREATE: &str = concatcp!(
         "WITH s AS (INSERT INTO alc_api.tenko_sessions (tenant_id, employee_id, schedule_id, tenko_type, tenko_method, status, \
              identity_verified_at, identity_face_photo_url, location, responsible_manager_name, started_at, \
              measurement_id, vehicle_number, vehicle_number_source) \
-         VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, NOW(), $10, $11, $12)",
+         VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, \
+             CASE WHEN btrim($8) <> '' THEN $8 ELSE ( \
+                 SELECT string_agg(CASE WHEN btrim(o.address) <> '' THEN o.name || ' (' || btrim(o.address) || ')' \
+                     ELSE o.name END, '、' ORDER BY o.name COLLATE \"C\", o.id) \
+                 FROM alc_api.tenko_office_devices d \
+                 JOIN alc_api.tenko_offices o ON o.tenant_id = d.tenant_id AND o.id = d.office_id \
+                 WHERE d.tenant_id = $1 AND d.device_id = $13) END, \
+             $9, NOW(), $10, $11, $12)",
         RETURNING_SESSION
     );
 
@@ -1079,6 +1089,7 @@ async fn start_handler(
                         (&measurement_id, Type::UUID),
                         (&vehicle, Type::TEXT),
                         (&vehicle_source, Type::TEXT),
+                        (&device_id, Type::TEXT),
                     ],
                 )
                 .await?;

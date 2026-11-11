@@ -3916,3 +3916,97 @@ async fn stand_bp_ties_to_tenko() {
         (json!("自動点呼"), json!(118))
     );
 }
+
+/// 点呼を受けた場所 (location。自己チェック表 二十 リ): 端末が送ってきた値 (GPS など) をそのまま使い、無い・空白だけなら
+/// 端末が所属する営業所から「名称 (所在地)」(所在地が無ければ名称) を名称順に「、」でつなぐ。所属が無い端末・名乗りの
+/// 無い要求は NULL。別のテナントの営業所 (同じ端末 ID) は使わない
+#[tokio::test]
+async fn start_location_from_device_offices() {
+    let app = app().await;
+    let t = tenant().await;
+    let emp = employee(t, "場所 一郎").await;
+    let db = admin().await;
+    let office = |tenant: Uuid, name: &'static str, address: Option<&'static str>| {
+        let db = &db;
+        async move {
+            db.query_one(
+                "INSERT INTO alc_api.tenko_offices (tenant_id, name, address) VALUES ($1, $2, $3) RETURNING id",
+                &[&tenant, &name, &address],
+            )
+            .await
+            .unwrap()
+            .get::<_, Uuid>(0)
+        }
+    };
+    let attach = |tenant: Uuid, device: &'static str, office: Uuid| {
+        let db = &db;
+        async move {
+            db.execute(
+                "INSERT INTO alc_api.tenko_office_devices (tenant_id, device_id, office_id) VALUES ($1, $2, $3)",
+                &[&tenant, &device, &office],
+            )
+            .await
+            .unwrap();
+        }
+    };
+    let saga = office(t, "佐賀営業所", Some(" 佐賀県佐賀市1-1 ")).await;
+    let group = office(t, "グループ本社", None).await;
+    let blank = office(t, "長崎営業所", Some("  ")).await;
+    attach(t, "kiosk-one", saga).await;
+    attach(t, "kiosk-two", saga).await;
+    attach(t, "kiosk-two", group).await;
+    attach(t, "kiosk-two", blank).await;
+    let other = tenant().await;
+    let other_office = office(other, "他社営業所", None).await;
+    attach(other, "kiosk-alone", other_office).await;
+
+    let start = |device: Option<&'static str>, location: Value| {
+        let app = &app;
+        async move {
+            let h: Vec<(&str, &str)> = device.map(|d| ("X-Device-Id", d)).into_iter().collect();
+            let mut body = json!({ "employee_id": emp, "tenko_type": "post_operation" });
+            if !location.is_null() {
+                body["location"] = location;
+            }
+            let got = send_h(app, "POST", "/api/tenko/sessions/start", t, &h, Some(body)).await;
+            assert_eq!(got.status, 201);
+            let s = got.json();
+            let id: Uuid = s["id"].as_str().unwrap().parse().unwrap();
+            let stored: Option<String> = admin()
+                .await
+                .query_one(
+                    "SELECT location FROM alc_api.tenko_sessions WHERE id = $1 AND tenant_id = $2",
+                    &[&id, &t],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(s["location"], json!(stored));
+            stored
+        }
+    };
+
+    // 端末が送ってきた場所が優先 (営業所で上書きしない)
+    assert_eq!(
+        start(Some("kiosk-one"), json!("33.2635,130.3009")).await,
+        Some("33.2635,130.3009".to_owned())
+    );
+    // 無い・空白だけなら営業所 1 つ → 名称 (所在地)
+    assert_eq!(
+        start(Some("kiosk-one"), Value::Null).await,
+        Some("佐賀営業所 (佐賀県佐賀市1-1)".to_owned())
+    );
+    assert_eq!(
+        start(Some("kiosk-one"), json!(" ")).await,
+        Some("佐賀営業所 (佐賀県佐賀市1-1)".to_owned())
+    );
+    // 営業所 2 つ以上 → 名称順に「、」でつなぐ (所在地が無い・空白だけなら名称だけ)
+    assert_eq!(
+        start(Some("kiosk-two"), json!("")).await,
+        Some("グループ本社、佐賀営業所 (佐賀県佐賀市1-1)、長崎営業所".to_owned())
+    );
+    // 所属が無い端末・別のテナントにだけ所属する端末・名乗りの無い要求は NULL
+    assert_eq!(start(Some("kiosk-none"), Value::Null).await, None);
+    assert_eq!(start(Some("kiosk-alone"), Value::Null).await, None);
+    assert_eq!(start(None, Value::Null).await, None);
+}
