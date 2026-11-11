@@ -66,7 +66,9 @@ pub struct NormalTenkoInput {
 pub mod sql {
     /// 通常点呼のセッション (rust の normal_tenko.rs の `record` の INSERT。値 (アルコール・体温・血圧) は写さず、
     /// 測定を measurement_id で指す)。記録済み (migration 141 の部分 unique。同じ測定、または同じ乗務員・同じ測定時刻) は
-    /// `ON CONFLICT DO NOTHING` で 0 行 (先勝ち)
+    /// `ON CONFLICT DO NOTHING` で 0 行 (先勝ち)。
+    /// 点呼を受けた場所 (location) は、測定の端末 ($14 device_id) が所属する営業所から引く (自動点呼の開始と同じ部分式。
+    /// 端末の ID が無いか所属が無ければ NULL。Refs ippoan/alc-app#676)
     pub fn insert_session() -> String {
         format!(
             "WITH s AS (INSERT INTO tenko_sessions ( \
@@ -74,15 +76,16 @@ pub mod sql {
                  measurement_id, responsible_manager_name, cancel_reason, \
                  started_at, completed_at, tenko_method, \
                  carins_cert_no, carins_vehicle_id, carins_expires_on, carins_matched_by, \
-                 identity_method \
+                 identity_method, location \
              ) VALUES ( \
                  $1, $2, NULL, $3, $4, \
                  $5, NULL, $6, \
                  $7, CASE WHEN $4 = 'judgment_pending' THEN NULL ELSE NOW() END, $8, \
                  $9, $10, $11, $12, \
-                 $13 \
+                 $13, {} \
              ) \
              ON CONFLICT DO NOTHING{}",
+            super::super::record::sql::device_office_location!("$1", "$14"),
             super::super::record::RETURNING_SESSION
         )
     }
@@ -181,6 +184,7 @@ pub async fn record(
                 (&carins_expires_on, Type::DATE),
                 (&carins_matched_by, Type::TEXT),
                 (&input.identity_method, Type::TEXT),
+                (&m.device_id, Type::TEXT),
             ],
         )
         .await?;

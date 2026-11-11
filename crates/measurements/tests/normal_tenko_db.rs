@@ -1272,3 +1272,92 @@ async fn test_csv_reads_in_person_it_tenko_as_in_person_tenko() {
         assert_eq!(tenko_method, expected, "記録の行そのものは書き換わらない");
     }
 }
+
+/// 点呼を受けた場所 (location。Refs ippoan/alc-app#676): 通常点呼のセッションと記録は、測定の端末 (`X-Device-Id`) が
+/// 所属する営業所の「名称 (所在地)」を持つ (自動点呼の開始と同じ部分式)。所属が無い端末・端末の名乗りが無い測定・
+/// 別のテナントにだけ所属する端末は NULL
+#[tokio::test]
+async fn test_normal_tenko_location_from_device_office() {
+    let app = app().await;
+    let t = tenant().await;
+    let emp = employee(t, "運行者", "NTLOC").await;
+    let db = admin().await;
+    let office = |tn: Uuid, name: &'static str, address: Option<&'static str>| {
+        let db = &db;
+        async move {
+            db.query_one(
+                "INSERT INTO alc_api.tenko_offices (tenant_id, name, address) VALUES ($1, $2, $3) RETURNING id",
+                &[&tn, &name, &address],
+            )
+            .await
+            .unwrap()
+            .get::<_, Uuid>(0)
+        }
+    };
+    let attach = |tn: Uuid, device: &'static str, office: Uuid| {
+        let db = &db;
+        async move {
+            db.execute(
+                "INSERT INTO alc_api.tenko_office_devices (tenant_id, device_id, office_id) VALUES ($1, $2, $3)",
+                &[&tn, &device, &office],
+            )
+            .await
+            .unwrap();
+        }
+    };
+    let saga = office(t, "佐賀営業所", Some(" 佐賀県佐賀市1-1 ")).await;
+    attach(t, "kiosk-one", saga).await;
+    let other = tenant().await;
+    let other_office = office(other, "他社営業所", None).await;
+    attach(other, "kiosk-alone", other_office).await;
+
+    let record = |device: Option<&'static str>, measured_at: &'static str| {
+        let app = &app;
+        let db = &db;
+        async move {
+            let mut h = vec![("content-type", "application/json")];
+            if let Some(d) = device {
+                h.push(("X-Device-Id", d));
+            }
+            let body = measurement_body(emp, "normal", measured_at, true, None);
+            let got = call_raw(
+                app,
+                "POST",
+                "/api/measurements",
+                Some(t),
+                &h,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .await;
+            assert_eq!(got.status, 201);
+            let m_id: Uuid = got.json()["id"].as_str().unwrap().parse().unwrap();
+            let row = db
+                .query_one(
+                    "SELECT s.location, r.location FROM alc_api.tenko_sessions s \
+                     JOIN alc_api.tenko_records r ON r.session_id = s.id AND r.tenant_id = s.tenant_id \
+                     WHERE s.measurement_id = $1 AND s.tenant_id = $2",
+                    &[&m_id, &t],
+                )
+                .await
+                .unwrap();
+            let session: Option<String> = row.get(0);
+            let rec: Option<String> = row.get(1);
+            assert_eq!(session, rec, "記録はセッションの場所を写す");
+            session
+        }
+    };
+
+    assert_eq!(
+        record(Some("kiosk-one"), "2026-11-11T01:00:00Z").await,
+        Some("佐賀営業所 (佐賀県佐賀市1-1)".to_owned())
+    );
+    assert_eq!(
+        record(Some("kiosk-none"), "2026-11-11T02:00:00Z").await,
+        None
+    );
+    assert_eq!(record(None, "2026-11-11T03:00:00Z").await, None);
+    assert_eq!(
+        record(Some("kiosk-alone"), "2026-11-11T04:00:00Z").await,
+        None
+    );
+}
