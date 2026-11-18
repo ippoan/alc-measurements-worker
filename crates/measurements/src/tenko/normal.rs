@@ -8,15 +8,24 @@
 //! 代わりに **測定の保存と同じ transaction** の中でセッションと記録を 1 組作る。記録の作成は内側の区切り
 //! (SAVEPOINT) で行い、失敗したら内側だけ戻す — **測定の保存は必ず残す**。
 //! 行の型・記録の書き方・hash は [`super::record`] (段の口・判定と同じもの)。
+//!
+//! IT点呼 を判定待ちで**新しく**作ったときは、着信の知らせ ([`IT_TENKO_PENDING`]) を返す。口は commit の後に
+//! [`super::fire::PendingFire`] で ippoan/alc-tenko-worker へ渡し、あちらが notify のグループ「点呼の異常」へメールする
+//! (1 件 1 回: 作られなかった再送・既にある session では返さない。検知で中止した IT点呼 は判定待ちでないので返さない。
+//! Refs ippoan/alc-app-s3#352)。
 
 use alc_worker_db::TenantTx;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio_postgres::types::Type;
 use tokio_postgres::Error;
 use uuid::Uuid;
 
-use super::record::{in_savepoint, status_for_result, write_record, Savepoint, TenkoSession};
+use super::fire::Event;
+use super::record::{
+    employee_name, in_savepoint, status_for_result, write_record, Savepoint, TenkoSession,
+};
 use crate::carins::lookup_expiry;
 use crate::models::Measurement;
 use crate::LogSink;
@@ -31,6 +40,9 @@ pub const TENKO_METHOD_NORMAL: &str = "通常点呼";
 /// 運行管理者の判定で閉じる点呼方法。完了する結果でも判定待ち (`judgment_pending`) で作り、記録は判定で書く
 /// ([`super::judgment`]。判定が記録の hash に入る。Refs ippoan/rust-alc-api#680)。検知 (中止) は判定を待たずに閉じる
 pub const TENKO_METHOD_IT: &str = "IT点呼";
+
+/// IT点呼 の着信 (判定待ちの IT点呼 を新しく作った) の種類。alc-tenko-worker はメールだけで知らせる
+pub const IT_TENKO_PENDING: &str = "it_tenko_pending";
 
 /// 結果で決まった status を、点呼方法で読み替える (IT点呼の完了は判定待ち)
 pub fn session_status<'a>(closed: &'a str, tenko_method: &str) -> &'a str {
@@ -228,17 +240,48 @@ pub async fn existing_session_id(
         .map(|(id, _)| id))
 }
 
+/// IT点呼 の着信の本文 (webhook と同じ形: `event`・`timestamp`・`tenant_id`・`data`)。時刻は点呼の開始 (無ければ `null`)
+pub fn it_pending_event(s: &TenkoSession, employee_name: Option<String>) -> Event {
+    Event::new(
+        IT_TENKO_PENDING,
+        json!({
+            "event": IT_TENKO_PENDING,
+            "timestamp": s.started_at,
+            "tenant_id": s.tenant_id,
+            "data": {
+                "session_id": s.id,
+                "employee_id": s.employee_id,
+                "employee_name": employee_name.unwrap_or_default(),
+                "tenko_type": s.tenko_type,
+                "started_at": s.started_at,
+                "location": s.location,
+            }
+        }),
+    )
+}
+
 /// 点呼セッションを作ってその id を返す。作られなかったとき (記録済みの再送、または結果が点呼にならない測定) は、
-/// 同じ測定に既にある session の id を引き直す (rust の `record_or_existing_session_id`)
+/// 同じ測定に既にある session の id を引き直す (rust の `record_or_existing_session_id`)。
+/// 判定待ちの IT点呼 を今回作ったときだけ、着信の知らせ ([`it_pending_event`]) も返す
 pub(crate) async fn record_or_existing_session_id(
     tx: &TenantTx<'_>,
     m: &Measurement,
     input: &NormalTenkoInput,
     log: &LogSink,
-) -> Result<Option<Uuid>, Error> {
+) -> Result<(Option<Uuid>, Option<Event>), Error> {
     match record(tx, m, input, log).await? {
-        Some(session) => Ok(Some(session.id)),
-        None => existing_session_id(tx, m.tenant_id, m.id).await,
+        Some(session) => {
+            let event = if session.tenko_method == TENKO_METHOD_IT
+                && session.status == super::flow::JUDGMENT_PENDING
+            {
+                let name = employee_name(tx, session.tenant_id, session.employee_id).await?;
+                Some(it_pending_event(&session, name))
+            } else {
+                None
+            };
+            Ok((Some(session.id), event))
+        }
+        None => Ok((existing_session_id(tx, m.tenant_id, m.id).await?, None)),
     }
 }
 
@@ -249,15 +292,16 @@ pub(crate) async fn record_or_existing_session_id(
 ///
 /// 戻り値は点呼セッションの id (Refs ippoan/alc-app#387): 今回作ったもの、または同じ測定に既にあるもの (再送)。
 /// 印が無い・結果が点呼にならない・記録に失敗したときは `None`。
+/// 2 つ目は IT点呼 の着信の知らせ (判定待ちの IT点呼 を今回作ったときだけ。記録に失敗したら `None`)
 pub async fn record_as_tenko_if_marked(
     tx: &TenantTx<'_>,
     m: &Measurement,
     record_as_tenko: bool,
     input: &NormalTenkoInput,
     log: &LogSink,
-) -> Option<Uuid> {
+) -> (Option<Uuid>, Option<Event>) {
     if !record_as_tenko || m.status != "completed" {
-        return None;
+        return (None, None);
     }
     let body = record_or_existing_session_id(tx, m, input, log);
     in_savepoint(tx, &SP_TENKO, body)
@@ -266,7 +310,7 @@ pub async fn record_as_tenko_if_marked(
             log(&format!(
                 "measurements: normal tenko record failed: {stage}"
             ));
-            None
+            (None, None)
         })
 }
 

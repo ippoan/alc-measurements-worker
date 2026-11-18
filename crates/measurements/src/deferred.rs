@@ -11,6 +11,10 @@
 //! 既存の記録の作り方 ([`crate::tenko::record_or_existing_session_id`]。列・hash は変えない) を呼ぶ。記録に失敗したら
 //! transaction ごと戻す (入力は残り、見回りがまた拾う)。取れなかった (確定済み) ときは、既にある session の点呼方法と
 //! 頼まれた方法を比べる (同じなら同じ id、違えば 409)。
+//!
+//! IT点呼 で確定して判定待ちのセッションを今回作ったときは、確定の口が commit の後に着信の知らせ
+//! ([`crate::tenko::normal::IT_TENKO_PENDING`]) を [`PendingFire`] で ippoan/alc-tenko-worker へ渡す (dev端末の要求では渡さない。
+//! 見回りは `通常点呼` でしか確定しないので渡すものは無い。Refs ippoan/alc-app-s3#352)。
 
 use alc_core_wasm::{DeviceDevSlot, TenantId};
 use alc_worker_db::{kind, PgClient, TxOutput};
@@ -26,6 +30,7 @@ use uuid::Uuid;
 
 use crate::measurements::VALID_TENKO_METHODS;
 use crate::models::Measurement;
+use crate::tenko::fire::{Event, PendingFire};
 use crate::tenko::{existing_session, record_or_existing_session_id, NormalTenkoInput};
 use crate::{set_device_dev, AppState, LogSink};
 
@@ -71,7 +76,8 @@ pub enum Confirmed {
 
 impl TxOutput for Confirmed {}
 
-/// 測定 `id` の点呼の記録を `tenko_method` で確定する (tenant_tx + dev の印。確定の口と見回りが同じものを使う)
+/// 測定 `id` の点呼の記録を `tenko_method` で確定する (tenant_tx + dev の印。確定の口と見回りが同じものを使う)。
+/// 2 つ目は IT点呼 の着信の知らせ (判定待ちの IT点呼 を今回作ったときだけ)
 pub async fn confirm(
     pg: &mut PgClient,
     tenant_id: Uuid,
@@ -79,7 +85,7 @@ pub async fn confirm(
     id: Uuid,
     tenko_method: String,
     log: LogSink,
-) -> Result<Confirmed, Error> {
+) -> Result<(Confirmed, Option<Event>), Error> {
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
             set_device_dev(tx, dev).await?;
@@ -87,14 +93,17 @@ pub async fn confirm(
                 .query_typed_opt(sql::STATUS, &[(&id, Type::UUID), (&tenant_id, Type::UUID)])
                 .await?
             else {
-                return Ok(Confirmed::NotFound);
+                return Ok((Confirmed::NotFound, None));
             };
             let pending: Option<serde_json::Value> = status.get(1);
             if status.get::<_, String>(0) != "completed" {
-                return Ok(Confirmed::Conflict {
-                    error: "measurement_not_completed",
-                    tenko_method: None,
-                });
+                return Ok((
+                    Confirmed::Conflict {
+                        error: "measurement_not_completed",
+                        tenko_method: None,
+                    },
+                    None,
+                ));
             }
             let claimed = tx
                 .query_typed_opt(
@@ -102,6 +111,7 @@ pub async fn confirm(
                     &[(&id, Type::UUID), (&tenant_id, Type::UUID)],
                 )
                 .await?;
+            let mut event = None;
             if let Some(row) = claimed {
                 let m = Measurement::from_row(&row);
                 // 入力は PUT が書いた JSON (行は FOR UPDATE で押さえてあるので、取った値と同じ)。
@@ -110,9 +120,9 @@ pub async fn confirm(
                     .and_then(|v| serde_json::from_value(v).ok())
                     .unwrap_or_default();
                 input.tenko_method = Some(tenko_method.clone());
-                record_or_existing_session_id(tx, &m, &input, &log).await?;
+                event = record_or_existing_session_id(tx, &m, &input, &log).await?.1;
             }
-            Ok(match existing_session(tx, tenant_id, id).await? {
+            let confirmed = match existing_session(tx, tenant_id, id).await? {
                 Some((session_id, method)) if method == tenko_method => {
                     Confirmed::Recorded(session_id)
                 }
@@ -124,7 +134,8 @@ pub async fn confirm(
                     error: "no_pending_tenko",
                     tenko_method: None,
                 },
-            })
+            };
+            Ok((confirmed, event))
         })
     })
     .await
@@ -137,7 +148,8 @@ pub struct ConfirmTenko {
     pub tenko_method: Option<String>,
 }
 
-/// 点呼の確定 — 200 `{"tenko_session_id", "tenko_method"}` / 409 `{"error", "tenko_method"}` / 404 / 400 (方法が 2 値以外)
+/// 点呼の確定 — 200 `{"tenko_session_id", "tenko_method"}` / 409 `{"error", "tenko_method"}` / 404 / 400 (方法が 2 値以外)。
+/// IT点呼 の着信の知らせがあれば、応答の extension に [`PendingFire`] を入れる (worker が応答の後に渡す)
 pub async fn confirm_tenko(
     State(state): State<AppState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
@@ -151,7 +163,7 @@ pub async fn confirm_tenko(
         .ok_or(StatusCode::BAD_REQUEST)?;
     let dev = dev.get();
     let mut pg = state.pg.lock().await;
-    let confirmed = confirm(
+    let (confirmed, event) = confirm(
         &mut pg,
         tenant_id,
         dev,
@@ -163,11 +175,17 @@ pub async fn confirm_tenko(
     .map_err(|e| state.db_fail("tenko confirm", &e))?;
     match confirmed {
         Confirmed::NotFound => Err(StatusCode::NOT_FOUND),
-        Confirmed::Recorded(session_id) => Ok(Json(json!({
-            "tenko_session_id": session_id,
-            "tenko_method": method,
-        }))
-        .into_response()),
+        Confirmed::Recorded(session_id) => {
+            let fire = PendingFire::new(&state, tenant_id, dev, event.into_iter().collect());
+            Ok((
+                fire.map(Extension),
+                Json(json!({
+                    "tenko_session_id": session_id,
+                    "tenko_method": method,
+                })),
+            )
+                .into_response())
+        }
         Confirmed::Conflict {
             error,
             tenko_method,
@@ -230,7 +248,7 @@ pub async fn sweep(pg: &mut PgClient, log: &LogSink) -> Option<SweepSummary> {
     for (tenant_id, id, dev) in pending {
         let method = SWEEP_METHOD.to_owned();
         match confirm(pg, tenant_id, dev, id, method, log.clone()).await {
-            Ok(Confirmed::Recorded(_)) => summary.confirmed += 1,
+            Ok((Confirmed::Recorded(_), _)) => summary.confirmed += 1,
             Ok(_) => summary.skipped += 1,
             Err(e) => {
                 log(&format!(

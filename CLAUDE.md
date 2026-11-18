@@ -29,7 +29,10 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
   血圧の日報にも同じ形のテスト送信 `POST /api/measurements/bp-report-test` (`report::bp_report_test`。下の「血圧の通知」)。
 - rust に無い点呼の確定の後回し (`deferred.rs`): 完了 PUT に `record_as_tenko` と `defer_tenko: true` が付けば、記録を作らず入力を
   `measurements.tenko_pending` に置く (alc-migrations 180)。確定は `POST /api/measurements/{id}/tenko` (`通常点呼`/`IT点呼`) か、
-  定時実行 (`[triggers]` 1 分ごと) の見回りが完了 (`updated_at`) から 2 分後に `通常点呼` で。見回りの一覧は SECURITY DEFINER の
+  定時実行 (`[triggers]` 1 分ごと) の見回りが完了 (`updated_at`) から 2 分後に `通常点呼` で。
+  IT点呼 を判定待ちで**新しく**作った保存・確定 (完了の PUT か確定の口) は、commit の後に `PendingFire` で ippoan/alc-tenko-worker へ
+  `it_tenko_pending` (乗務員・種別・開始・拠点) を渡す (あちらが notify のグループ「点呼の異常」へメールする。1 件 1 回: 再送・確定済み・
+  検知で中止した IT点呼・dev端末では渡さない。`tenko::normal::record_or_existing_session_id` が返す。Refs ippoan/alc-app-s3#352)。見回りの一覧は SECURITY DEFINER の
   `list_pending_tenko` を nil の tenant_tx で引き、1 件ずつその tenant と dev の軸で確定する。
 - 顔写真・動画のキーは、保存した URL の中で `/{要求の tenant_id}/` が**最後に**現れる位置から後ろを取り (`files::extract_key`)、
   `{tenant}/{uuid}.jpg`・`{tenant}/blow-video/{uuid}.webm` の形に一致しなければ 500。rust は `{R2_PUBLIC_URL_BASE}/` を剥ぐが、
@@ -119,6 +122,6 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
   無い・過ぎた自動点呼は `ESCALATE` で遠隔点呼として続ける (`STAND_BP_MISSING_REASON`)。dev 端末と自動点呼でない点呼は切り替えない。
 - 点呼の webhook は送らない: `PendingFire` を応答の extension に入れ、`src/lib.rs` が `wait_until` で alc-tenko-worker の
   `/internal/webhooks/fire` へ渡す (Service Binding `ALC_TENKO`。本番 `alc-tenko`・staging `alc-tenko-staging`)。dev の要求は渡さない。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 46・api_db 10・files_db 14・normal_tenko_db 27・alert_db 29・deferred_tenko_db 13・bp_db 10・report_db 17・bp_settings_db 18・upload_db 2・tenko_flow_db 27) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 46・api_db 10・files_db 14・normal_tenko_db 28・alert_db 29・deferred_tenko_db 14・bp_db 10・report_db 17・bp_settings_db 18・upload_db 2・tenko_flow_db 27) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・Hyperdrive の設定の ID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-trouble-worker と同じ rev)。

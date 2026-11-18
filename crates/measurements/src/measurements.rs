@@ -237,6 +237,7 @@ pub async fn create(
             // INSERT なので旧値は無い (新が 0 より上なら検知メールを送る)
             let alert = should_alert(None, m.alcohol_level);
             // POST は点呼方法・本人確認の方法を受けない (従来どおり通常点呼・記録なし)。点呼セッションの id も返さない
+            // (通常点呼なので IT点呼 の着信の知らせも出ない)
             let tenko = NormalTenkoInput {
                 tenko_type: input.tenko_type,
                 tenko_method: None,
@@ -268,14 +269,14 @@ pub enum Updated {
     NotFound,
     /// `tenko_session_id` のセッションが無い・乗務員が違う・進められない status (409。何も書いていない)
     SessionMismatch,
-    /// 保存した。点呼の webhook (アルコール検知) があれば応答の後に渡す
+    /// 保存した。点呼の webhook (アルコール検知) か IT点呼 の着信の知らせがあれば応答の後に渡す
     Saved(Box<UpdatedMeasurement>, Triggers, Option<Event>),
 }
 
-/// transaction の中の結果 (測定・(点呼セッションの id, 確定待ち)・通知の条件・(進めたセッション, webhook))
+/// transaction の中の結果 (測定・(点呼セッションの id, 確定待ち, IT点呼 の着信)・通知の条件・(進めたセッション, webhook))
 type Saved = (
     Measurement,
-    (Option<Uuid>, bool),
+    (Option<Uuid>, bool, Option<Event>),
     Triggers,
     Option<(TenkoSession, Option<Event>)>,
 );
@@ -364,14 +365,15 @@ pub async fn update(
                 // 確定待ちの測定 (この保存で入れた、または前の保存で入れてまだ確定していない) は記録を作らない
                 // (確定の口か見回りが作る)
                 let marked = input.record_as_tenko && !tenko_pending;
-                let session_id = record_as_tenko_if_marked(tx, &m, marked, &tenko, &log).await;
+                let (session_id, it_pending) =
+                    record_as_tenko_if_marked(tx, &m, marked, &tenko, &log).await;
                 let advanced = match session {
                     Some(cur) => Some(advance(tx, cur, &m, now, &log).await),
                     None => None,
                 };
                 Ok(Some(Some((
                     m,
-                    (session_id, tenko_pending),
+                    (session_id, tenko_pending, it_pending),
                     triggers,
                     advanced,
                 ))))
@@ -381,12 +383,15 @@ pub async fn update(
     let Some(found) = found else {
         return Ok(Updated::SessionMismatch);
     };
-    let Some((measurement, (session_id, tenko_pending), triggers, advanced)) = found else {
+    let Some((measurement, (session_id, tenko_pending, it_pending), triggers, advanced)) = found
+    else {
         return Ok(Updated::NotFound);
     };
+    // 段を進める (tenko_session_id) と通常点呼・IT点呼の記録 (record_as_tenko) は同じ PUT に来ない (handler が 400 で弾く)
+    // ので、渡すものは多くても 1 つ
     let (tenko_session, event) = match advanced {
         Some((s, event)) => (Some(s), event),
-        None => (None, None),
+        None => (None, it_pending),
     };
     Ok(Updated::Saved(
         Box::new(UpdatedMeasurement {

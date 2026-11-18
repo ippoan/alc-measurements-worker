@@ -1361,3 +1361,127 @@ async fn test_normal_tenko_location_from_device_office() {
         None
     );
 }
+
+/// IT点呼 の着信 (Refs ippoan/alc-app-s3#352): 完了の PUT が判定待ちの IT点呼 を**新しく**作ったときだけ、
+/// alc-tenko-worker の `/internal/webhooks/fire` へ `it_tenko_pending` を 1 回渡す (乗務員の名前・種別・開始・拠点つき)。
+/// 同じ PUT の再送・検知で中止した IT点呼・通常点呼・dev端末の要求では渡さない
+#[tokio::test]
+async fn test_put_it_tenko_fires_pending_once() {
+    let tenko = MockService::with(202, false);
+    let app = build_tenko(rt_client().await, tenko.clone());
+    let t = tenant().await;
+    let emp = employee(t, "着信 四郎", "NTIT1").await;
+    let db = admin().await;
+    let office: Uuid = db
+        .query_one(
+            "INSERT INTO alc_api.tenko_offices (tenant_id, name) VALUES ($1, '着信営業所') RETURNING id",
+            &[&t],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    db.execute(
+        "INSERT INTO alc_api.tenko_office_devices (tenant_id, device_id, office_id) VALUES ($1, 'kiosk-it', $2)",
+        &[&t, &office],
+    )
+    .await
+    .unwrap();
+    let start = |dev: bool| {
+        let app = &app;
+        async move {
+            let mut h = vec![
+                ("content-type", "application/json"),
+                ("X-Device-Id", "kiosk-it"),
+            ];
+            if dev {
+                h.push(("X-Device-Dev", "1"));
+            }
+            let got = call_raw(
+                app,
+                "POST",
+                "/api/measurements/start",
+                Some(t),
+                &h,
+                serde_json::to_vec(&serde_json::json!({ "employee_id": emp })).unwrap(),
+            )
+            .await;
+            assert_eq!(got.status, 201);
+            got.json()["id"].as_str().unwrap().to_owned()
+        }
+    };
+    let put = |m_id: String, body: Value, dev: bool| {
+        let app = &app;
+        async move {
+            let mut h = vec![("content-type", "application/json")];
+            if dev {
+                h.push(("X-Device-Dev", "1"));
+            }
+            let got = call_raw(
+                app,
+                "PUT",
+                &format!("/api/measurements/{m_id}"),
+                Some(t),
+                &h,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .await;
+            assert_eq!(got.status, 200);
+            got.json()
+        }
+    };
+
+    let m_id = start(false).await;
+    let body = completed_body(
+        "pass",
+        "2026-11-17T23:00:00Z",
+        true,
+        Some("pre_operation"),
+        Some("IT点呼"),
+    );
+    let json = put(m_id.clone(), body.clone(), false).await;
+    let sent = tenko.requests();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].path, "/internal/webhooks/fire");
+    assert!(sent[0].headers.contains(&("x-tenant-id", t.to_string())));
+    let fired: Value = serde_json::from_str(&sent[0].body).unwrap();
+    assert_eq!(fired["event_type"], "it_tenko_pending");
+    let p = &fired["payload"];
+    assert_eq!(p["event"], "it_tenko_pending");
+    assert_eq!(p["tenant_id"], t.to_string());
+    assert_eq!(p["data"]["session_id"], json["tenko_session_id"]);
+    assert_eq!(p["data"]["employee_id"], emp.to_string());
+    assert_eq!(p["data"]["employee_name"], "着信 四郎");
+    assert_eq!(p["data"]["tenko_type"], "pre_operation");
+    let location: Option<String> = db
+        .query_one(
+            "SELECT location FROM alc_api.tenko_sessions WHERE measurement_id = $1::text::uuid",
+            &[&m_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(location
+        .as_deref()
+        .is_some_and(|l| l.contains("着信営業所")));
+    assert_eq!(p["data"]["location"], location.unwrap());
+    assert_eq!(p["data"]["started_at"], p["timestamp"]);
+    assert!(p["data"]["started_at"]
+        .as_str()
+        .is_some_and(|s| s.starts_with("2026-11-17T23:00:00")));
+
+    // 同じ PUT の再送 → session は既にあるので渡さない
+    put(m_id, body, false).await;
+    assert_eq!(tenko.requests().len(), 1);
+
+    // 検知で中止した IT点呼・通常点呼・dev端末の IT点呼 は渡さない
+    let over = start(false).await;
+    let b = completed_body("over", "2026-11-17T23:10:00Z", true, None, Some("IT点呼"));
+    put(over, b, false).await;
+    let normal = start(false).await;
+    let b = completed_body("pass", "2026-11-17T23:20:00Z", true, None, Some("通常点呼"));
+    put(normal, b, false).await;
+    let dev = start(true).await;
+    let b = completed_body("pass", "2026-11-17T23:30:00Z", true, None, Some("IT点呼"));
+    put(dev, b, true).await;
+    assert_eq!(tenko.requests().len(), 1);
+}
