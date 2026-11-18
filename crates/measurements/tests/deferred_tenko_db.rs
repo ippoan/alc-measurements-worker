@@ -326,6 +326,49 @@ async fn test_confirm_it_tenko_records_method() {
     assert_eq!(other.json()["tenko_method"], "IT点呼");
 }
 
+/// IT点呼 で確定して判定待ちを作ったときだけ、着信 (`it_tenko_pending`) を alc-tenko-worker へ 1 回渡す
+/// (2 回目の確定・通常点呼の確定・dev端末の確定では渡さない。Refs ippoan/alc-app-s3#352)
+#[tokio::test]
+async fn test_confirm_it_tenko_fires_pending_once() {
+    let tenko = MockService::with(202, false);
+    let app = build_tenko(rt_client().await, tenko.clone());
+    let tenant = tenant().await;
+    let emp = employee(tenant, "確定 五郎", "DF7").await;
+    let (id, _) =
+        deferred_measurement(&app, tenant, emp, "normal", "2026-11-17T22:00:00Z", false).await;
+    let res = confirm(&app, tenant, &id, "IT点呼").await;
+    assert_eq!(res.status, 200);
+    let sent = tenko.requests();
+    assert_eq!(sent.len(), 1);
+    let fired: Value = serde_json::from_str(&sent[0].body).unwrap();
+    assert_eq!(fired["event_type"], "it_tenko_pending");
+    assert_eq!(
+        fired["payload"]["data"]["session_id"],
+        res.json()["tenko_session_id"]
+    );
+    assert_eq!(fired["payload"]["data"]["employee_name"], "確定 五郎");
+    assert_eq!(fired["payload"]["data"]["tenko_type"], "pre_operation");
+
+    // 2 回目 (確定済み) は渡さない
+    assert_eq!(confirm(&app, tenant, &id, "IT点呼").await.status, 200);
+    // 通常点呼の確定・dev端末の IT点呼 の確定も渡さない
+    let (normal, _) =
+        deferred_measurement(&app, tenant, emp, "normal", "2026-11-17T22:10:00Z", false).await;
+    assert_eq!(confirm(&app, tenant, &normal, "通常点呼").await.status, 200);
+    let (dev, _) =
+        deferred_measurement(&app, tenant, emp, "normal", "2026-11-17T22:20:00Z", true).await;
+    let got = confirm_as(
+        &app,
+        tenant,
+        &dev,
+        true,
+        json!({ "tenko_method": "IT点呼" }),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(tenko.requests().len(), 1);
+}
+
 #[tokio::test]
 async fn test_confirm_rejects() {
     let app = app().await;
