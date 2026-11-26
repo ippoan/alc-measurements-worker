@@ -10,8 +10,8 @@
 //! - アルコールの段は [`super::alcohol`]、運行管理者の判定は [`super::judgment`]
 //! - 自己点検表の不足を埋める口と規則 (alc-migrations 204): `PUT …/vehicle` (車両番号。車検証の登録番号 / 予定 / 手入力)、
 //!   測定の有効時間 (社員の基準値。`PUT …/medical` は過ぎた測定を 400 `measurement_expired`、再開・自己再開・アルコールの段の
-//!   直前へ進める段は未測定のアルコールで有効時間を過ぎていれば `medical_pending` へ戻す)、`self-resume` は管理者が再開済みでも
-//!   受け (再開の時刻・理由は上書きしない)、`resume` は再開した運行管理者の氏名 (`resumed_by_name`)、`cancel` は代替措置
+//!   直前へ進める段は未測定のアルコールで有効時間を過ぎていれば `medical_pending` へ戻す)、`self-resume` は運行管理者が再開した
+//!   点呼を 1 回だけ受け (運転者が自分で止めた点呼は 400 `manager_resume_required`。再開の時刻・理由は上書きしない)、`resume` は再開した運行管理者の氏名 (`resumed_by_name`)、`cancel` は代替措置
 //! - 血圧は測定台で測る: `PUT …/medical` は本文に血圧が無ければ、有効時間内の最新の血圧を点呼の測定に写す。無ければ
 //!   自動点呼は遠隔点呼として続ける (dev 端末は切り替えない)
 //! - 取り消し・中断・再開は運行管理者の鍵でも送れる (運行管理者の点呼の一覧から)。範囲は判定と同じ
@@ -1974,7 +1974,16 @@ async fn self_resume_handler(
                         })),
                     )));
                 }
-                // 管理者が再開済みでも受ける (再開の時刻・理由・管理者は上書きしない)
+                // 続きから再開できるのは、運行管理者が再開した点呼 (業務前 十二: 判定に至った内容を確かめて再開) を、
+                // 運転者がまだ本人確認して続けていないときだけ。運転者が自分で止めた点呼は途中から続けさせず、
+                // 最初からやり直させる (2025/10/6 FAQ)。管理者の再開は `resumed_by_name` を必ず埋める
+                if cur.resumed_by_name.is_none() || cur.resume_identity_method.is_some() {
+                    return Ok(Flow::Api(bad_request(
+                        "manager_resume_required",
+                        "運行管理者が再開した点呼だけ続きから再開できます。新しく点呼をやり直してください",
+                    )));
+                }
+                // 再開の時刻・理由・管理者は上書きしない
                 let s = one(
                     tx,
                     sql::SELF_RESUME,
