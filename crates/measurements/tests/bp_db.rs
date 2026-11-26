@@ -386,3 +386,196 @@ async fn test_lookup_failure_keeps_the_save_and_logs_a_fixed_word() {
         "{logs:?}"
     );
 }
+
+// --- 測定台の血圧の回数の制限と、運行管理者が血圧を外す口 (Refs ippoan/alc-app#676) ---
+
+/// テストの App の「今」(support の `build_every` の固定の時刻) より 1 分前。有効時間 (既定 30 分) の内
+const RECENT: &str = "2026-10-22T21:59:00Z";
+
+fn stand_bp(systolic: i32) -> Value {
+    json!({ "status": "completed", "systolic": systolic, "diastolic": 80, "medical_measured_at": RECENT })
+}
+
+fn manager_headers() -> [(&'static str, &'static str); 4] {
+    [
+        ("content-type", "application/json"),
+        ("X-User-ID", "0b9f5a52-6a1e-4c1b-9d2a-3f4e5d6c7b8a"),
+        ("X-User-Email", "kanri@example.invalid"),
+        ("X-User-Role", "admin"),
+    ]
+}
+
+async fn exclude(app: &App, tenant: Uuid, id: &str, body: Value, headers: &[(&str, &str)]) -> Got {
+    call_raw(
+        app,
+        "POST",
+        &format!("/api/measurements/{id}/exclude-bp"),
+        Some(tenant),
+        headers,
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn test_stand_bp_allows_two_in_the_window_and_refuses_the_third() {
+    let (tenant, emp) = setup().await;
+    let app = app_with(&MockService::ok()).await;
+    let first = start_measurement(&app, tenant, emp).await;
+    put_measurement_ok(&app, tenant, &first, &stand_bp(150)).await;
+    let second = start_measurement(&app, tenant, emp).await;
+    put_measurement_ok(&app, tenant, &second, &stand_bp(128)).await;
+    // 送り直し (同じ測定にもう血圧がある) は数えない
+    put_measurement_ok(&app, tenant, &second, &stand_bp(128)).await;
+
+    let third = start_measurement(&app, tenant, emp).await;
+    let res = put_measurement(&app, tenant, &third, &stand_bp(126)).await;
+    assert_eq!(res.status, 422);
+    let row = admin()
+        .await
+        .query_one(
+            "SELECT systolic FROM alc_api.measurements WHERE id = $1",
+            &[&Uuid::parse_str(&third).unwrap()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, Option<i32>>(0), None);
+    // 有効時間 (既定 30 分) を過ぎた血圧は数えない: 古い 2 回の後でも 3 回目が通る
+    let (t2, e2) = setup().await;
+    let old = json!({ "status": "completed", "systolic": 120, "diastolic": 80, "medical_measured_at": "2026-10-22T20:00:00Z" });
+    for body in [&old, &old, &stand_bp(121)] {
+        let id = start_measurement(&app, t2, e2).await;
+        put_measurement_ok(&app, t2, &id, body).await;
+    }
+}
+
+#[tokio::test]
+async fn test_manager_excludes_a_mixed_up_bp_and_it_no_longer_counts() {
+    let (tenant, emp) = setup().await;
+    let app = app_with(&MockService::ok()).await;
+    let first = start_measurement(&app, tenant, emp).await;
+    put_measurement_ok(&app, tenant, &first, &stand_bp(150)).await;
+    let second = start_measurement(&app, tenant, emp).await;
+    put_measurement_ok(&app, tenant, &second, &stand_bp(128)).await;
+
+    // 理由は必須、ログインの無い要求 (端末の鍵) は 401
+    let h = manager_headers();
+    let blank = exclude(&app, tenant, &first, json!({ "reason": "  " }), &h).await;
+    assert_eq!(
+        (blank.status, blank.json()["error"].clone()),
+        (400, json!("reason_required"))
+    );
+    let no_login = exclude(&app, tenant, &first, json!({ "reason": "テレコ" }), &h[..1]).await;
+    assert_eq!(no_login.status, 401);
+
+    let got = exclude(
+        &app,
+        tenant,
+        &first,
+        json!({ "reason": " 別の人の血圧 " }),
+        &h,
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    let j = got.json();
+    assert_eq!(
+        (
+            j["bp_excluded_reason"].clone(),
+            j["bp_excluded_by_name"].clone(),
+            j["systolic"].clone()
+        ),
+        (
+            json!("別の人の血圧"),
+            json!("kanri@example.invalid"),
+            json!(150)
+        )
+    );
+    assert!(j["bp_excluded_at"].is_string());
+    let named = exclude(
+        &app,
+        tenant,
+        &second,
+        json!({ "reason": "x", "excluded_by_name": " 運行 太郎 " }),
+        &h,
+    )
+    .await;
+    assert_eq!(named.json()["bp_excluded_by_name"], "運行 太郎");
+
+    // 外した分は数えない: もう 2 回測れる
+    for s in [130, 132] {
+        let id = start_measurement(&app, tenant, emp).await;
+        put_measurement_ok(&app, tenant, &id, &stand_bp(s)).await;
+    }
+
+    // 二度は外せない (409)、血圧の無い測定 (400)、無い測定 (404)
+    let again = exclude(&app, tenant, &first, json!({ "reason": "x" }), &h).await;
+    assert_eq!(
+        (again.status, again.json()["error"].clone()),
+        (409, json!("already_excluded"))
+    );
+    let plain = start_measurement(&app, tenant, emp).await;
+    let no_bp = exclude(&app, tenant, &plain, json!({ "reason": "x" }), &h).await;
+    assert_eq!(
+        (no_bp.status, no_bp.json()["error"].clone()),
+        (400, json!("not_blood_pressure"))
+    );
+    let gone = exclude(
+        &app,
+        tenant,
+        &Uuid::new_v4().to_string(),
+        json!({ "reason": "x" }),
+        &h,
+    )
+    .await;
+    assert_eq!(
+        (gone.status, gone.json()),
+        (404, json!({ "error": "measurement_not_found" }))
+    );
+    // 名前もメールも空のログインは user_id を外した人として残す
+    let third = start_measurement(&app, tenant, emp).await;
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.measurements SET systolic = 99, diastolic = 60 WHERE id = $1",
+            &[&Uuid::parse_str(&third).unwrap()],
+        )
+        .await
+        .unwrap();
+    let mut anon = manager_headers();
+    anon[2] = ("X-User-Email", "");
+    let by_id = exclude(&app, tenant, &third, json!({ "reason": "x" }), &anon).await;
+    assert_eq!(
+        by_id.json()["bp_excluded_by_name"],
+        "0b9f5a52-6a1e-4c1b-9d2a-3f4e5d6c7b8a"
+    );
+}
+
+#[tokio::test]
+async fn test_bp_limit_and_exclude_db_failures_are_500() {
+    let (tenant, emp) = setup().await;
+    let ok = app_with(&MockService::ok()).await;
+    let id = start_measurement(&ok, tenant, emp).await;
+    let app = build_lineworks(broken_client().await, None);
+    let put = put_measurement(&app, tenant, &id, &stand_bp(120)).await;
+    assert_eq!(put.status, 500);
+    let ex = exclude(
+        &app,
+        tenant,
+        &id,
+        json!({ "reason": "x" }),
+        &manager_headers(),
+    )
+    .await;
+    assert_eq!(ex.status, 500);
+    let logs = app.logs();
+    assert!(
+        logs.iter()
+            .any(|l| l.starts_with("measurements: measurement bp limit failed: db (")),
+        "{logs:?}"
+    );
+    assert!(
+        logs.iter()
+            .any(|l| l.starts_with("measurements: measurement exclude-bp failed: db (")),
+        "{logs:?}"
+    );
+}

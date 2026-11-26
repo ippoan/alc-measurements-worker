@@ -447,10 +447,12 @@ pub mod sql {
          WHERE m.tenant_id = $1 AND m.employee_id = $2 AND m.systolic IS NOT NULL AND m.diastolic IS NOT NULL";
 
     /// 乗務員の最新の血圧 (測定台で測った測定。点呼の測定に写した値も同じ値と時刻なので区別しない)。
+    /// 運行管理者が「本人の測定ではない」として外した血圧 (alc-migrations 219) は使わない。
     /// $1 tenant_id / $2 employee_id → systolic / diastolic / pulse / 測定の時刻
     pub const LATEST_BP: &str = "SELECT m.systolic, m.diastolic, m.pulse, \
              COALESCE(m.medical_measured_at, m.measured_at) AS at FROM alc_api.measurements m \
          WHERE m.tenant_id = $1 AND m.employee_id = $2 AND m.systolic IS NOT NULL AND m.diastolic IS NOT NULL \
+           AND m.bp_excluded_at IS NULL \
          ORDER BY at DESC LIMIT 1";
 
     /// $1 tenant_id / $2 employee_id

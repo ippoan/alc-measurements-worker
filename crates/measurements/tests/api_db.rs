@@ -11,8 +11,11 @@ use support::*;
 use uuid::Uuid;
 
 /// rust の `Measurement` の JSON の key (応答の形。rust の mock テストの一覧と同じ)
-const MEASUREMENT_KEYS: [&str; 20] = [
+const MEASUREMENT_KEYS: [&str; 23] = [
     "alcohol_value",
+    "bp_excluded_at",
+    "bp_excluded_by_name",
+    "bp_excluded_reason",
     "created_at",
     "device_id",
     "device_use_count",
