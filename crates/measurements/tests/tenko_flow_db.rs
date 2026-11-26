@@ -1182,6 +1182,19 @@ async fn self_resume_rules() {
         (got.status, got.json()["error"].clone()),
         (403, json!("identity_mismatch"))
     );
+    // 運転者が自分で止めた点呼 (運行管理者が再開していない) は途中から続けさせない (2025/10/6 FAQ)
+    let got = send(
+        &app,
+        "POST",
+        &uri,
+        t,
+        Some(json!({ "reason": "x", "identity": { "employee_id": emp, "method": "vein" } })),
+    )
+    .await;
+    assert_eq!(
+        (got.status, got.json()["error"].clone()),
+        (400, json!("manager_resume_required"))
+    );
     assert!(admin()
         .await
         .query_one(
@@ -1191,6 +1204,22 @@ async fn self_resume_rules() {
         .await
         .unwrap()
         .get::<_, bool>(0));
+    // 運行管理者が再開した点呼は、本人確認して 1 回だけ続けられる (再開の時刻・理由は管理者の値のまま)
+    let managed = [
+        ("resumed_at", "NOW()"),
+        ("resume_reason", "'確認'"),
+        ("resumed_by_name", "'運行 太郎'"),
+    ];
+    let id = sess(
+        t,
+        emp,
+        "pre_operation",
+        "自動点呼",
+        "medical_pending",
+        &managed,
+    )
+    .await;
+    let uri = format!("/api/tenko/sessions/{id}/self-resume");
     let r = send(
         &app,
         "POST",
@@ -1208,10 +1237,10 @@ async fn self_resume_rules() {
             r["resumed_by_user_id"].clone(),
             r["status"].clone()
         ),
-        (json!("電池切れ"), Value::Null, json!("medical_pending"))
+        (json!("確認"), Value::Null, json!("medical_pending"))
     );
     assert_eq!(r["resume_identity_method"], "vein");
-    // 2 回目も受ける (再開の時刻・理由は最初の値のまま。管理者が再開済みのセッションも受けるため)
+    // 2 回目は受けない (続けたあとに止めた点呼も、最初からやり直す)
     let again = send(
         &app,
         "POST",
@@ -1220,9 +1249,19 @@ async fn self_resume_rules() {
         Some(json!({ "reason": "x", "identity": { "employee_id": emp, "method": "vein" } })),
     )
     .await;
-    assert_eq!(again.status, 200);
-    assert_eq!(again.json()["resume_reason"], "電池切れ");
-    let s2 = sess(t, emp, "pre_operation", "自動点呼", "medical_pending", &[]).await;
+    assert_eq!(
+        (again.status, again.json()["error"].clone()),
+        (400, json!("manager_resume_required"))
+    );
+    let s2 = sess(
+        t,
+        emp,
+        "pre_operation",
+        "自動点呼",
+        "medical_pending",
+        &managed,
+    )
+    .await;
     let by = send_h(
         &app,
         "POST",
@@ -2622,7 +2661,20 @@ async fn medical_validity_window() {
             "daily_inspection_pending",
         ),
     ] {
-        let id = sess(t, emp, "pre_operation", "自動点呼", status, &[extra]).await;
+        // 自己再開は運行管理者が再開した点呼だけ受ける
+        let id = sess(
+            t,
+            emp,
+            "pre_operation",
+            "自動点呼",
+            status,
+            &[
+                extra,
+                ("resumed_at", "NOW()"),
+                ("resumed_by_name", "'運行 太郎'"),
+            ],
+        )
+        .await;
         let r = send(&app, "POST", &selfr(id), t, body.clone()).await;
         assert_eq!(r.json()["status"], want);
     }
