@@ -36,6 +36,11 @@ pub struct Measurement {
     pub medical_manual_input: Option<bool>,
     /// この行を作った端末の ID (auth-worker が端末の token から付けた `X-Device-Id`。無ければ NULL。alc-migrations 190)
     pub device_id: Option<String>,
+    /// 血圧を「本人の測定ではない」として運行管理者が外した時刻・理由・氏名 (alc-migrations 219)。外した血圧は
+    /// 測定台の回数にも点呼にも入らない
+    pub bp_excluded_at: Option<DateTime<Utc>>,
+    pub bp_excluded_reason: Option<String>,
+    pub bp_excluded_by_name: Option<String>,
 }
 
 impl TxOutput for Measurement {}
@@ -45,10 +50,10 @@ impl TxOutput for Measurement {}
 pub const MEASUREMENT_COLUMNS: &str = "id, tenant_id, employee_id, alcohol_level, result, device_use_count, \
      face_photo_url, video_url, measured_at, created_at, updated_at, status, \
      temperature, systolic, diastolic, pulse, medical_measured_at, face_verified, medical_manual_input, \
-     device_id";
+     device_id, bp_excluded_at, bp_excluded_reason, bp_excluded_by_name";
 
 /// [`MEASUREMENT_COLUMNS`] の列の数 (= その後ろに足した列の位置)
-pub const MEASUREMENT_COLUMN_COUNT: usize = 20;
+pub const MEASUREMENT_COLUMN_COUNT: usize = 23;
 
 impl Measurement {
     /// [`MEASUREMENT_COLUMNS`] の順で並んだ行から読む
@@ -74,6 +79,9 @@ impl Measurement {
             face_verified: r.get(17),
             medical_manual_input: r.get(18),
             device_id: r.get(19),
+            bp_excluded_at: r.get(20),
+            bp_excluded_reason: r.get(21),
+            bp_excluded_by_name: r.get(22),
         }
     }
 }

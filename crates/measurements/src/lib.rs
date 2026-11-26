@@ -29,6 +29,7 @@
 
 pub mod alert;
 pub mod bp;
+pub mod bp_limit;
 pub mod bp_settings;
 pub mod carins;
 pub mod deferred;

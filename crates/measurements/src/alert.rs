@@ -432,6 +432,9 @@ mod tests {
             face_verified: None,
             medical_manual_input: None,
             device_id: None,
+            bp_excluded_at: None,
+            bp_excluded_reason: None,
+            bp_excluded_by_name: None,
         };
         let (subject, body) = compose("山田\r\n太郎", &m);
         assert_eq!(subject, "アルコール検知: 山田  太郎");

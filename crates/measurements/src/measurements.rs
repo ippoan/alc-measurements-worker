@@ -14,6 +14,7 @@
 //! アルコール検知メールのテスト送信 (`POST /measurements/alert-test`。admin だけ) は [`crate::alert::alert_test`]。
 //! 血圧の日報のテスト送信 (`POST /measurements/bp-report-test`。admin だけ) は [`crate::report::bp_report_test`]。
 //! 点呼の確定 (`POST /measurements/{id}/tenko`。rust に無い) は [`crate::deferred::confirm_tenko`]。
+//! 測定台の血圧の回数の制限 (PUT の 422) と、血圧を外す口 (`POST /measurements/{id}/exclude-bp`) は [`crate::bp_limit`]。
 
 use alc_core_wasm::{DeviceDevSlot, TenantId};
 use alc_worker_db::PgClient;
@@ -465,6 +466,10 @@ pub fn router() -> Router<AppState> {
             "/measurements/{id}/tenko",
             post(crate::deferred::confirm_tenko),
         )
+        .route(
+            "/measurements/{id}/exclude-bp",
+            post(crate::bp_limit::exclude_bp),
+        )
 }
 
 /// 端末の ID を載せるヘッダー。auth-worker が端末の token で来た要求にだけ付ける (検証済み token の sub。client の同名ヘッダーは届かない)
@@ -542,6 +547,16 @@ async fn update_measurement(
     let dev = dev.get();
     let now = (state.now)();
     let mut pg = state.pg.lock().await;
+    // 測定台の血圧 (点呼の印が無い保存) は、有効時間内に 2 回まで (2025/10/6 FAQ の再測定 1 回。[`crate::bp_limit`])
+    if body.systolic.is_some()
+        && !body.record_as_tenko
+        && body.tenko_session_id.is_none()
+        && crate::bp_limit::limit_reached(&mut pg, tenant_id, dev, id, now)
+            .await
+            .map_err(|e| state.db_fail("measurement bp limit", &e))?
+    {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
     let found = update(&mut pg, tenant_id, dev, id, body, state.log.clone(), now)
         .await
         .map_err(|e| state.db_fail("measurement update", &e))?;
