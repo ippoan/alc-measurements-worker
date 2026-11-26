@@ -389,11 +389,13 @@ async fn test_lookup_failure_keeps_the_save_and_logs_a_fixed_word() {
 
 // --- 測定台の血圧の回数の制限と、運行管理者が血圧を外す口 (Refs ippoan/alc-app#676) ---
 
-/// テストの App の「今」(support の `build_every` の固定の時刻) より 1 分前。有効時間 (既定 30 分) の内
-const RECENT: &str = "2026-10-22T21:59:00Z";
-
-fn stand_bp(systolic: i32) -> Value {
-    json!({ "status": "completed", "systolic": systolic, "diastolic": 80, "medical_measured_at": RECENT })
+/// 測定台の血圧。測った時刻はテストの App の「今」(support の `build_every` の固定の時刻 22:00Z) の
+/// `mins_ago` 分前で、有効時間 (既定 30 分) の内に置く。回数は「同じ時刻は 1 回」と数えるので、
+/// 別の測定として数えさせたいものは別の `mins_ago` にする
+fn stand_bp(systolic: i32, mins_ago: u32) -> Value {
+    assert!((1..30).contains(&mins_ago));
+    let at = format!("2026-10-22T21:{:02}:00Z", 60 - mins_ago);
+    json!({ "status": "completed", "systolic": systolic, "diastolic": 80, "medical_measured_at": at })
 }
 
 fn manager_headers() -> [(&'static str, &'static str); 4] {
@@ -422,14 +424,14 @@ async fn test_stand_bp_allows_two_in_the_window_and_refuses_the_third() {
     let (tenant, emp) = setup().await;
     let app = app_with(&MockService::ok()).await;
     let first = start_measurement(&app, tenant, emp).await;
-    put_measurement_ok(&app, tenant, &first, &stand_bp(150)).await;
+    put_measurement_ok(&app, tenant, &first, &stand_bp(150, 5)).await;
     let second = start_measurement(&app, tenant, emp).await;
-    put_measurement_ok(&app, tenant, &second, &stand_bp(128)).await;
+    put_measurement_ok(&app, tenant, &second, &stand_bp(128, 3)).await;
     // 送り直し (同じ測定にもう血圧がある) は数えない
-    put_measurement_ok(&app, tenant, &second, &stand_bp(128)).await;
+    put_measurement_ok(&app, tenant, &second, &stand_bp(128, 3)).await;
 
     let third = start_measurement(&app, tenant, emp).await;
-    let res = put_measurement(&app, tenant, &third, &stand_bp(126)).await;
+    let res = put_measurement(&app, tenant, &third, &stand_bp(126, 1)).await;
     assert_eq!(res.status, 422);
     let row = admin()
         .await
@@ -443,7 +445,7 @@ async fn test_stand_bp_allows_two_in_the_window_and_refuses_the_third() {
     // 有効時間 (既定 30 分) を過ぎた血圧は数えない: 古い 2 回の後でも 3 回目が通る
     let (t2, e2) = setup().await;
     let old = json!({ "status": "completed", "systolic": 120, "diastolic": 80, "medical_measured_at": "2026-10-22T20:00:00Z" });
-    for body in [&old, &old, &stand_bp(121)] {
+    for body in [&old, &old, &stand_bp(121, 1)] {
         let id = start_measurement(&app, t2, e2).await;
         put_measurement_ok(&app, t2, &id, body).await;
     }
@@ -454,9 +456,9 @@ async fn test_manager_excludes_a_mixed_up_bp_and_it_no_longer_counts() {
     let (tenant, emp) = setup().await;
     let app = app_with(&MockService::ok()).await;
     let first = start_measurement(&app, tenant, emp).await;
-    put_measurement_ok(&app, tenant, &first, &stand_bp(150)).await;
+    put_measurement_ok(&app, tenant, &first, &stand_bp(150, 9)).await;
     let second = start_measurement(&app, tenant, emp).await;
-    put_measurement_ok(&app, tenant, &second, &stand_bp(128)).await;
+    put_measurement_ok(&app, tenant, &second, &stand_bp(128, 7)).await;
 
     // 理由は必須、ログインの無い要求 (端末の鍵) は 401
     let h = manager_headers();
@@ -502,9 +504,9 @@ async fn test_manager_excludes_a_mixed_up_bp_and_it_no_longer_counts() {
     assert_eq!(named.json()["bp_excluded_by_name"], "運行 太郎");
 
     // 外した分は数えない: もう 2 回測れる
-    for s in [130, 132] {
+    for (s, mins_ago) in [(130, 5), (132, 3)] {
         let id = start_measurement(&app, tenant, emp).await;
-        put_measurement_ok(&app, tenant, &id, &stand_bp(s)).await;
+        put_measurement_ok(&app, tenant, &id, &stand_bp(s, mins_ago)).await;
     }
 
     // 二度は外せない (409)、血圧の無い測定 (400)、無い測定 (404)
@@ -556,7 +558,7 @@ async fn test_bp_limit_and_exclude_db_failures_are_500() {
     let ok = app_with(&MockService::ok()).await;
     let id = start_measurement(&ok, tenant, emp).await;
     let app = build_lineworks(broken_client().await, None);
-    let put = put_measurement(&app, tenant, &id, &stand_bp(120)).await;
+    let put = put_measurement(&app, tenant, &id, &stand_bp(120, 1)).await;
     assert_eq!(put.status, 500);
     let ex = exclude(
         &app,
