@@ -86,6 +86,9 @@ pub struct StartSession {
     pub employee_id: Uuid,
     pub identity_face_photo_url: Option<String>,
     pub location: Option<String>,
+    /// 開始の前に行った本人確認の方法 (`vein` / `face`。それ以外・無しは NULL で記録する)
+    #[serde(default)]
+    pub identity_method: Option<String>,
 }
 
 /// rust の `SubmitMedicalData` (`device_id` は rust でも読むだけで使わない)
@@ -135,6 +138,9 @@ pub struct Resume {
     pub resumed_by_name: Option<String>,
     #[serde(default)]
     pub identity: Option<ResumeIdentity>,
+    /// 自己再開の本人確認のとき端末のカメラで撮った顔写真 (撮れなければ無し。本人確認の記録に残す)
+    #[serde(default)]
+    pub identity_face_photo_url: Option<String>,
 }
 
 /// キオスクが自己再開の前に行った本人確認: 照合で決まった社員と方法 (`vein` / `face`)
@@ -299,6 +305,12 @@ pub mod sql {
          WHERE id = $1 AND tenant_id = $2";
 
     /// $1 session_id / $2 schedule_id / $3 tenant_id
+    /// 点呼の本人確認の記録 (alc-migrations 221。自己点検表 ト①)。監視カメラの切り出しの元にもなる。
+    /// $1 tenant_id / $2 session_id / $3 employee_id / $4 phase (`start` / `resume`) / $5 方法 / $6 端末 / $7 顔写真
+    pub const INSERT_IDENTITY_EVENT: &str = "INSERT INTO alc_api.tenko_identity_events \
+         (tenant_id, session_id, employee_id, phase, method, device_id, face_photo_url) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)";
+
     pub const SET_CONSUMED_BY: &str =
         "UPDATE alc_api.tenko_schedules SET consumed_by_session_id = $1 \
          WHERE id = $2 AND tenant_id = $3";
@@ -1089,6 +1101,17 @@ async fn start_handler(
                         (&vehicle_source, Type::TEXT),
                         (&device_id, Type::TEXT),
                     ],
+                )
+                .await?;
+                // 本人確認の記録 (照合した端末・時刻・方法・顔写真。自己点検表 ト①)
+                let identity_method = known_identity_method(body.identity_method.as_deref());
+                insert_identity_event(
+                    tx,
+                    &s,
+                    "start",
+                    identity_method,
+                    &device_id,
+                    &body.identity_face_photo_url,
                 )
                 .await?;
                 if let Some(sid) = body.schedule_id {
@@ -1923,18 +1946,51 @@ async fn resume_handler(
     .await
 }
 
+/// 本人確認の方法として記録する値 (`vein` / `face` だけ。ほかは記録しない)
+pub fn known_identity_method(m: Option<&str>) -> Option<&str> {
+    m.filter(|m| RESUME_IDENTITY_METHODS.contains(m))
+}
+
+/// 点呼の本人確認を 1 行記録する ([`sql::INSERT_IDENTITY_EVENT`])
+async fn insert_identity_event(
+    tx: &TenantTx<'_>,
+    s: &TenkoSession,
+    phase: &str,
+    method: Option<&str>,
+    device_id: &Option<String>,
+    face_photo_url: &Option<String>,
+) -> Result<(), tokio_postgres::Error> {
+    tx.execute_typed(
+        sql::INSERT_IDENTITY_EVENT,
+        &[
+            (&s.tenant_id, Type::UUID),
+            (&s.id, Type::UUID),
+            (&s.employee_id, Type::UUID),
+            (&phase, Type::TEXT),
+            (&method, Type::TEXT),
+            (device_id, Type::TEXT),
+            (face_photo_url, Type::TEXT),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
 async fn self_resume_handler(
     State(state): State<AppState>,
     Extension(TenantId(tenant_id)): Extension<TenantId>,
     Extension(dev): Extension<DeviceDevSlot>,
     user: Option<Extension<AuthUser>>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<Resume>,
 ) -> Response {
     let reason = body.reason.trim().to_owned();
     if reason.is_empty() {
         return bad_request("reason_required", "再開理由は必須です").into_response();
     }
+    let device_id = device_id_from(&headers, &state.log);
+    let face_photo_url = clean(body.identity_face_photo_url.as_deref());
     // 本人確認 (業務前 十三): 照合で決まった社員と方法が無ければ受けない (鍵だけでは再開させない)
     let Some(identity) = body
         .identity
@@ -1996,6 +2052,16 @@ async fn self_resume_handler(
                         (&id, Type::UUID),
                         (&tenant_id, Type::UUID),
                     ],
+                )
+                .await?;
+                // 本人確認の記録 (照合した端末・時刻・方法・顔写真。自己点検表 ト①)
+                insert_identity_event(
+                    tx,
+                    &s,
+                    "resume",
+                    Some(identity.method.as_str()),
+                    &device_id,
+                    &face_photo_url,
                 )
                 .await?;
                 // 測定が有効時間を過ぎていれば体温・血圧の測り直しから
@@ -2109,6 +2175,14 @@ async fn vehicle_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_method_keeps_only_known() {
+        assert_eq!(known_identity_method(Some("vein")), Some("vein"));
+        assert_eq!(known_identity_method(Some("face")), Some("face"));
+        assert_eq!(known_identity_method(Some("pin")), None);
+        assert_eq!(known_identity_method(None), None);
+    }
 
     fn base() -> EmployeeHealthBaseline {
         EmployeeHealthBaseline {
