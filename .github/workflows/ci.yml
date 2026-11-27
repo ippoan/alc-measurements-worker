@@ -75,7 +75,7 @@ jobs:
           cargo llvm-cov --locked -p measurements --no-report 2>&1 | tee "$RUNNER_TEMP/measurements-test.txt"
           # target ごとの結果の行だけを見る (ほかの target の行と取り違えない)
           awk '/Running unittests src\/lib\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/measurements-test.txt" \
-            | grep -Eq '^test result: ok\. 46 passed; 0 failed; 0 ignored'
+            | grep -Eq '^test result: ok\. 47 passed; 0 failed; 0 ignored'
           awk '/Running tests\/api_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/measurements-test.txt" \
             | grep -Eq '^test result: ok\. 10 passed; 0 failed; 0 ignored'
           awk '/Running tests\/files_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/measurements-test.txt" \
