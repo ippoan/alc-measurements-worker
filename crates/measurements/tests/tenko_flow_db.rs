@@ -200,6 +200,24 @@ async fn manager(t: Uuid, role: &str) -> Uuid {
     id
 }
 
+/// 点呼の本人確認の記録 (alc-migrations 221): (phase, method, device_id, face_photo_url) を時刻の順に
+async fn identity_events(
+    session: Uuid,
+) -> Vec<(String, Option<String>, Option<String>, Option<String>)> {
+    admin()
+        .await
+        .query(
+            "SELECT phase, method, device_id, face_photo_url FROM alc_api.tenko_identity_events \
+             WHERE session_id = $1 ORDER BY occurred_at, created_at",
+            &[&session],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .collect()
+}
+
 async fn records(session: Uuid) -> Vec<(String, String, Value, String)> {
     admin()
         .await
@@ -256,12 +274,22 @@ async fn pre_operation_auto_flow_writes_record() {
         "/api/tenko/sessions/start",
         t,
         &[("X-Device-Id", "kiosk-1")],
-        Some(json!({ "schedule_id": sch, "employee_id": emp })),
+        Some(json!({ "schedule_id": sch, "employee_id": emp, "identity_method": "vein", "identity_face_photo_url": "https://r2.invalid/face-start.jpg" })),
     )
     .await;
     assert_eq!(got.status, 201);
     let s = got.json();
     let id = s["id"].as_str().unwrap().to_owned();
+    // 本人確認の記録 (自己点検表 ト①): 照合した端末・方法・顔写真
+    assert_eq!(
+        identity_events(id.parse().unwrap()).await,
+        vec![(
+            "start".to_owned(),
+            Some("vein".to_owned()),
+            Some("kiosk-1".to_owned()),
+            Some("https://r2.invalid/face-start.jpg".to_owned())
+        )]
+    );
     // 値の置き場の測定を作ってセッションから指す (started・乗務員と端末はセッションと同じ)
     let mid: Uuid = s["measurement_id"].as_str().unwrap().parse().unwrap();
     let m = admin()
@@ -1220,17 +1248,28 @@ async fn self_resume_rules() {
     )
     .await;
     let uri = format!("/api/tenko/sessions/{id}/self-resume");
-    let r = send(
+    let r = send_h(
         &app,
         "POST",
         &uri,
         t,
+        &[("X-Device-Id", "kiosk-2")],
         Some(
-            json!({ "reason": " 電池切れ ", "identity": { "employee_id": emp, "method": "vein" } }),
+            json!({ "reason": " 電池切れ ", "identity": { "employee_id": emp, "method": "vein" }, "identity_face_photo_url": " https://r2.invalid/face-resume.jpg " }),
         ),
     )
     .await
     .json();
+    // 再開の本人確認も記録する (方法・端末・顔写真)
+    assert_eq!(
+        identity_events(id).await,
+        vec![(
+            "resume".to_owned(),
+            Some("vein".to_owned()),
+            Some("kiosk-2".to_owned()),
+            Some("https://r2.invalid/face-resume.jpg".to_owned())
+        )]
+    );
     assert_eq!(
         (
             r["resume_reason"].clone(),
