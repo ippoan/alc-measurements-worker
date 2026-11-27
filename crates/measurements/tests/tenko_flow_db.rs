@@ -1315,7 +1315,7 @@ async fn manager_judgment_rules() {
         ("X-Device-Role", "device-tenko-manager"),
         ("X-Device-Dev", "1"),
     ];
-    let body = |j: &str, by: Uuid, m: Option<&str>| json!({ "judgment": j, "judged_by_employee_id": by, "reason": "確認", "method": m });
+    let body = |j: &str, by: Uuid, m: Option<&str>| json!({ "judgment": j, "judged_by_employee_id": by, "reason": "確認", "method": m, "alternative_measure": "交代" });
     let u = |id: Uuid| format!("/api/tenko/sessions/{id}/judgment");
 
     // 管理者ログインでも運行管理者の鍵でもない → 401。判定の値・判定した人の検査
@@ -1948,7 +1948,7 @@ async fn judgment_closes_pending_and_writes_record() {
     let emp = employee(t, "遠隔 太郎").await;
     let judge = manager(t, "manager").await;
     let u = |id: Uuid| format!("/api/tenko/sessions/{id}/judgment");
-    let body = |j: &str, m: Option<&str>| json!({ "judgment": j, "judged_by_employee_id": judge, "reason": "通話で確認", "method": m });
+    let body = |j: &str, m: Option<&str>| json!({ "judgment": j, "judged_by_employee_id": judge, "reason": "通話で確認", "method": m, "alternative_measure": "交代" });
 
     // 業務前の遠隔点呼: 指示の確認で判定待ち (記録はまだ)
     let pre = sess(
@@ -2914,6 +2914,87 @@ async fn resume_name_alternative_measure_and_self_resume_after_manager() {
     .await
     .json();
     assert_eq!(r["alternative_measure"], "交代");
+
+    // 従事できない (ng) は理由と代替措置が必須 (業務前 二十 タ)。空白だけも 400
+    for bad in [
+        json!({ "judgment": "ng", "judged_by_employee_id": judge, "reason": "確認" }),
+        json!({ "judgment": "ng", "judged_by_employee_id": judge, "reason": "確認", "alternative_measure": "  " }),
+        json!({ "judgment": "ng", "judged_by_employee_id": judge, "reason": " ", "alternative_measure": "交代" }),
+        json!({ "judgment": "ng", "judged_by_employee_id": judge, "alternative_measure": "交代" }),
+    ] {
+        assert_eq!(
+            send_h(&app, "POST", &j(done), t, &admin_headers(), Some(bad))
+                .await
+                .status,
+            400
+        );
+    }
+
+    // 先に閉じた記録 (取り消し) への判定は、記録に紐づく判定の表へ 1 回ごとに追記する (alc-migrations 220)。
+    // 判定待ちを閉じたときも同じ表に 1 行入る。記録の無いセッションには何も足さない
+    let judged = |sid: Uuid| async move {
+        admin()
+            .await
+            .query(
+                "SELECT j.judgment, j.reason, j.alternative_measure, j.judged_by_name \
+                 FROM alc_api.tenko_record_judgments j JOIN alc_api.tenko_records r ON r.id = j.record_id \
+                 WHERE r.session_id = $1 ORDER BY j.created_at",
+                &[&sid],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<_, String>(0),
+                    r.get::<_, Option<String>>(1),
+                    r.get::<_, Option<String>>(2),
+                    r.get::<_, String>(3),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let name = "判定 管理者".to_owned();
+    send_h(
+        &app,
+        "POST",
+        &j(c1),
+        t,
+        &admin_headers(),
+        Some(jb("ng", Some(" 運行中止 "))),
+    )
+    .await;
+    send_h(
+        &app,
+        "POST",
+        &j(c1),
+        t,
+        &admin_headers(),
+        Some(jb("ok", Some("不要"))),
+    )
+    .await;
+    assert_eq!(
+        judged(c1).await,
+        vec![
+            (
+                "ng".to_owned(),
+                Some("確認".to_owned()),
+                Some("運行中止".to_owned()),
+                name.clone()
+            ),
+            ("ok".to_owned(), Some("確認".to_owned()), None, name.clone()),
+        ]
+    );
+    assert_eq!(
+        judged(pending).await,
+        vec![(
+            "ng".to_owned(),
+            Some("確認".to_owned()),
+            Some("運行を見合わせる".to_owned()),
+            name.clone()
+        )]
+    );
+    assert!(judged(done).await.is_empty());
 }
 
 /// 業務前 二十 ハ: 車両番号。開始で予定の値を写し、`PUT …/vehicle` は車検証の登録番号 > 予定の値 > 手入力
