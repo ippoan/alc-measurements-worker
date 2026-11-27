@@ -2,6 +2,8 @@
 //!
 //! - `GET /measurements/{id}/face-photo` — R2 の顔写真を返す (`Content-Type: image/jpeg`)
 //! - `GET /measurements/{id}/video` — R2 の動画を返す (`Content-Type: video/webm`)
+//! - `GET /tenko/identity-events/{id}/face-photo` — 点呼の本人確認 (指静脈の照合) のとき端末のカメラで撮った顔写真
+//!   (`tenko_identity_events.face_photo_url`。自己点検表 ト①。Refs ippoan/alc-app#720)。振る舞いは測定の顔写真と同じ
 //!
 //! どちらも `Cache-Control: private, max-age=3600`、本文は R2 のバイト列。測定を `tenant_id` 付きで取る →
 //! 無ければ 404、URL の列 (`face_photo_url` / `video_url`) が NULL でも 404 → URL から R2 のキーを取り出せなければ 500 →
@@ -20,15 +22,18 @@
 use std::sync::Arc;
 
 use alc_core_wasm::{DeviceDevSlot, TenantId};
+use alc_worker_db::PgClient;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
 use futures_util::future::BoxFuture;
+use tokio_postgres::types::Type;
 use uuid::Uuid;
 
 use crate::measurements::get_one;
+use crate::set_device_dev;
 use crate::{AppState, LogSink};
 
 /// R2 の段の失敗。持つのは段の名前だけ (キーやランタイムのエラー文を持たない)
@@ -111,6 +116,55 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/measurements/{id}/face-photo", get(get_face_photo))
         .route("/measurements/{id}/video", get(get_video))
+        .route(
+            "/tenko/identity-events/{id}/face-photo",
+            get(get_identity_face_photo),
+        )
+}
+
+/// 点呼の本人確認の顔写真の URL (行が無い・写真が無ければ None)
+async fn identity_face_url(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    dev: bool,
+    id: Uuid,
+) -> Result<Option<String>, tokio_postgres::Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            set_device_dev(tx, dev).await?;
+            Ok(tx
+                .query_typed_opt(
+                    "SELECT face_photo_url FROM alc_api.tenko_identity_events WHERE id = $1 AND tenant_id = $2",
+                    &[(&id, Type::UUID), (&tenant_id, Type::UUID)],
+                )
+                .await?
+                .and_then(|r| r.get::<_, Option<String>>(0)))
+        })
+    })
+    .await
+}
+
+async fn get_identity_face_photo(
+    State(state): State<AppState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Extension(dev): Extension<DeviceDevSlot>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, StatusCode> {
+    let stage = "identity-face-photo";
+    let Some(files) = state.files.clone() else {
+        (state.log)(&format!(
+            "measurements: {stage} failed: storage (unconfigured)"
+        ));
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let url = {
+        let mut pg = state.pg.lock().await;
+        identity_face_url(&mut pg, tenant_id, dev.get(), id)
+            .await
+            .map_err(|e| state.db_fail(stage, &e))?
+    }
+    .ok_or(StatusCode::NOT_FOUND)?;
+    respond(&state, &files, tenant_id, &url, Media::FacePhoto, stage).await
 }
 
 async fn get_face_photo(
@@ -182,7 +236,19 @@ async fn serve(
             Media::Video => m.video_url,
         })
         .ok_or(StatusCode::NOT_FOUND)?;
-    let bytes = read_media(&state.log, &files, tenant_id, &url, media, stage)
+    respond(&state, &files, tenant_id, &url, media, stage).await
+}
+
+/// 保存した URL の写真・動画を R2 から読んで返す (読めなければ 500)
+async fn respond(
+    state: &AppState,
+    files: &SharedStore,
+    tenant_id: Uuid,
+    url: &str,
+    media: Media,
+    stage: &str,
+) -> Result<Response, StatusCode> {
+    let bytes = read_media(&state.log, files, tenant_id, url, media, stage)
         .await
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((
