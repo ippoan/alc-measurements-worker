@@ -275,3 +275,69 @@ async fn test_without_r2_binding_the_two_routes_are_503() {
     let res = call(&app, "GET", "/api/measurements", Some(tenant), None).await;
     assert_eq!(res.status, 200);
 }
+
+/// 点呼の本人確認のとき端末のカメラで撮った顔写真 (`GET /api/tenko/identity-events/{id}/face-photo`。自己点検表 ト①。
+/// Refs ippoan/alc-app#720): 写真あり → 200 (R2 のバイト列)・写真なし / 行なし → 404・DB に届かない → 500・R2 の binding 無し → 503
+#[tokio::test]
+async fn identity_event_face_photo() {
+    let other = tenant().await;
+    let tenant = tenant().await;
+    let emp = employee(tenant, "運行者", &Uuid::new_v4().simple().to_string()[..8]).await;
+    let key = FACE.key(tenant);
+    let (session, with_photo, without) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    admin()
+        .await
+        .batch_execute(&format!(
+            "INSERT INTO alc_api.tenko_sessions (id, tenant_id, employee_id, tenko_type, status) \
+             VALUES ('{session}', '{tenant}', '{emp}', 'pre_operation', 'medical_pending'); \
+             INSERT INTO alc_api.tenko_identity_events (id, tenant_id, session_id, employee_id, phase, face_photo_url) VALUES \
+             ('{with_photo}', '{tenant}', '{session}', '{emp}', 'start', '{url}'), \
+             ('{without}', '{tenant}', '{session}', '{emp}', 'resume', NULL);",
+            url = Kind::url(&key)
+        ))
+        .await
+        .unwrap();
+    let uri = |id: Uuid| format!("/api/tenko/identity-events/{id}/face-photo");
+
+    let store = MockStore::with(&key, BYTES);
+    let app = build_with(rt_client().await, Some(shared(&store)));
+    let res = call(&app, "GET", &uri(with_photo), Some(tenant), None).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.headers["content-type"], "image/jpeg");
+    assert_eq!(res.body, BYTES);
+    assert_eq!(store.gets(), [key]);
+    for id in [without, Uuid::new_v4()] {
+        assert_eq!(
+            call(&app, "GET", &uri(id), Some(tenant), None).await.status,
+            404
+        );
+    }
+    // 別の tenant からは見えない
+    assert_eq!(
+        call(&app, "GET", &uri(with_photo), Some(other), None)
+            .await
+            .status,
+        404
+    );
+
+    let broken = build_with(broken_client().await, Some(shared(&store)));
+    assert_eq!(
+        call(&broken, "GET", &uri(with_photo), Some(tenant), None)
+            .await
+            .status,
+        500
+    );
+    assert!(broken.logs()[0].starts_with("measurements: identity-face-photo failed: db ("));
+
+    let no_store = build_with(rt_client().await, None);
+    assert_eq!(
+        call(&no_store, "GET", &uri(with_photo), Some(tenant), None)
+            .await
+            .status,
+        503
+    );
+    assert_eq!(
+        no_store.logs(),
+        ["measurements: identity-face-photo failed: storage (unconfigured)"]
+    );
+}
