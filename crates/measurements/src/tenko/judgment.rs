@@ -11,6 +11,9 @@
 //! - **判定が記録に入ったセッション**: 409 `already_recorded` (記録は UPDATE できないので押し直せない)
 //! - **それ以外** (判定待ちを足す前に閉じた IT点呼の記録など): 今までどおり判定の列だけ書く (押し直し可。記録は先に
 //!   書かれていて判定を含まない — 記録の CSV はセッションを join して出す)
+//! - **判定は毎回、点呼の最新の記録に紐づく表 `tenko_record_judgments` に 1 行追記する** (alc-migrations 220。追記だけで
+//!   書き換え不可)。自動で中止した記録にも、後から入れた判定と代替措置が残り、判定の履歴になる。記録がまだ無ければ足さない
+//! - **従事できない (`ng`) は理由と代替措置が必須** (業務前 二十 タ。無い・空白だけなら 400)
 //!
 //! 血圧の記録が足りず対面点呼へ切り替えたセッションは、会った運行管理者の所属 ([`office_scope`]) で点呼の方法を決める。
 //! 点呼の営業所は車両で決まる。手で選んだ所属 (セッションの車両番号を車両マスタ `maintenance_vehicles` の登録番号と照合)
@@ -94,6 +97,15 @@ pub mod sql {
     /// 判定が点呼の記録に入っているか。$1 session_id / $2 tenant_id
     pub const JUDGED_IN_RECORD: &str = "SELECT EXISTS (SELECT 1 FROM alc_api.tenko_records \
          WHERE session_id = $1 AND tenant_id = $2 AND record_data ->> 'manager_judgment' IS NOT NULL)";
+
+    /// 点呼の最新の記録に判定を 1 行追記する (alc-migrations 220。記録がまだ無ければ何もしない)。判定した人の氏名は
+    /// その時点の写し。$1 tenant_id / $2 session_id / $3 judgment / $4 理由 / $5 代替措置 / $6 確認の方法 / $7 判定した人
+    pub const APPEND_RECORD_JUDGMENT: &str = "INSERT INTO alc_api.tenko_record_judgments \
+         (tenant_id, record_id, judgment, reason, alternative_measure, method, judged_by, judged_by_name) \
+         SELECT $1, r.id, $3, $4, $5, $6, $7, \
+             COALESCE((SELECT e.name FROM alc_api.employees e WHERE e.tenant_id = $1 AND e.id = $7), '') \
+         FROM alc_api.tenko_records r WHERE r.tenant_id = $1 AND r.session_id = $2 \
+         ORDER BY r.recorded_at DESC LIMIT 1";
 
     /// 在籍の社員の役割 (判定した運行管理者の検査)。$1 tenant_id / $2 employee_id
     pub const JUDGE_ROLE: &str =
@@ -273,6 +285,16 @@ async fn judgment_handler(
     if body.judgment != "ok" && body.judgment != "ng" {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    // 従事できない (ng) と判断したときは理由と代替措置が要る (業務前 二十 タ。記録の表の CHECK と同じ)
+    let reason = clean(body.reason.as_deref());
+    let alternative_measure = if body.judgment == "ng" {
+        clean(body.alternative_measure.as_deref())
+    } else {
+        None
+    };
+    if body.judgment == "ng" && (reason.is_none() || alternative_measure.is_none()) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let dev = slot.get();
     let prod_manager = prod_manager_key(&slot, admin);
     run(
@@ -329,12 +351,6 @@ async fn judgment_handler(
                 } else {
                     method
                 };
-                // 代替措置は従事できない (ng) 判定のときだけ保存する
-                let alternative_measure = if body.judgment == "ng" {
-                    clean(body.alternative_measure.as_deref())
-                } else {
-                    None
-                };
                 let args: [Arg; 7] = [
                     (&body.judgment, Type::TEXT),
                     (&body.reason, Type::TEXT),
@@ -354,6 +370,7 @@ async fn judgment_handler(
                     )
                     .await?;
                     write_record(tx, &s).await?;
+                    append_record_judgment(tx, &s, &body, &reason, &alternative_measure).await?;
                     return Ok(Flow::Session(Box::new(s), None));
                 }
                 let recorded: bool = tx
@@ -370,9 +387,35 @@ async fn judgment_handler(
                     )));
                 }
                 let s = one(tx, sql::MANAGER_JUDGMENT, &args).await?;
+                // 先に閉じた記録 (自動の中止など) にも、後から入れた判定と代替措置を追記で残す
+                append_record_judgment(tx, &s, &body, &reason, &alternative_measure).await?;
                 Ok(Flow::Session(Box::new(s), None))
             })
         },
     )
     .await
+}
+
+/// 判定を点呼の最新の記録に 1 行追記する ([`sql::APPEND_RECORD_JUDGMENT`])。確認の方法は判定を書いた後のセッションの値
+async fn append_record_judgment(
+    tx: &TenantTx<'_>,
+    s: &TenkoSession,
+    body: &ManagerJudgment,
+    reason: &Option<String>,
+    alternative_measure: &Option<String>,
+) -> Result<(), tokio_postgres::Error> {
+    tx.execute_typed(
+        sql::APPEND_RECORD_JUDGMENT,
+        &[
+            (&s.tenant_id, Type::UUID),
+            (&s.id, Type::UUID),
+            (&body.judgment, Type::TEXT),
+            (reason, Type::TEXT),
+            (alternative_measure, Type::TEXT),
+            (&s.manager_judgment_method, Type::TEXT),
+            (&body.judged_by_employee_id, Type::UUID),
+        ],
+    )
+    .await?;
+    Ok(())
 }
