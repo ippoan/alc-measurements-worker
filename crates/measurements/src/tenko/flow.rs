@@ -864,17 +864,16 @@ pub async fn back_to_medical_if_expired(
     }
     let v = validity(tx, s.tenant_id, s.employee_id).await?;
     let mut expired = medical_expired(measured_at, v.temperature_minutes, now);
-    if !expired && s.systolic.is_some() {
-        if let Some(mid) = s.measurement_id {
-            let bp_at: Option<DateTime<Utc>> = tx
-                .query_typed_opt(
-                    sql::BP_MEASURED_AT,
-                    &[(&mid, Type::UUID), (&s.tenant_id, Type::UUID)],
-                )
-                .await?
-                .and_then(|r| r.get(0));
-            expired = bp_at.is_some_and(|at| v.bp.expired(at, now));
-        }
+    // 血圧の値は測定 (measurement_id) から読むので、血圧があれば measurement_id も必ずある (1 つの条件で見る)
+    if let (false, Some(_), Some(mid)) = (expired, s.systolic, s.measurement_id) {
+        let bp_at: Option<DateTime<Utc>> = tx
+            .query_typed_opt(
+                sql::BP_MEASURED_AT,
+                &[(&mid, Type::UUID), (&s.tenant_id, Type::UUID)],
+            )
+            .await?
+            .and_then(|r| r.get(0));
+        expired = bp_at.is_some_and(|at| v.bp.expired(at, now));
     }
     if !expired {
         return Ok(s);
