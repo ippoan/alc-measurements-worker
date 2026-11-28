@@ -3,7 +3,8 @@
 //! 自動点呼の血圧は 1 回に限り測り直せる (2025/10/6 FAQ)。血圧は点呼のキオスクではなく測定台で測り、点呼は
 //! 有効時間内の最新の血圧を使う ([`crate::tenko::flow`] の `LATEST_BP`)。そこで測定台の保存
 //! (`PUT /measurements/{id}` で点呼の印が無いもの) は、同じ運転者が測定の有効時間内に [`MAX_STAND_BP`] 回
-//! (最初 + 測り直し 1 回) を超えて血圧を入れようとしたら 422 で断る ([`limit_reached`])。
+//! (最初 + 測り直し 1 回) を超えて血圧を入れようとしたら 422 で断る ([`limit_reached`])。画面は静脈認証が通った直後に
+//! 同じ数え方で `GET /measurements/bp-count?employee_id=` を問い ([`bp_count`])、超えていれば測定に進ませない。
 //!
 //! 測定台で人が入れ替わり (テレコ) 別の人の血圧が自分の分に入ったときは、運行管理者が
 //! `POST /measurements/{id}/exclude-bp` でその測定を理由と氏名を付けて外す ([`exclude_bp`])。外した血圧は回数にも
@@ -13,7 +14,8 @@
 use alc_core_wasm::api_error::bad_request;
 use alc_core_wasm::{AuthUser, DeviceDevSlot, TenantId};
 use alc_worker_db::{PgClient, TxOutput};
-use axum::extract::{Path, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -36,19 +38,34 @@ mod sql {
 
     use crate::models::MEASUREMENT_COLUMNS;
 
-    /// この測定に血圧を入れると、同じ運転者の有効時間内の血圧が [`super::MAX_STAND_BP`] を超えるか。
-    /// $1 id / $2 tenant_id / $3 今 / $4 有効時間の既定 (分。基準値の行が無いとき)。
-    /// 数えないもの: この測定 (送り直し)、外した血圧。点呼の測定に写した血圧は測定台の血圧と同じ時刻なので、
-    /// 時刻の重なりは 1 回に数える。この測定に既に血圧が入っていれば (送り直し) 数は 0
-    pub const COUNT_IN_WINDOW: &str = "WITH me AS (SELECT employee_id, systolic FROM measurements \
-             WHERE id = $1 AND tenant_id = $2), \
-         v AS (SELECT COALESCE((SELECT b.measurement_validity_minutes FROM employee_health_baselines b, me \
+    /// 数える文の共通の後ろ半分。前に CTE `me (employee_id, skip_id, counts)` を置いて使う
+    /// (`skip_id` = 数えない測定 (送り直しの自分)、`counts` = false なら数は 0)。
+    /// $2 tenant_id / $3 今 / $4 有効時間の既定 (分。基準値の行が無いとき)。列は (数, 有効時間の分)。
+    /// 数えないもの: `skip_id` の測定、外した血圧。点呼の測定に写した血圧は測定台の血圧と同じ時刻なので、
+    /// 時刻の重なりは 1 回に数える
+    const COUNT_TAIL: &str = ", v AS (SELECT COALESCE((SELECT b.measurement_validity_minutes \
+             FROM employee_health_baselines b, me \
              WHERE b.tenant_id = $2 AND b.employee_id = me.employee_id), $4::int) AS mins) \
-         SELECT count(DISTINCT COALESCE(m.medical_measured_at, m.measured_at)) \
-           FROM measurements m, me, v \
-          WHERE m.tenant_id = $2 AND m.employee_id = me.employee_id AND m.id <> $1 AND me.systolic IS NULL \
-            AND m.systolic IS NOT NULL AND m.bp_excluded_at IS NULL \
-            AND COALESCE(m.medical_measured_at, m.measured_at) >= $3 - make_interval(mins => v.mins)";
+         SELECT (SELECT count(DISTINCT COALESCE(m.medical_measured_at, m.measured_at)) \
+           FROM measurements m, me \
+          WHERE m.tenant_id = $2 AND m.employee_id = me.employee_id AND m.id IS DISTINCT FROM me.skip_id \
+            AND me.counts AND m.systolic IS NOT NULL AND m.bp_excluded_at IS NULL \
+            AND COALESCE(m.medical_measured_at, m.measured_at) >= $3 - make_interval(mins => v.mins)), \
+         v.mins FROM v";
+
+    /// この測定に血圧を入れると、同じ運転者の有効時間内の血圧が [`super::MAX_STAND_BP`] を超えるか。$1 id。
+    /// この測定に既に血圧が入っていれば (送り直し) 数は 0
+    pub const COUNT_FOR_MEASUREMENT: &str = concatcp!(
+        "WITH me AS (SELECT employee_id, id AS skip_id, systolic IS NULL AS counts FROM measurements \
+             WHERE id = $1 AND tenant_id = $2)",
+        COUNT_TAIL
+    );
+
+    /// 社員の有効時間内の血圧の数 (静脈認証の直後の問い合わせ)。$1 employee_id
+    pub const COUNT_FOR_EMPLOYEE: &str = concatcp!(
+        "WITH me AS (SELECT $1::uuid AS employee_id, NULL::uuid AS skip_id, true AS counts)",
+        COUNT_TAIL
+    );
 
     /// 外す前の値 (`FOR UPDATE`)。列は (最高血圧, 外した時刻)。$1 id / $2 tenant_id
     pub const BEFORE_EXCLUDE: &str =
@@ -63,8 +80,39 @@ mod sql {
     );
 }
 
-struct Reached(bool);
-impl TxOutput for Reached {}
+struct Counted(i64, i32);
+impl TxOutput for Counted {}
+
+/// 有効時間内の血圧の数と有効時間 (分)。`sql` は [`sql::COUNT_FOR_MEASUREMENT`] か [`sql::COUNT_FOR_EMPLOYEE`]
+/// ($1 はそれぞれ測定 id・社員 id)
+async fn count_in_window(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    dev: bool,
+    sql: &'static str,
+    key: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(i64, i32), Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            set_device_dev(tx, dev).await?;
+            let row = tx
+                .query_typed_one(
+                    sql,
+                    &[
+                        (&key, Type::UUID),
+                        (&tenant_id, Type::UUID),
+                        (&now, Type::TIMESTAMPTZ),
+                        (&DEFAULT_VALIDITY_MINUTES, Type::INT4),
+                    ],
+                )
+                .await?;
+            Ok(Counted(row.get(0), row.get(1)))
+        })
+    })
+    .await
+    .map(|Counted(n, mins)| (n, mins))
+}
 
 /// 測定 `id` に血圧を入れると制限を超えるか ([`MAX_STAND_BP`])。測定が無ければ false (保存の側が 404 にする)
 pub async fn limit_reached(
@@ -74,25 +122,50 @@ pub async fn limit_reached(
     id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<bool, Error> {
-    pg.tenant_tx(tenant_id, move |tx| {
-        Box::pin(async move {
-            set_device_dev(tx, dev).await?;
-            let row = tx
-                .query_typed_one(
-                    sql::COUNT_IN_WINDOW,
-                    &[
-                        (&id, Type::UUID),
-                        (&tenant_id, Type::UUID),
-                        (&now, Type::TIMESTAMPTZ),
-                        (&DEFAULT_VALIDITY_MINUTES, Type::INT4),
-                    ],
-                )
-                .await?;
-            Ok(Reached(row.get::<_, i64>(0) >= MAX_STAND_BP))
-        })
-    })
+    count_in_window(pg, tenant_id, dev, sql::COUNT_FOR_MEASUREMENT, id, now)
+        .await
+        .map(|(n, _)| n >= MAX_STAND_BP)
+}
+
+/// `GET /measurements/bp-count` の問い合わせ
+#[derive(Debug, Deserialize)]
+pub struct BpCountQuery {
+    pub employee_id: Uuid,
+}
+
+/// `GET /measurements/bp-count?employee_id=` — 社員の有効時間内の測定台の血圧の数 (数え方は [`limit_reached`] と同じ)。
+/// 静脈認証が通った直後に画面が問い、`reached` なら測定に進ませない (保存の 422 は保険として残る)。
+/// ログインでも端末の鍵でも通る (保存と同じ扱い)。`employee_id` が無い・不正なら 400 (本文なし)
+pub async fn bp_count(
+    State(state): State<AppState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Extension(dev): Extension<DeviceDevSlot>,
+    query: Result<Query<BpCountQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(BpCountQuery { employee_id })) = query else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let now = (state.now)();
+    let mut pg = state.pg.lock().await;
+    match count_in_window(
+        &mut pg,
+        tenant_id,
+        dev.get(),
+        sql::COUNT_FOR_EMPLOYEE,
+        employee_id,
+        now,
+    )
     .await
-    .map(|Reached(b)| b)
+    {
+        Err(e) => state.db_fail("measurement bp count", &e).into_response(),
+        Ok((count, mins)) => Json(json!({
+            "count": count,
+            "limit": MAX_STAND_BP,
+            "validity_minutes": mins,
+            "reached": count >= MAX_STAND_BP,
+        }))
+        .into_response(),
+    }
 }
 
 /// `POST /measurements/{id}/exclude-bp` の本文
