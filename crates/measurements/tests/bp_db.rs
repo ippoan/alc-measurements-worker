@@ -442,9 +442,10 @@ async fn test_stand_bp_allows_two_in_the_window_and_refuses_the_third() {
         .await
         .unwrap();
     assert_eq!(row.get::<_, Option<i32>>(0), None);
-    // 有効時間 (既定 30 分) を過ぎた血圧は数えない: 古い 2 回の後でも 3 回目が通る
+    // 血圧の有効時間は既定で当日中 (日本時間。alc-migrations 222)。今 (10/23 07:00 JST) から見て前日 (10/22 23:00 JST) の
+    // 2 回は数えない: その後でも 3 回目が通る
     let (t2, e2) = setup().await;
-    let old = json!({ "status": "completed", "systolic": 120, "diastolic": 80, "medical_measured_at": "2026-10-22T20:00:00Z" });
+    let old = json!({ "status": "completed", "systolic": 120, "diastolic": 80, "medical_measured_at": "2026-10-22T14:00:00Z" });
     for body in [&old, &old, &stand_bp(121, 1)] {
         let id = start_measurement(&app, t2, e2).await;
         put_measurement_ok(&app, t2, &id, body).await;
@@ -610,24 +611,24 @@ async fn test_bp_count_counts_like_the_save_limit() {
         (zero.status, zero.json()),
         (
             200,
-            json!({ "count": 0, "limit": 2, "validity_minutes": 30, "reached": false })
+            json!({ "count": 0, "limit": 2, "validity": "same_day", "validity_minutes": null, "reached": false })
         )
     );
-    // 有効時間を過ぎた血圧・血圧の無い測定は数えない
-    let old = start_measurement(&app, tenant, emp).await;
-    put_measurement_ok(
-        &app,
-        tenant,
-        &old,
-        &json!({ "status": "completed", "systolic": 120, "diastolic": 80, "medical_measured_at": "2026-10-22T20:00:00Z" }),
-    )
-    .await;
+    // 当日中 (既定): 前日 (日本時間) の血圧・血圧の無い測定は数えない。同じ日の 2 時間前は数える
+    for at in ["2026-10-22T14:00:00Z", "2026-10-22T20:00:00Z"] {
+        let id = start_measurement(&app, tenant, emp).await;
+        put_measurement_ok(
+            &app,
+            tenant,
+            &id,
+            &json!({ "status": "completed", "systolic": 120, "diastolic": 80, "medical_measured_at": at }),
+        )
+        .await;
+    }
     start_measurement(&app, tenant, emp).await;
+    assert_eq!(bp_count(&app, tenant, &q).await.json()["count"], 1);
     let first = start_measurement(&app, tenant, emp).await;
     put_measurement_ok(&app, tenant, &first, &stand_bp(150, 5)).await;
-    assert_eq!(bp_count(&app, tenant, &q).await.json()["count"], 1);
-    let second = start_measurement(&app, tenant, emp).await;
-    put_measurement_ok(&app, tenant, &second, &stand_bp(128, 3)).await;
     let two = bp_count(&app, tenant, &q).await.json();
     assert_eq!(
         (two["count"].clone(), two["reached"].clone()),
@@ -658,25 +659,34 @@ async fn test_bp_count_counts_like_the_save_limit() {
         (json!(1), json!(false))
     );
 
-    // 有効時間は基準値の行から (150 分なら 20:00 の血圧も入る)
+    // 体温の有効時間 (measurement_validity_minutes) は血圧の数えに効かない
     baseline(tenant, emp, 120, 80, 10).await;
-    admin()
-        .await
-        .execute(
-            "UPDATE alc_api.employee_health_baselines SET measurement_validity_minutes = 150 WHERE employee_id = $1",
-            &[&emp],
-        )
-        .await
-        .unwrap();
+    let set = |col: &'static str, v: Option<i32>| async move {
+        admin()
+            .await
+            .execute(
+                &format!("UPDATE alc_api.employee_health_baselines SET {col} = $2 WHERE employee_id = $1"),
+                &[&emp, &v],
+            )
+            .await
+            .unwrap();
+    };
+    set("measurement_validity_minutes", Some(1)).await;
+    assert_eq!(bp_count(&app, tenant, &q).await.json()["count"], 1);
+    // 血圧の有効時間を分にすると分で数える (600 分なら前日の 23:00 JST も入る。60 分なら 2 時間前も外れる)
+    set("bp_validity_minutes", Some(600)).await;
     let wide = bp_count(&app, tenant, &q).await.json();
     assert_eq!(
         (
             wide["count"].clone(),
+            wide["validity"].clone(),
             wide["validity_minutes"].clone(),
             wide["reached"].clone()
         ),
-        (json!(2), json!(150), json!(true))
+        (json!(2), json!("minutes"), json!(600), json!(true))
     );
+    set("bp_validity_minutes", Some(60)).await;
+    assert_eq!(bp_count(&app, tenant, &q).await.json()["count"], 0);
 
     // 別の社員・別のテナントの血圧は数えない
     let (t2, e2) = setup().await;

@@ -3,7 +3,7 @@
 //! 自動点呼の血圧は 1 回に限り測り直せる (2025/10/6 FAQ)。血圧は点呼のキオスクではなく測定台で測り、点呼は
 //! 有効時間内の最新の血圧を使う ([`crate::tenko::flow`] の `LATEST_BP`)。そこで測定台の保存
 //! (`PUT /measurements/{id}` で点呼の印が無いもの) は、同じ運転者が測定の有効時間内に [`MAX_STAND_BP`] 回
-//! (最初 + 測り直し 1 回) を超えて血圧を入れようとしたら 422 で断る ([`limit_reached`])。画面は静脈認証が通った直後に
+//! (最初 + 測り直し 1 回) を超えて血圧を入れようとしたら 422 で断る (有効時間は血圧の規則。既定は当日中 = 1 日 2 回まで) ([`limit_reached`])。画面は静脈認証が通った直後に
 //! 同じ数え方で `GET /measurements/bp-count?employee_id=` を問い ([`bp_count`])、超えていれば測定に進ませない。
 //!
 //! 測定台で人が入れ替わり (テレコ) 別の人の血圧が自分の分に入ったときは、運行管理者が
@@ -27,7 +27,7 @@ use tokio_postgres::Error;
 use uuid::Uuid;
 
 use crate::models::Measurement;
-use crate::tenko::flow::{clean, DEFAULT_VALIDITY_MINUTES};
+use crate::tenko::flow::clean;
 use crate::{set_device_dev, AppState};
 
 /// 測定台で同じ運転者が測定の有効時間内に入れられる血圧の数 (最初 + 測り直し 1 回)
@@ -39,18 +39,21 @@ mod sql {
     use crate::models::MEASUREMENT_COLUMNS;
 
     /// 数える文の共通の後ろ半分。前に CTE `me (employee_id, skip_id, counts)` を置いて使う
-    /// (`skip_id` = 数えない測定 (送り直しの自分)、`counts` = false なら数は 0)。
-    /// $2 tenant_id / $3 今 / $4 有効時間の既定 (分。基準値の行が無いとき)。列は (数, 有効時間の分)。
-    /// 数えないもの: `skip_id` の測定、外した血圧。点呼の測定に写した血圧は測定台の血圧と同じ時刻なので、
-    /// 時刻の重なりは 1 回に数える
-    const COUNT_TAIL: &str = ", v AS (SELECT COALESCE((SELECT b.measurement_validity_minutes \
-             FROM employee_health_baselines b, me \
-             WHERE b.tenant_id = $2 AND b.employee_id = me.employee_id), $4::int) AS mins) \
-         SELECT (SELECT count(DISTINCT COALESCE(m.medical_measured_at, m.measured_at)) \
+    /// (`skip_id` = 数えない測定 (送り直しの自分)、`counts` = false なら数は 0)。$2 tenant_id / $3 今。
+    /// 列は (数, 血圧の有効時間の分 (NULL = 当日中))。血圧の有効時間は基準値の `bp_validity_minutes` (alc-migrations 222)。
+    /// NULL・基準値の行が無ければ当日中 (日本時間の同じ日付。今より後の日付も数える)。血圧の時刻は
+    /// `COALESCE(bp_measured_at, medical_measured_at, measured_at)` (点呼に写した血圧は測定台の血圧と同じ時刻なので 1 回に数える)。
+    /// 数えないもの: `skip_id` の測定、外した血圧
+    const COUNT_TAIL: &str = ", v AS (SELECT (SELECT b.bp_validity_minutes FROM employee_health_baselines b, me \
+             WHERE b.tenant_id = $2 AND b.employee_id = me.employee_id) AS mins), \
+         t AS (SELECT COALESCE(m.bp_measured_at, m.medical_measured_at, m.measured_at) AS at \
            FROM measurements m, me \
           WHERE m.tenant_id = $2 AND m.employee_id = me.employee_id AND m.id IS DISTINCT FROM me.skip_id \
-            AND me.counts AND m.systolic IS NOT NULL AND m.bp_excluded_at IS NULL \
-            AND COALESCE(m.medical_measured_at, m.measured_at) >= $3 - make_interval(mins => v.mins)), \
+            AND me.counts AND m.systolic IS NOT NULL AND m.bp_excluded_at IS NULL) \
+         SELECT (SELECT count(DISTINCT t.at) FROM t \
+          WHERE CASE WHEN v.mins IS NULL \
+                     THEN (t.at AT TIME ZONE 'Asia/Tokyo')::date >= ($3 AT TIME ZONE 'Asia/Tokyo')::date \
+                     ELSE t.at >= $3 - make_interval(mins => v.mins) END), \
          v.mins FROM v";
 
     /// この測定に血圧を入れると、同じ運転者の有効時間内の血圧が [`super::MAX_STAND_BP`] を超えるか。$1 id。
@@ -80,10 +83,10 @@ mod sql {
     );
 }
 
-struct Counted(i64, i32);
+struct Counted(i64, Option<i32>);
 impl TxOutput for Counted {}
 
-/// 有効時間内の血圧の数と有効時間 (分)。`sql` は [`sql::COUNT_FOR_MEASUREMENT`] か [`sql::COUNT_FOR_EMPLOYEE`]
+/// 有効時間内の血圧の数と血圧の有効時間 (分。`None` = 当日中)。`sql` は [`sql::COUNT_FOR_MEASUREMENT`] か [`sql::COUNT_FOR_EMPLOYEE`]
 /// ($1 はそれぞれ測定 id・社員 id)
 async fn count_in_window(
     pg: &mut PgClient,
@@ -92,7 +95,7 @@ async fn count_in_window(
     sql: &'static str,
     key: Uuid,
     now: DateTime<Utc>,
-) -> Result<(i64, i32), Error> {
+) -> Result<(i64, Option<i32>), Error> {
     pg.tenant_tx(tenant_id, move |tx| {
         Box::pin(async move {
             set_device_dev(tx, dev).await?;
@@ -103,7 +106,6 @@ async fn count_in_window(
                         (&key, Type::UUID),
                         (&tenant_id, Type::UUID),
                         (&now, Type::TIMESTAMPTZ),
-                        (&DEFAULT_VALIDITY_MINUTES, Type::INT4),
                     ],
                 )
                 .await?;
@@ -161,6 +163,7 @@ pub async fn bp_count(
         Ok((count, mins)) => Json(json!({
             "count": count,
             "limit": MAX_STAND_BP,
+            "validity": if mins.is_some() { "minutes" } else { "same_day" },
             "validity_minutes": mins,
             "reached": count >= MAX_STAND_BP,
         }))

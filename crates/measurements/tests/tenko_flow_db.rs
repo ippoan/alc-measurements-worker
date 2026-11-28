@@ -108,6 +108,7 @@ async fn sess(
             "diastolic",
             "pulse",
             "medical_measured_at",
+            "bp_measured_at",
             "result",
         ]
         .contains(c)
@@ -2583,8 +2584,9 @@ async fn manager_key_cancel_interrupt_resume_scope() {
     assert_eq!(r["status"], "daily_inspection_pending");
 }
 
-/// 業務前 八: 体温・血圧の測定の有効時間 (社員の基準値。無ければ 30 分)。過ぎた値は受けず、再開・自己再開・
-/// アルコールの段の直前へ進める段は、アルコール未測定で過ぎていれば体温・血圧の測り直しへ戻す
+/// 業務前 八: 体温・血圧の測定の有効時間 (社員の基準値。体温は無ければ 30 分、血圧は無ければ当日中)。過ぎた値は受けず、
+/// 再開・自己再開・アルコールの段の直前へ進める段は、アルコール未測定で体温か血圧 (それぞれの時刻で) が過ぎていれば
+/// 体温・血圧の測り直しへ戻す
 #[tokio::test]
 async fn medical_validity_window() {
     let app = app().await;
@@ -2666,6 +2668,29 @@ async fn medical_validity_window() {
         let r = send_h(&app, "POST", &resume(id), t, &admin_headers(), body.clone()).await;
         assert_eq!(r.json()["status"], want);
         assert_eq!(session_status(id).await, want);
+    }
+    // 血圧は血圧の時刻で見る (alc-migrations 222): 体温が新しくても、写した血圧が前日 (日本時間) なら測り直し。
+    // 同じ日なら従来の再開先 (体温の 30 分を過ぎた 20:00Z でも血圧は当日中で有効)
+    for (bp_at, want) in [
+        ("'2026-10-22T14:00:00Z'", "medical_pending"),
+        ("'2026-10-22T20:00:00Z'", "daily_inspection_pending"),
+    ] {
+        let id = sess(
+            t,
+            emp,
+            "pre_operation",
+            "自動点呼",
+            "interrupted",
+            &[
+                ("medical_measured_at", fresh),
+                ("systolic", "120"),
+                ("diastolic", "80"),
+                ("bp_measured_at", bp_at),
+            ],
+        )
+        .await;
+        let r = send_h(&app, "POST", &resume(id), t, &admin_headers(), body.clone()).await;
+        assert_eq!(r.json()["status"], want, "{bp_at}");
     }
     let measured = sess(
         t,
@@ -3937,8 +3962,9 @@ async fn vehicle_candidates_for_kiosk() {
     );
 }
 
-/// 測定台で測った血圧を点呼に結ぶ (業務前 七・八・十)。本文に血圧が無ければ、有効時間内の最新の血圧を点呼の測定に写し、
-/// 基準値との差と安全判定に使う。測定の時刻は体温と血圧の早い方。有効な血圧が無い自動点呼は遠隔点呼として続ける
+/// 測定台で測った血圧を点呼に結ぶ (業務前 七・八・十)。本文に血圧が無ければ、血圧の有効時間 (既定は当日中 = 日本時間の
+/// 同じ日付。alc-migrations 222) 内の最新の血圧を点呼の測定に写し、基準値との差と安全判定に使う。体温の時刻は
+/// `medical_measured_at`、写した血圧の時刻は `bp_measured_at` に別々に入る。有効な血圧が無い自動点呼は遠隔点呼として続ける
 /// (dev 端末・自動点呼でない点呼は切り替えない)
 #[tokio::test]
 async fn stand_bp_ties_to_tenko() {
@@ -3961,7 +3987,7 @@ async fn stand_bp_ties_to_tenko() {
         Some(json!({ "temperature": 36.5, "medical_measured_at": "2026-10-22T21:55:00Z" }));
     let uri = |id: Uuid, step: &str| format!("/api/tenko/sessions/{id}/{step}");
 
-    // 有効時間内 (要求の今 22:00 の 30 分以内) の測定台の血圧を写す。古い方 (20:00) は使わない
+    // 当日中 (要求の今 10/23 07:00 JST と同じ日付) の最新の測定台の血圧を写す。古い方 (20:00Z) は使わない
     let emp = employee(t, "測定台 一郎").await;
     baseline(t, emp).await;
     stand(emp, "2026-10-22T20:00:00Z").await;
@@ -3988,10 +4014,25 @@ async fn stand_bp_ties_to_tenko() {
             json!(36.5)
         )
     );
+    // 体温の時刻は本文の時刻、血圧の時刻は測定台の時刻 (早い方にまとめない)
     assert!(m["medical_measured_at"]
         .as_str()
         .unwrap()
-        .starts_with("2026-10-22T21:45:00"));
+        .starts_with("2026-10-22T21:55:00"));
+    let bp_at: Option<chrono::DateTime<chrono::Utc>> = admin()
+        .await
+        .query_one(
+            "SELECT m.bp_measured_at FROM alc_api.measurements m JOIN alc_api.tenko_sessions s ON s.measurement_id = m.id \
+             WHERE s.id = $1",
+            &[&id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        bp_at.map(|t| t.to_rfc3339()),
+        Some("2026-10-22T21:45:00+00:00".to_owned())
+    );
     // 差と安全判定に血圧が入る (基準 120/80 ±10)
     let decl = send(
         &app,
@@ -4013,9 +4054,30 @@ async fn stand_bp_ties_to_tenko() {
         (json!("fail"), json!(["systolic"]), json!(30), json!(10))
     );
 
-    // 有効な血圧が無い自動点呼は遠隔点呼として続ける
+    // 血圧の有効時間を分にした社員は分で見る (30 分前より古い 21:00Z は使わない → 遠隔点呼)
+    let mins = employee(t, "測定台 三郎").await;
+    baseline(t, mins).await;
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.employee_health_baselines SET bp_validity_minutes = 30 WHERE employee_id = $1",
+            &[&mins],
+        )
+        .await
+        .unwrap();
+    stand(mins, "2026-10-22T21:00:00Z").await;
+    let id = sess(t, mins, "pre_operation", "自動点呼", "medical_pending", &[]).await;
+    let m = send(&app, "PUT", &uri(id, "medical"), t, medical.clone())
+        .await
+        .json();
+    assert_eq!(
+        (m["tenko_method"].clone(), m["systolic"].clone()),
+        (json!("遠隔点呼"), Value::Null)
+    );
+
+    // 有効な血圧が無い (前日 = 10/22 23:00 JST の血圧だけ) 自動点呼は遠隔点呼として続ける
     let none = employee(t, "測定台 二郎").await;
-    stand(none, "2026-10-22T21:00:00Z").await;
+    stand(none, "2026-10-22T14:00:00Z").await;
     let id = sess(t, none, "pre_operation", "自動点呼", "medical_pending", &[]).await;
     let m = send(&app, "PUT", &uri(id, "medical"), t, medical.clone())
         .await

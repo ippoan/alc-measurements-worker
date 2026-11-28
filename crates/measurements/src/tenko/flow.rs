@@ -12,8 +12,11 @@
 //!   測定の有効時間 (社員の基準値。`PUT …/medical` は過ぎた測定を 400 `measurement_expired`、再開・自己再開・アルコールの段の
 //!   直前へ進める段は未測定のアルコールで有効時間を過ぎていれば `medical_pending` へ戻す)、`self-resume` は運行管理者が再開した
 //!   点呼を 1 回だけ受け (運転者が自分で止めた点呼は 400 `manager_resume_required`。再開の時刻・理由は上書きしない)、`resume` は再開した運行管理者の氏名 (`resumed_by_name`)、`cancel` は代替措置
-//! - 血圧は測定台で測る: `PUT …/medical` は本文に血圧が無ければ、有効時間内の最新の血圧を点呼の測定に写す。無ければ
+//! - 血圧は測定台で測る: `PUT …/medical` は本文に血圧が無ければ、血圧の有効時間内の最新の血圧を点呼の測定に写す。無ければ
 //!   自動点呼は遠隔点呼として続ける (dev 端末は切り替えない)
+//! - 有効時間は体温と血圧で別 (alc-migrations 222): 体温は `measurement_validity_minutes` (分、既定 30)、血圧は
+//!   `bp_validity_minutes` (NULL = 当日中 = 日本時間の同じ日付。[`BpValidity`])。時刻も別々に持つ: 体温は測定の
+//!   `medical_measured_at`、写した血圧は `bp_measured_at` (古い行は NULL で `medical_measured_at` に落とす)
 //! - 取り消し・中断・再開は運行管理者の鍵でも送れる (運行管理者の点呼の一覧から)。範囲は判定と同じ
 //!   ([`prod_manager_key`])。再開は管理者ログインか運行管理者の鍵だけ (キオスクの鍵は 401)
 //!
@@ -53,6 +56,7 @@ use super::record::{
     close_with_record, employee_name, TenkoSession, MEASUREMENT_JOIN, RETURNING_SESSION,
     SESSION_COLUMNS,
 };
+use crate::bp::jst;
 use crate::carins::{lookup_expiry, CarinsLookup};
 use crate::measurements::{device_id_from, DEFAULT_PAGE, DEFAULT_PER_PAGE, MAX_PER_PAGE};
 use crate::{set_device_dev, AppState};
@@ -347,12 +351,14 @@ pub mod sql {
     );
 
     /// 体温・血圧の段の値を値の置き場の測定に書く (来た値だけ変え、時刻は無ければ NOW())。セッションを更新する前に流し、
-    /// セッションの応答は測定から読む)。$1 temperature / $2 systolic / $3 diastolic / $4 pulse / $5 medical_measured_at /
-    /// $6 medical_manual_input / $7 measurement_id / $8 tenant_id
+    /// セッションの応答は測定から読む)。`medical_measured_at` は体温の時刻、`bp_measured_at` は写した測定台の血圧の時刻
+    /// (血圧をこの回に書くときだけ変える。本文の血圧なら NULL = 体温と同じ時刻)。$1 temperature / $2 systolic / $3 diastolic /
+    /// $4 pulse / $5 medical_measured_at / $6 medical_manual_input / $7 measurement_id / $8 tenant_id / $9 bp_measured_at
     pub const MEDICAL_TO_MEASUREMENT: &str =
         "UPDATE alc_api.measurements SET temperature = COALESCE($1, temperature), systolic = COALESCE($2, systolic), \
              diastolic = COALESCE($3, diastolic), pulse = COALESCE($4, pulse), \
-             medical_measured_at = COALESCE($5, NOW()), medical_manual_input = $6, updated_at = NOW() \
+             medical_measured_at = COALESCE($5, NOW()), medical_manual_input = $6, \
+             bp_measured_at = CASE WHEN $2::int IS NULL THEN bp_measured_at ELSE $9 END, updated_at = NOW() \
          WHERE id = $7 AND tenant_id = $8";
 
     /// 測定を持たないセッション (段階 2 より前に始まったもの) を測定に結ぶ。$1 measurement_id / $2 id / $3 tenant_id
@@ -454,7 +460,7 @@ pub mod sql {
 
     /// 血圧の記録がある日数 (東京の日付で数え、同じ日の複数件は 1 日)。$1 tenant_id / $2 employee_id → 日数。
     /// dev 軸は RLS が他の問い合わせと同じく効かせる
-    pub const BP_HISTORY_DAYS: &str = "SELECT COUNT(DISTINCT ((COALESCE(m.medical_measured_at, m.measured_at) \
+    pub const BP_HISTORY_DAYS: &str = "SELECT COUNT(DISTINCT ((COALESCE(m.bp_measured_at, m.medical_measured_at, m.measured_at) \
          AT TIME ZONE 'Asia/Tokyo')::date)) FROM alc_api.measurements m \
          WHERE m.tenant_id = $1 AND m.employee_id = $2 AND m.systolic IS NOT NULL AND m.diastolic IS NOT NULL";
 
@@ -462,7 +468,7 @@ pub mod sql {
     /// 運行管理者が「本人の測定ではない」として外した血圧 (alc-migrations 219) は使わない。
     /// $1 tenant_id / $2 employee_id → systolic / diastolic / pulse / 測定の時刻
     pub const LATEST_BP: &str = "SELECT m.systolic, m.diastolic, m.pulse, \
-             COALESCE(m.medical_measured_at, m.measured_at) AS at FROM alc_api.measurements m \
+             COALESCE(m.bp_measured_at, m.medical_measured_at, m.measured_at) AS at FROM alc_api.measurements m \
          WHERE m.tenant_id = $1 AND m.employee_id = $2 AND m.systolic IS NOT NULL AND m.diastolic IS NOT NULL \
            AND m.bp_excluded_at IS NULL \
          ORDER BY at DESC LIMIT 1";
@@ -474,10 +480,16 @@ pub mod sql {
         " FROM alc_api.employee_health_baselines WHERE tenant_id = $1 AND employee_id = $2"
     );
 
-    /// 測定の有効時間 (分。業務前 八)。$1 tenant_id / $2 employee_id。行が無ければ [`DEFAULT_VALIDITY_MINUTES`]
-    pub const VALIDITY_MINUTES: &str =
-        "SELECT measurement_validity_minutes FROM alc_api.employee_health_baselines \
+    /// 測定の有効時間 (業務前 八)。列は (体温の分, 血圧の分 (NULL = 当日中。alc-migrations 222))。$1 tenant_id / $2 employee_id。
+    /// 行が無ければ体温は [`DEFAULT_VALIDITY_MINUTES`]・血圧は当日中
+    pub const VALIDITY: &str =
+        "SELECT measurement_validity_minutes, bp_validity_minutes FROM alc_api.employee_health_baselines \
          WHERE tenant_id = $1 AND employee_id = $2";
+
+    /// 点呼の測定の血圧の時刻 (写した測定台の血圧の時刻。無ければ体温と同じ時刻)。$1 measurement_id / $2 tenant_id
+    pub const BP_MEASURED_AT: &str =
+        "SELECT COALESCE(bp_measured_at, medical_measured_at) FROM alc_api.measurements \
+         WHERE id = $1 AND tenant_id = $2";
 
     /// 有効時間を過ぎた体温・血圧を測り直させる。$1 id / $2 tenant_id
     pub const BACK_TO_MEDICAL: &str = concatcp!(
@@ -542,8 +554,42 @@ pub fn baseline(r: &Row) -> EmployeeHealthBaseline {
     }
 }
 
-/// 測定の有効時間の既定 (分。基準値の行が無い社員。`employee_health_baselines.measurement_validity_minutes` の DEFAULT と同じ)
+/// 体温の有効時間の既定 (分。基準値の行が無い社員。`employee_health_baselines.measurement_validity_minutes` の DEFAULT と同じ)
 pub const DEFAULT_VALIDITY_MINUTES: i32 = 30;
+
+/// 血圧の有効時間 (`employee_health_baselines.bp_validity_minutes`。alc-migrations 222)。体温の有効時間とは別
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BpValidity {
+    /// 当日中 (日本時間の同じ日付)。列が NULL・基準値の行が無いとき (既定)
+    SameDay,
+    /// 測ってから分
+    Minutes(i32),
+}
+
+impl BpValidity {
+    pub fn from_column(minutes: Option<i32>) -> Self {
+        minutes.map_or(Self::SameDay, Self::Minutes)
+    }
+
+    /// 血圧の測定が有効時間を過ぎているか。当日中は、測った日付 (日本時間) が今の日付より前なら過ぎている
+    /// (端末の時計のずれで今より後の時刻は有効のまま)
+    pub fn expired(self, measured_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+        match self {
+            Self::SameDay => {
+                measured_at.with_timezone(&jst()).date_naive()
+                    < now.with_timezone(&jst()).date_naive()
+            }
+            Self::Minutes(m) => medical_expired(measured_at, m, now),
+        }
+    }
+}
+
+/// 社員の測定の有効時間。体温は分、血圧は [`BpValidity`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Validity {
+    pub temperature_minutes: i32,
+    pub bp: BpValidity,
+}
 
 /// 測定台の血圧 ([`sql::LATEST_BP`] の行)
 pub struct StandBp {
@@ -562,7 +608,7 @@ pub fn stand_bp(r: &Row) -> StandBp {
     }
 }
 
-/// 体温・血圧の測定が有効時間を過ぎているか
+/// 体温 (と分で決めた血圧) の測定が有効時間を過ぎているか
 pub fn medical_expired(
     measured_at: DateTime<Utc>,
     validity_minutes: i32,
@@ -775,22 +821,31 @@ async fn instruction(
         .and_then(|r| r.get(0)))
 }
 
-/// 社員の測定の有効時間 (分)。基準値の行が無ければ [`DEFAULT_VALIDITY_MINUTES`]
-pub async fn validity_minutes(
+/// 社員の測定の有効時間。基準値の行が無ければ体温は [`DEFAULT_VALIDITY_MINUTES`]・血圧は当日中
+pub async fn validity(
     tx: &TenantTx<'_>,
     tenant_id: Uuid,
     employee_id: Uuid,
-) -> Result<i32, Error> {
+) -> Result<Validity, Error> {
     Ok(tx
         .query_typed_opt(
-            sql::VALIDITY_MINUTES,
+            sql::VALIDITY,
             &[(&tenant_id, Type::UUID), (&employee_id, Type::UUID)],
         )
         .await?
-        .map_or(DEFAULT_VALIDITY_MINUTES, |r| r.get(0)))
+        .map_or(
+            Validity {
+                temperature_minutes: DEFAULT_VALIDITY_MINUTES,
+                bp: BpValidity::SameDay,
+            },
+            |r| Validity {
+                temperature_minutes: r.get(0),
+                bp: BpValidity::from_column(r.get(1)),
+            },
+        ))
 }
 
-/// アルコール未測定で、記録済みの体温・血圧の測定が有効時間を過ぎていれば、状態を `medical_pending` へ戻す
+/// アルコール未測定で、記録済みの体温 (分) か血圧 ([`BpValidity`]。血圧の時刻で見る) の測定が有効時間を過ぎていれば、状態を `medical_pending` へ戻す
 /// (業務前 八。体温・血圧の測り直しから。自己申告と安全判定もやり直し)。再開と、アルコールの段の直前へ進める段が使う。
 /// 戻さないときは受けたセッションをそのまま返す
 pub async fn back_to_medical_if_expired(
@@ -807,8 +862,21 @@ pub async fn back_to_medical_if_expired(
     {
         return Ok(s);
     }
-    let minutes = validity_minutes(tx, s.tenant_id, s.employee_id).await?;
-    if !medical_expired(measured_at, minutes, now) {
+    let v = validity(tx, s.tenant_id, s.employee_id).await?;
+    let mut expired = medical_expired(measured_at, v.temperature_minutes, now);
+    if !expired && s.systolic.is_some() {
+        if let Some(mid) = s.measurement_id {
+            let bp_at: Option<DateTime<Utc>> = tx
+                .query_typed_opt(
+                    sql::BP_MEASURED_AT,
+                    &[(&mid, Type::UUID), (&s.tenant_id, Type::UUID)],
+                )
+                .await?
+                .and_then(|r| r.get(0));
+            expired = bp_at.is_some_and(|at| v.bp.expired(at, now));
+        }
+    }
+    if !expired {
         return Ok(s);
     }
     one(
@@ -1190,8 +1258,9 @@ async fn medical_handler(
                         ),
                     )));
                 }
-                // 測定から有効時間 (社員の基準値。無ければ 30 分) を過ぎた値は受けない (業務前 八)
-                let minutes = validity_minutes(tx, tenant_id, cur.employee_id).await?;
+                // 測定から有効時間 (社員の基準値。体温は無ければ 30 分) を過ぎた値は受けない (業務前 八)
+                let v = validity(tx, tenant_id, cur.employee_id).await?;
+                let minutes = v.temperature_minutes;
                 if let Some(measured_at) = body.medical_measured_at {
                     if medical_expired(measured_at, minutes, at) {
                         return Ok(Flow::Api(bad_request(
@@ -1202,11 +1271,12 @@ async fn medical_handler(
                         )));
                     }
                 }
-                // 血圧は点呼のキオスクではなく測定台で測る (オーナー決定 2026-11-05)。本文に血圧が無ければ、有効時間内の
-                // 最新の測定台の血圧を点呼の測定に写し、基準値との差と安全判定に使う (業務前 七・八・十)。測定の時刻は
-                // 体温と血圧の早い方にする (再開のときの有効時間の見直しが古い方で効く)
+                // 血圧は点呼のキオスクではなく測定台で測る (オーナー決定 2026-11-05)。本文に血圧が無ければ、血圧の有効時間
+                // (既定は当日中) 内の最新の測定台の血圧を点呼の測定に写し、基準値との差と安全判定に使う (業務前 七・八・十)。
+                // 体温の時刻 (`medical_measured_at`) と血圧の時刻 (`bp_measured_at`) は別々に持つ (再開の見直しも別々)
                 let mut bp = (body.systolic, body.diastolic, body.pulse);
-                let mut measured_at = body.medical_measured_at;
+                let measured_at = body.medical_measured_at;
+                let mut bp_at: Option<DateTime<Utc>> = None;
                 let mut stand_missing = false;
                 if body.systolic.is_none() || body.diastolic.is_none() {
                     let stand = tx
@@ -1216,12 +1286,11 @@ async fn medical_handler(
                         )
                         .await?
                         .map(|r| stand_bp(&r))
-                        .filter(|b| !medical_expired(b.measured_at, minutes, at));
+                        .filter(|b| !v.bp.expired(b.measured_at, at));
                     match stand {
                         Some(b) => {
                             bp = (Some(b.systolic), Some(b.diastolic), body.pulse.or(b.pulse));
-                            let temp_at = body.medical_measured_at.unwrap_or(at);
-                            measured_at = Some(temp_at.min(b.measured_at));
+                            bp_at = Some(b.measured_at);
                         }
                         None => stand_missing = true,
                     }
@@ -1269,6 +1338,7 @@ async fn medical_handler(
                         (&body.medical_manual_input, Type::BOOL),
                         (&mid, Type::UUID),
                         (&tenant_id, Type::UUID),
+                        (&bp_at, Type::TIMESTAMPTZ),
                     ],
                 )
                 .await?;
@@ -2248,6 +2318,18 @@ mod tests {
         // ちょうど有効時間は有効、1 秒過ぎたら過ぎている
         assert!(!medical_expired(at("2026-10-22T21:30:00Z"), 30, now));
         assert!(medical_expired(at("2026-10-22T21:29:59Z"), 30, now));
+        // 血圧: 列が NULL = 当日中 (日本時間)。今は 10/23 07:00 JST。10/23 00:00 JST (= 10/22 15:00Z) からは有効、その前は過ぎている。
+        // 今より後 (端末の時計のずれ) は有効
+        let same_day = BpValidity::from_column(None);
+        assert_eq!(same_day, BpValidity::SameDay);
+        assert!(!same_day.expired(at("2026-10-22T15:00:00Z"), now));
+        assert!(same_day.expired(at("2026-10-22T14:59:59Z"), now));
+        assert!(!same_day.expired(at("2026-10-23T03:00:00Z"), now));
+        // 分で決めた血圧は体温と同じ比べ方
+        let minutes = BpValidity::from_column(Some(30));
+        assert_eq!(minutes, BpValidity::Minutes(30));
+        assert!(!minutes.expired(at("2026-10-22T21:30:00Z"), now));
+        assert!(minutes.expired(at("2026-10-22T21:29:59Z"), now));
         assert_eq!(clean(Some("  品川 ")), Some("品川".to_owned()));
         assert_eq!(clean(Some("  ")), None);
         assert_eq!(clean(None), None);
