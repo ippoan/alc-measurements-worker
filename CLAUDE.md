@@ -27,7 +27,7 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - rust に無い口 `POST /api/measurements/alert-test` (アルコール検知メールのテスト送信。`alert::alert_test`)。**この口だけ role を見る**
   (`X-User-Role` から復元した `AuthUser` が admin でなければ 403)。宛先の引きと送信のループは検知と同じ関数 (`alert::recipients`・`alert::deliver`)。
   測定台の血圧の回数の問い合わせ `GET /api/measurements/bp-count?employee_id=` (`bp_limit::bp_count`。rust に無い。静脈認証が通った直後に
-  画面が問う): `{"count","limit":2,"validity_minutes","reached"}`。数え方は保存の 422 (`bp_limit::limit_reached`) と同じ文の後ろ半分
+  画面が問う): `{"count","limit":2,"validity":"same_day"|"minutes","validity_minutes"(当日中は null),"reached"}`。数え方は保存の 422 (`bp_limit::limit_reached`) と同じ文の後ろ半分
   (`sql::COUNT_TAIL`) を使う。role は見ない (端末の鍵でも通る)。`employee_id` が無い・不正は 400 (本文なし)。
   血圧の日報にも同じ形のテスト送信 `POST /api/measurements/bp-report-test` (`report::bp_report_test`。下の「血圧の通知」)。
 - rust に無い点呼の確定の後回し (`deferred.rs`): 完了 PUT に `record_as_tenko` と `defer_tenko: true` が付けば、記録を作らず入力を
@@ -104,9 +104,12 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
 - 自己点検表の不足 (alc-migrations 204): 点呼セッションに `vehicle_number`・`vehicle_number_source` (carins/schedule/manual)・`resumed_by_name`・
   `alternative_measure` (record_data にも入る)。`PUT /api/tenko/sessions/{id}/vehicle` (車検証の管理番号が car_inspection に一致すれば登録番号
   `CarNo` = carins、無ければ入力値で予定と同じなら schedule・違えば manual、どちらも無ければ 400。`carins.rs` の `CarinsLookup.car_no` は
-  この口だけが使う)。開始は予定の `vehicle_number` を写す。測定の有効時間 (`employee_health_baselines.measurement_validity_minutes`、無ければ 30 分):
-  `PUT …/medical` は過ぎた測定を 400 `measurement_expired`、再開・自己再開・携行品(無ければ日常点検)の後のアルコールの段の直前は、アルコール未測定で
-  過ぎていれば `medical_pending` へ戻す。`self-resume` は管理者が再開済みでも受け、再開の時刻・理由・管理者を上書きしない。`resume` は
+  この口だけが使う)。開始は予定の `vehicle_number` を写す。測定の有効時間は体温と血圧で別 (alc-migrations 222。`tenko::flow::validity`):
+  体温は `employee_health_baselines.measurement_validity_minutes` (無ければ 30 分)、血圧は `bp_validity_minutes` (NULL・行なし = **当日中** =
+  日本時間の同じ日付。`BpValidity`)。時刻も別: 体温は測定の `medical_measured_at`、点呼に写した血圧は `bp_measured_at` (古い行は NULL で
+  `medical_measured_at` に落とす。早い方にまとめない)。`PUT …/medical` は過ぎた体温を 400 `measurement_expired`、再開・自己再開・携行品(無ければ日常点検)の後の
+  アルコールの段の直前は、アルコール未測定で体温か血圧 (それぞれの時刻で) が過ぎていれば `medical_pending` へ戻す。
+  測定台の「2 回まで」(`bp_limit::COUNT_TAIL`) も血圧の規則で数える (既定は当日中 = 1 日 2 回まで)。`self-resume` は管理者が再開済みでも受け、再開の時刻・理由・管理者を上書きしない。`resume` は
   `resumed_by_name` 必須 (運行管理者の鍵。ログインは省略時に名前、空ならメール — kit の復元は name を空で入れる)。`cancel`・`ng` 判定は `alternative_measure`。
 - 点呼の記録は内側の区切り (`SAVEPOINT`。名前は定数) で作る。**段を閉じる口 (指示の確認・運行報告・取り消し・安全判定の中断・
   日常点検 NG) は記録が書けなければ閉じない** (`record::close_with_record`: 更新ごと区切りまで戻し、機器故障
@@ -121,7 +124,7 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
 - 開始 (`POST /tenko/sessions/start`) は、予定ありの業務前 (自動点呼) で乗務員の血圧の記録 (東京の日付の異なり数、`BP_HISTORY_DAYS_REQUIRED` = 10) が足りないと、予定は消費して**遠隔点呼で作る** (escalate-remote と同じ `ESCALATE` の文。`remote_escalation_reason` = 「血圧の記録が 10 日分に満たない (いま N 日分)」、状態は `medical_pending`)。dev 端末は切り替えない (キオスクが警告する)。業務後・予定なしは対象外。
   検知 (中止) は判定を待たずに閉じて記録する。
 - 血圧は点呼のキオスクで測らず測定台で測る (業務前 七・八・十)。`PUT …/medical` は本文に血圧が無ければ、乗務員の最新の血圧
-  (`sql::LATEST_BP`。測定台の測定) が有効時間内なら点呼の測定に写し (測定の時刻は体温と血圧の早い方)、差と安全判定に使う。
+  (`sql::LATEST_BP`。測定台の測定) が血圧の有効時間内なら点呼の測定に写し (血圧の時刻は `bp_measured_at`)、差と安全判定に使う。
   無い・過ぎた自動点呼は `ESCALATE` で遠隔点呼として続ける (`STAND_BP_MISSING_REASON`)。dev 端末と自動点呼でない点呼は切り替えない。
 - 点呼の webhook は送らない: `PendingFire` を応答の extension に入れ、`src/lib.rs` が `wait_until` で alc-tenko-worker の
   `/internal/webhooks/fire` へ渡す (Service Binding `ALC_TENKO`。本番 `alc-tenko`・staging `alc-tenko-staging`)。dev の要求は渡さない。

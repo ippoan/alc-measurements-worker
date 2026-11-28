@@ -53,7 +53,7 @@ pub mod sql {
     pub const CARRY_MEDICAL: &str = "UPDATE alc_api.measurements n SET temperature = o.temperature, \
              systolic = o.systolic, diastolic = o.diastolic, pulse = o.pulse, \
              medical_measured_at = o.medical_measured_at, medical_manual_input = o.medical_manual_input, \
-             updated_at = NOW() \
+             bp_measured_at = o.bp_measured_at, updated_at = NOW() \
          FROM alc_api.measurements o \
          WHERE n.id = $1 AND n.tenant_id = $3 AND o.id = $2 AND o.tenant_id = $3 \
            AND o.medical_measured_at IS NOT NULL";

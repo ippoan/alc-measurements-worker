@@ -17,7 +17,7 @@
 //! 宛先が 0 (グループが無い・メンバーがいない・メールが使えない) のテナントは何もしない。記録が 0 件なら「記録はありません」と送る。
 //! 1 テナントの失敗で残りを止めない (リトライしない)。dev 端末の記録は RLS が分けるので入らない。
 //!
-//! 記録の時刻は `medical_measured_at` (無ければ `measured_at`)。完了 (completed) で systolic が入っている行だけ。
+//! 記録の時刻は血圧の時刻 `bp_measured_at` (点呼に写した血圧。無ければ `medical_measured_at`、それも無ければ `measured_at`)。完了 (completed) で systolic が入っている行だけ。
 //! **ログは件数だけ** (氏名・値・id・メールアドレスを出さない)。
 
 use alc_core_wasm::{DeviceDevSlot, TenantId};
@@ -54,15 +54,15 @@ pub mod sql {
     /// 前日の記録 (時刻順)。基準値は LEFT JOIN (無ければ全部 NULL = 既定)。WHERE に tenant_id も明示する
     pub fn records() -> String {
         format!(
-            "SELECT e.name, COALESCE(m.medical_measured_at, m.measured_at) AS at, \
+            "SELECT e.name, COALESCE(m.bp_measured_at, m.medical_measured_at, m.measured_at) AS at, \
                     m.systolic, m.diastolic, m.pulse, {BASELINE_COLUMNS} \
              FROM measurements m \
              LEFT JOIN employees e ON e.id = m.employee_id AND e.tenant_id = m.tenant_id \
              LEFT JOIN employee_health_baselines b \
                     ON b.employee_id = m.employee_id AND b.tenant_id = m.tenant_id \
              WHERE m.tenant_id = $1 AND m.status = 'completed' AND m.systolic IS NOT NULL \
-               AND COALESCE(m.medical_measured_at, m.measured_at) >= $2 \
-               AND COALESCE(m.medical_measured_at, m.measured_at) < $3 \
+               AND COALESCE(m.bp_measured_at, m.medical_measured_at, m.measured_at) >= $2 \
+               AND COALESCE(m.bp_measured_at, m.medical_measured_at, m.measured_at) < $3 \
              ORDER BY at, e.name"
         )
     }
