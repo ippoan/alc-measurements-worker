@@ -26,6 +26,9 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 ## rust と違う振る舞い
 - rust に無い口 `POST /api/measurements/alert-test` (アルコール検知メールのテスト送信。`alert::alert_test`)。**この口だけ role を見る**
   (`X-User-Role` から復元した `AuthUser` が admin でなければ 403)。宛先の引きと送信のループは検知と同じ関数 (`alert::recipients`・`alert::deliver`)。
+  測定台の血圧の回数の問い合わせ `GET /api/measurements/bp-count?employee_id=` (`bp_limit::bp_count`。rust に無い。静脈認証が通った直後に
+  画面が問う): `{"count","limit":2,"validity_minutes","reached"}`。数え方は保存の 422 (`bp_limit::limit_reached`) と同じ文の後ろ半分
+  (`sql::COUNT_TAIL`) を使う。role は見ない (端末の鍵でも通る)。`employee_id` が無い・不正は 400 (本文なし)。
   血圧の日報にも同じ形のテスト送信 `POST /api/measurements/bp-report-test` (`report::bp_report_test`。下の「血圧の通知」)。
 - rust に無い点呼の確定の後回し (`deferred.rs`): 完了 PUT に `record_as_tenko` と `defer_tenko: true` が付けば、記録を作らず入力を
   `measurements.tenko_pending` に置く (alc-migrations 180)。確定は `POST /api/measurements/{id}/tenko` (`通常点呼`/`IT点呼`) か、
@@ -122,6 +125,6 @@ native のテストは `tests/support` の `call_raw` が同じく取り出し�
   無い・過ぎた自動点呼は `ESCALATE` で遠隔点呼として続ける (`STAND_BP_MISSING_REASON`)。dev 端末と自動点呼でない点呼は切り替えない。
 - 点呼の webhook は送らない: `PendingFire` を応答の extension に入れ、`src/lib.rs` が `wait_until` で alc-tenko-worker の
   `/internal/webhooks/fire` へ渡す (Service Binding `ALC_TENKO`。本番 `alc-tenko`・staging `alc-tenko-staging`)。dev の要求は渡さない。
-- `coverage_100.toml` の登録を外さない。CI の本数 (lib 46・api_db 10・files_db 14・normal_tenko_db 28・alert_db 29・deferred_tenko_db 14・bp_db 10・report_db 17・bp_settings_db 18・upload_db 2・tenko_flow_db 27) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (lib 46・api_db 10・files_db 14・normal_tenko_db 28・alert_db 29・deferred_tenko_db 14・bp_db 14・report_db 17・bp_settings_db 18・upload_db 2・tenko_flow_db 27) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・Hyperdrive の設定の ID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-trouble-worker と同じ rev)。

@@ -569,6 +569,8 @@ async fn test_bp_limit_and_exclude_db_failures_are_500() {
     )
     .await;
     assert_eq!(ex.status, 500);
+    let count = bp_count(&app, tenant, &format!("?employee_id={emp}")).await;
+    assert_eq!(count.status, 500);
     let logs = app.logs();
     assert!(
         logs.iter()
@@ -580,4 +582,115 @@ async fn test_bp_limit_and_exclude_db_failures_are_500() {
             .any(|l| l.starts_with("measurements: measurement exclude-bp failed: db (")),
         "{logs:?}"
     );
+    assert!(
+        logs.iter()
+            .any(|l| l.starts_with("measurements: measurement bp count failed: db (")),
+        "{logs:?}"
+    );
+}
+
+async fn bp_count(app: &App, tenant: Uuid, query: &str) -> Got {
+    call(
+        app,
+        "GET",
+        &format!("/api/measurements/bp-count{query}"),
+        Some(tenant),
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn test_bp_count_counts_like_the_save_limit() {
+    let (tenant, emp) = setup().await;
+    let app = app_with(&MockService::ok()).await;
+    let q = format!("?employee_id={emp}");
+    let zero = bp_count(&app, tenant, &q).await;
+    assert_eq!(
+        (zero.status, zero.json()),
+        (
+            200,
+            json!({ "count": 0, "limit": 2, "validity_minutes": 30, "reached": false })
+        )
+    );
+    // 有効時間を過ぎた血圧・血圧の無い測定は数えない
+    let old = start_measurement(&app, tenant, emp).await;
+    put_measurement_ok(
+        &app,
+        tenant,
+        &old,
+        &json!({ "status": "completed", "systolic": 120, "diastolic": 80, "medical_measured_at": "2026-10-22T20:00:00Z" }),
+    )
+    .await;
+    start_measurement(&app, tenant, emp).await;
+    let first = start_measurement(&app, tenant, emp).await;
+    put_measurement_ok(&app, tenant, &first, &stand_bp(150, 5)).await;
+    assert_eq!(bp_count(&app, tenant, &q).await.json()["count"], 1);
+    let second = start_measurement(&app, tenant, emp).await;
+    put_measurement_ok(&app, tenant, &second, &stand_bp(128, 3)).await;
+    let two = bp_count(&app, tenant, &q).await.json();
+    assert_eq!(
+        (two["count"].clone(), two["reached"].clone()),
+        (json!(2), json!(true))
+    );
+    // 保存も 3 回目を断る (問い合わせと同じ数え方)
+    let third = start_measurement(&app, tenant, emp).await;
+    assert_eq!(
+        put_measurement(&app, tenant, &third, &stand_bp(126, 1))
+            .await
+            .status,
+        422
+    );
+
+    // 外した血圧は数えない
+    let ex = exclude(
+        &app,
+        tenant,
+        &first,
+        json!({ "reason": "x" }),
+        &manager_headers(),
+    )
+    .await;
+    assert_eq!(ex.status, 200);
+    let after = bp_count(&app, tenant, &q).await.json();
+    assert_eq!(
+        (after["count"].clone(), after["reached"].clone()),
+        (json!(1), json!(false))
+    );
+
+    // 有効時間は基準値の行から (150 分なら 20:00 の血圧も入る)
+    baseline(tenant, emp, 120, 80, 10).await;
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.employee_health_baselines SET measurement_validity_minutes = 150 WHERE employee_id = $1",
+            &[&emp],
+        )
+        .await
+        .unwrap();
+    let wide = bp_count(&app, tenant, &q).await.json();
+    assert_eq!(
+        (
+            wide["count"].clone(),
+            wide["validity_minutes"].clone(),
+            wide["reached"].clone()
+        ),
+        (json!(2), json!(150), json!(true))
+    );
+
+    // 別の社員・別のテナントの血圧は数えない
+    let (t2, e2) = setup().await;
+    assert_eq!(
+        bp_count(&app, t2, &format!("?employee_id={e2}"))
+            .await
+            .json()["count"],
+        0
+    );
+    assert_eq!(bp_count(&app, t2, &q).await.json()["count"], 0);
+
+    // employee_id が無い・uuid でない → 400 (本文なし)
+    for bad in ["", "?employee_id=abc"] {
+        let got = bp_count(&app, tenant, bad).await;
+        assert_eq!((got.status, got.body.is_empty()), (400, true), "{bad}");
+    }
 }

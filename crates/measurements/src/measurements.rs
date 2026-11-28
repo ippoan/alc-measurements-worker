@@ -14,7 +14,7 @@
 //! アルコール検知メールのテスト送信 (`POST /measurements/alert-test`。admin だけ) は [`crate::alert::alert_test`]。
 //! 血圧の日報のテスト送信 (`POST /measurements/bp-report-test`。admin だけ) は [`crate::report::bp_report_test`]。
 //! 点呼の確定 (`POST /measurements/{id}/tenko`。rust に無い) は [`crate::deferred::confirm_tenko`]。
-//! 測定台の血圧の回数の制限 (PUT の 422) と、血圧を外す口 (`POST /measurements/{id}/exclude-bp`) は [`crate::bp_limit`]。
+//! 測定台の血圧の回数の制限 (PUT の 422)・回数の問い合わせ (`GET /measurements/bp-count`) と、血圧を外す口 (`POST /measurements/{id}/exclude-bp`) は [`crate::bp_limit`]。
 
 use alc_core_wasm::{DeviceDevSlot, TenantId};
 use alc_worker_db::PgClient;
@@ -458,6 +458,7 @@ pub fn router() -> Router<AppState> {
         .route("/measurements/start", post(start_measurement))
         .route("/measurements/alert-test", post(alert::alert_test))
         .route("/measurements/bp-report-test", post(report::bp_report_test))
+        .route("/measurements/bp-count", get(crate::bp_limit::bp_count))
         .route(
             "/measurements/{id}",
             get(get_measurement).put(update_measurement),
